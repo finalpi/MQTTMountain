@@ -1,6 +1,6 @@
 {
   "name": "mqtt-mountain",
-  "version": "1.0.0",
+  "version": "1.0.4",
   "description": "高性能 MQTT 客户端（Electron + Vue 3 + TS）",
   "main": "dist-electron/main/index.js",
   "author": "",
@@ -11,7 +11,8 @@
     "build:dir": "vue-tsc --noEmit && vite build && electron-builder --dir",
     "typecheck": "vue-tsc --noEmit",
     "postinstall": "electron-builder install-app-deps",
-    "rebuild": "electron-builder install-app-deps"
+    "rebuild": "electron-builder install-app-deps",
+    "release": "node scripts/release.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

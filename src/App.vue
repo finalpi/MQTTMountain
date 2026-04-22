@@ -14,12 +14,14 @@ import { useMessageStore } from './stores/messages';
 import { useSettingsStore } from './stores/settings';
 import { useMqttBridge } from './composables/useMqttBridge';
 import { useToast } from './composables/useToast';
+import { useFocusFix } from './composables/useFocusFix';
 
 const conn = useConnectionStore();
 const msg = useMessageStore();
 const settings = useSettingsStore();
 const { start, stop } = useMqttBridge();
 const toast = useToast();
+useFocusFix();
 
 type MainTab = 'messages' | 'history';
 const mainTab = ref<MainTab>('messages');
