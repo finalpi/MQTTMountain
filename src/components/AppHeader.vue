@@ -8,10 +8,13 @@ const conn = useConnectionStore();
 const msg = useMessageStore();
 const { theme, toggle: toggleTheme } = useTheme();
 
+const bucket = computed(() => msg.bucketFor(conn.selectedId));
 const topicsCount = computed(() => {
-    void msg.topicsVersion;
-    return msg.topics.size;
+    void bucket.value.topicsVersion;
+    return bucket.value.topics.size;
 });
+const recvCount = computed(() => bucket.value.receiveCount);
+const sendCount = computed(() => bucket.value.publishCount);
 
 const stateText = computed(() => {
     switch (conn.selectedState) {
@@ -51,11 +54,11 @@ const brokerLine = computed(() => {
         </div>
         <div class="stats">
             <div class="stat-item">
-                <div class="val">{{ msg.receiveCount }}</div>
+                <div class="val">{{ recvCount }}</div>
                 <div class="lbl">收到</div>
             </div>
             <div class="stat-item">
-                <div class="val">{{ msg.publishCount }}</div>
+                <div class="val">{{ sendCount }}</div>
                 <div class="lbl">发送</div>
             </div>
             <div class="stat-item">

@@ -38,6 +38,7 @@ export interface AppSettings {
 
 /** 批量从主进程推到渲染进程的单条消息 */
 export interface MqttMessage {
+    connectionId: string;
     topic: string;
     payload: string;
     time: number;

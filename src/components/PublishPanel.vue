@@ -113,7 +113,7 @@ async function doPublish(): Promise<void> {
         retain: retain.value
     });
     if (r.success) {
-        msg.pushPublishHistory({ topic: topic.value.trim(), payload: payload.value, qos: qos.value, retain: retain.value, time: Date.now() });
+        msg.pushPublishHistory(c.id, { topic: topic.value.trim(), payload: payload.value, qos: qos.value, retain: retain.value, time: Date.now() });
         toast.success('已发送');
     } else {
         toast.error('发送失败：' + (r.message || ''));
@@ -128,8 +128,9 @@ function repeat(item: { topic: string; payload: string; qos: number; retain: boo
 }
 
 const historyList = computed(() => {
-    void msg.publishHistoryVersion;
-    return msg.publishHistory.snapshot().reverse();
+    const b = msg.bucketFor(conn.selectedId);
+    void b.publishHistoryVersion;
+    return b.publishHistory.snapshot().reverse();
 });
 </script>
 

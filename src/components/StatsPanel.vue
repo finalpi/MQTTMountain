@@ -1,20 +1,23 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { useMessageStore } from '@/stores/messages';
+import { useConnectionStore } from '@/stores/connection';
 
 const msg = useMessageStore();
+const conn = useConnectionStore();
+const bucket = computed(() => msg.bucketFor(conn.selectedId));
 
 const topicsCount = computed(() => {
-    void msg.topicsVersion;
-    return msg.topics.size;
+    void bucket.value.topicsVersion;
+    return bucket.value.topics.size;
 });
 const timelineLen = computed(() => {
-    void msg.timelineVersion;
-    return msg.timeline.length;
+    void bucket.value.timelineVersion;
+    return bucket.value.timeline.length;
 });
 const timelineCap = computed(() => {
-    void msg.timelineVersion;
-    return msg.timeline.capacity;
+    void bucket.value.timelineVersion;
+    return bucket.value.timeline.capacity;
 });
 </script>
 
@@ -26,11 +29,11 @@ const timelineCap = computed(() => {
         <div class="panel-body">
             <div class="grid">
                 <div class="card">
-                    <div class="val">{{ msg.receiveCount }}</div>
+                    <div class="val">{{ bucket.receiveCount }}</div>
                     <div class="lbl">收到消息</div>
                 </div>
                 <div class="card">
-                    <div class="val">{{ msg.publishCount }}</div>
+                    <div class="val">{{ bucket.publishCount }}</div>
                     <div class="lbl">发送消息</div>
                 </div>
                 <div class="card">

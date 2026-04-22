@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { markRaw, reactive, ref } from 'vue';
+import { markRaw, reactive } from 'vue';
 import { RingBuffer } from '@/utils/ringBuffer';
 import type { MqttMessage } from '@shared/types';
 
@@ -19,47 +19,86 @@ export interface TopicView {
     lastTime: number;
     lastSeq: number;
     disabled: boolean;
-    /** 预计算的归一化 topic，用于过滤时命中 topic 本身 */
     normTopic: string;
 }
 
-/**
- * 消息存储：
- *   - timeline：全局环形缓冲（展示「时间线模式」）
- *   - topics：按主题分桶，每桶独立环形缓冲（展示「主题模式」右侧详情）
- *   - topicList：主题名顺序列表（Map.keys() 保持插入顺序；切换排序时重算）
- *   - selectedTopic：当前选中的主题
- *   - paused：暂停后仍接收主进程推送，但不再刷新 UI（通过 version 机制判定）
- */
-export const useMessageStore = defineStore('messages', () => {
-    // markRaw：RingBuffer 内部自维护 version/total，不应被 Vue 深层代理
-    const timeline = markRaw(new RingBuffer<MsgRow>(10000));
-    const timelineVersion = ref(0);
-    const topics = markRaw(new Map<string, TopicView>());
-    const topicsVersion = ref(0);
-    const selectedTopic = ref<string | null>(null);
-    const activeConnectionId = ref<string | null>(null);
-    const paused = ref(false);
-    const receiveCount = ref(0);
-    const publishCount = ref(0);
-    const publishHistory = markRaw(new RingBuffer<{ topic: string; payload: string; qos: number; retain: boolean; time: number }>(50));
-    const publishHistoryVersion = ref(0);
+export interface PublishHistoryItem {
+    topic: string;
+    payload: string;
+    qos: number;
+    retain: boolean;
+    time: number;
+}
 
+/**
+ * 每个连接一份独立数据桶
+ * - timeline、topics 都用 markRaw 避免深层响应代理（内部用 version 触发更新）
+ * - 其他原始类型字段由外层 reactive 代理后自动响应
+ */
+export interface MsgBucket {
+    timeline: RingBuffer<MsgRow>;
+    timelineVersion: number;
+    topics: Map<string, TopicView>;
+    topicsVersion: number;
+    selectedTopic: string | null;
+    paused: boolean;
+    receiveCount: number;
+    publishCount: number;
+    publishHistory: RingBuffer<PublishHistoryItem>;
+    publishHistoryVersion: number;
+}
+
+export const useMessageStore = defineStore('messages', () => {
+    let maxMemoryMessages = 10000;
     let maxPerTopic = 500;
-    // 渲染端全局自增 seq（永不复用），避免与主进程 seq 撞车导致 v-for key 重复
     let localSeqGen = 0;
     const nextSeq = (): number => ++localSeqGen;
 
-    function setLimits(total: number, perTopic: number): void {
-        maxPerTopic = Math.max(50, perTopic);
-        timeline.setCapacity(Math.max(100, total));
-        for (const v of topics.values()) v.buf.setCapacity(maxPerTopic);
-        timelineVersion.value++;
-        topicsVersion.value++;
+    const buckets = reactive(new Map<string, MsgBucket>());
+
+    function createBucket(): MsgBucket {
+        return {
+            timeline: markRaw(new RingBuffer<MsgRow>(maxMemoryMessages)),
+            timelineVersion: 0,
+            topics: markRaw(new Map<string, TopicView>()),
+            topicsVersion: 0,
+            selectedTopic: null,
+            paused: false,
+            receiveCount: 0,
+            publishCount: 0,
+            publishHistory: markRaw(new RingBuffer<PublishHistoryItem>(50)),
+            publishHistoryVersion: 0
+        };
     }
 
-    function ensureTopic(topic: string): TopicView {
-        let v = topics.get(topic);
+    /** 获取或新建连接对应的 bucket；id 为空时返回一个临时 bucket（不写回 map） */
+    function bucketFor(id: string | null | undefined): MsgBucket {
+        if (!id) return createBucket();
+        let b = buckets.get(id);
+        if (!b) {
+            b = createBucket();
+            buckets.set(id, b);
+        }
+        return b;
+    }
+
+    function hasBucket(id: string | null | undefined): boolean {
+        return !!id && buckets.has(id);
+    }
+
+    function setLimits(total: number, perTopic: number): void {
+        maxMemoryMessages = Math.max(100, total);
+        maxPerTopic = Math.max(50, perTopic);
+        for (const b of buckets.values()) {
+            b.timeline.setCapacity(maxMemoryMessages);
+            for (const v of b.topics.values()) v.buf.setCapacity(maxPerTopic);
+            b.timelineVersion++;
+            b.topicsVersion++;
+        }
+    }
+
+    function ensureTopic(b: MsgBucket, topic: string): TopicView {
+        let v = b.topics.get(topic);
         if (!v) {
             v = markRaw<TopicView>({
                 topic,
@@ -70,122 +109,133 @@ export const useMessageStore = defineStore('messages', () => {
                 disabled: false,
                 normTopic: topic.toLowerCase().replace(/\s+/gu, '')
             });
-            topics.set(topic, v);
-            topicsVersion.value++;
+            b.topics.set(topic, v);
+            b.topicsVersion++;
         }
         return v;
     }
 
-    function ingest(batch: MqttMessage[]): void {
-        if (batch.length === 0) return;
+    function ingest(connectionId: string, batch: MqttMessage[]): void {
+        if (!connectionId || batch.length === 0) return;
+        const b = bucketFor(connectionId);
+        if (b.paused) return; // 该连接单独暂停显示
         for (let i = 0; i < batch.length; i++) {
             const m = batch[i];
             const row: MsgRow = { topic: m.topic, payload: m.payload, time: m.time, seq: nextSeq() };
-            timeline.push(row);
-            const v = topics.get(m.topic);
-            if (v) {
-                v.buf.push(row);
-                v.total++;
-                v.lastTime = m.time;
-                v.lastSeq = m.seq;
+            b.timeline.push(row);
+            const existing = b.topics.get(m.topic);
+            if (existing) {
+                existing.buf.push(row);
+                existing.total++;
+                existing.lastTime = m.time;
+                existing.lastSeq = row.seq;
             } else {
                 const nv = markRaw<TopicView>({
                     topic: m.topic,
                     buf: new RingBuffer<MsgRow>(maxPerTopic),
                     total: 1,
                     lastTime: m.time,
-                    lastSeq: m.seq,
+                    lastSeq: row.seq,
                     disabled: false,
                     normTopic: m.topic.toLowerCase().replace(/\s+/gu, '')
                 });
                 nv.buf.push(row);
-                topics.set(m.topic, nv);
+                b.topics.set(m.topic, nv);
             }
         }
-        receiveCount.value += batch.length;
-        timelineVersion.value++;
-        topicsVersion.value++;
+        b.receiveCount += batch.length;
+        b.timelineVersion++;
+        b.topicsVersion++;
     }
 
-    function clearAll(): void {
-        timeline.clear();
-        topics.clear();
-        timelineVersion.value++;
-        topicsVersion.value++;
-        receiveCount.value = 0;
-        selectedTopic.value = null;
+    function clearAll(connectionId: string): void {
+        const b = buckets.get(connectionId);
+        if (!b) return;
+        b.timeline.clear();
+        b.topics.clear();
+        b.timelineVersion++;
+        b.topicsVersion++;
+        b.receiveCount = 0;
+        b.selectedTopic = null;
     }
 
-    function clearTopic(topic: string): void {
-        const v = topics.get(topic);
+    function clearTopic(connectionId: string, topic: string): void {
+        const b = buckets.get(connectionId);
+        if (!b) return;
+        const v = b.topics.get(topic);
         if (!v) return;
         v.buf.clear();
         v.total = 0;
-        topicsVersion.value++;
+        b.topicsVersion++;
     }
 
-    function removeTopic(topic: string): void {
-        if (topics.delete(topic)) topicsVersion.value++;
-        if (selectedTopic.value === topic) selectedTopic.value = null;
+    function removeTopic(connectionId: string, topic: string): void {
+        const b = buckets.get(connectionId);
+        if (!b) return;
+        if (b.topics.delete(topic)) b.topicsVersion++;
+        if (b.selectedTopic === topic) b.selectedTopic = null;
     }
 
-    function selectTopic(topic: string | null): void {
-        selectedTopic.value = topic;
+    function selectTopic(connectionId: string, topic: string | null): void {
+        const b = bucketFor(connectionId);
+        b.selectedTopic = topic;
     }
 
-    function setTopicDisabled(topic: string, disabled: boolean): void {
-        const v = topics.get(topic);
-        if (v) { v.disabled = disabled; topicsVersion.value++; }
+    function setTopicDisabled(connectionId: string, topic: string, disabled: boolean): void {
+        const b = buckets.get(connectionId);
+        if (!b) return;
+        const v = b.topics.get(topic);
+        if (v) { v.disabled = disabled; b.topicsVersion++; }
     }
 
-    function pushPublishHistory(item: { topic: string; payload: string; qos: number; retain: boolean; time: number }): void {
-        publishHistory.push(item);
-        publishHistoryVersion.value++;
-        publishCount.value++;
+    function pushPublishHistory(connectionId: string, item: PublishHistoryItem): void {
+        const b = bucketFor(connectionId);
+        b.publishHistory.push(item);
+        b.publishHistoryVersion++;
+        b.publishCount++;
     }
 
-    /** 用主进程返回的「最近消息」预填 */
-    function hydrate(rows: { topic: string; payload: string; time: number }[]): void {
-        if (!rows.length) return;
-        const ordered = rows.slice().sort((a, b) => a.time - b.time);
+    function setPaused(connectionId: string, paused: boolean): void {
+        const b = bucketFor(connectionId);
+        b.paused = paused;
+    }
+
+    function hydrate(connectionId: string, rows: { topic: string; payload: string; time: number }[]): void {
+        if (!connectionId || !rows.length) return;
+        const b = bucketFor(connectionId);
+        const ordered = rows.slice().sort((a, b2) => a.time - b2.time);
         for (const r of ordered) {
             const row: MsgRow = { topic: r.topic, payload: r.payload, time: r.time, seq: nextSeq() };
-            timeline.push(row);
-            const v = ensureTopic(r.topic);
+            b.timeline.push(row);
+            const v = ensureTopic(b, r.topic);
             v.buf.push(row);
             v.total++;
             v.lastTime = r.time;
             v.lastSeq = row.seq;
         }
-        timelineVersion.value++;
-        topicsVersion.value++;
+        b.timelineVersion++;
+        b.topicsVersion++;
     }
 
-    function setActiveConnection(id: string | null): void {
-        activeConnectionId.value = id;
+    /** 关闭连接（或删除配置）时清掉桶 */
+    function dropBucket(connectionId: string): void {
+        buckets.delete(connectionId);
     }
 
     return {
-        timeline,
-        timelineVersion,
-        topics,
-        topicsVersion,
-        selectedTopic,
-        activeConnectionId,
-        paused,
-        receiveCount,
-        publishCount,
-        publishHistory,
-        publishHistoryVersion,
+        buckets,
+        bucketFor,
+        hasBucket,
         setLimits,
         ingest,
+        hydrate,
         clearAll,
         clearTopic,
         removeTopic,
         selectTopic,
         setTopicDisabled,
         pushPublishHistory,
-        hydrate,
-        setActiveConnection
+        setPaused,
+        dropBucket
     };
 });

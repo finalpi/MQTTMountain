@@ -3,6 +3,8 @@ import { useConnectionStore, type ConnState } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
 import type { MqttMessage } from '@shared/types';
 
+interface PendingItem { connId: string; batch: MqttMessage[] }
+
 /**
  * 桥接主进程批量消息 → 渲染侧 store。
  * 收到一批消息后用 requestAnimationFrame 合并，避免每批都触发响应式刷新。
@@ -14,37 +16,40 @@ export function useMqttBridge() {
     let unsubState: (() => void) | null = null;
     let stopWatch: (() => void) | null = null;
 
-    const pendingBatches: MqttMessage[][] = [];
+    const pending: PendingItem[] = [];
     let rafId: number | null = null;
 
     function schedule(): void {
         if (rafId != null) return;
         rafId = requestAnimationFrame(() => {
             rafId = null;
-            if (!pendingBatches.length) return;
+            if (!pending.length) return;
 
-            // 暂停中：直接丢弃待处理批次（数据库/磁盘由主进程负责，不受此影响）
-            if (msg.paused) {
-                pendingBatches.length = 0;
-                return;
+            // 按 connectionId 聚合，分别投递到各自的 bucket
+            const byConn = new Map<string, MqttMessage[]>();
+            for (const it of pending) {
+                let arr = byConn.get(it.connId);
+                if (!arr) { arr = []; byConn.set(it.connId, arr); }
+                for (let i = 0; i < it.batch.length; i++) arr.push(it.batch[i]);
             }
+            pending.length = 0;
 
-            let total = 0;
-            for (const b of pendingBatches) total += b.length;
-            const merged = new Array<MqttMessage>(total);
-            let k = 0;
-            for (const b of pendingBatches) for (let i = 0; i < b.length; i++) merged[k++] = b[i];
-            pendingBatches.length = 0;
-            msg.ingest(merged);
+            for (const [connId, list] of byConn) {
+                msg.ingest(connId, list);
+            }
         });
     }
 
     function start(): void {
         unsubMsg = window.api.onMqttMessages((batch) => {
+            if (!batch.length) return;
+            // 同一批次里的所有消息都是同一 connectionId（主进程按连接分离），取第一条即可
+            const connId = batch[0].connectionId;
+            if (!connId) return;
             if (import.meta.env.DEV) {
-                console.debug('[mqtt] batch:', batch.length, batch[0]?.topic);
+                console.debug('[mqtt] batch:', connId, batch.length, batch[0]?.topic);
             }
-            pendingBatches.push(batch);
+            pending.push({ connId, batch });
             schedule();
         });
 
@@ -55,11 +60,14 @@ export function useMqttBridge() {
             conn.setState(p.connectionId, p.state as ConnState, p.message);
         });
 
-        // 选中变化 → 把选中主题作为 priorityTopic 通知主进程
+        // 选中连接 / 选中主题变化时告知主进程当前关注主题，降采样保护它
         stopWatch = watch(
-            () => msg.selectedTopic,
-            (topic) => {
+            () => {
                 const cid = conn.selectedId;
+                const bucket = cid ? msg.buckets.get(cid) : null;
+                return [cid, bucket?.selectedTopic ?? null] as const;
+            },
+            ([cid, topic]) => {
                 if (!cid) return;
                 window.api.mqttSetPriorityTopic({ connectionId: cid, topic });
             }
@@ -72,7 +80,7 @@ export function useMqttBridge() {
         stopWatch?.(); stopWatch = null;
         if (rafId != null) cancelAnimationFrame(rafId);
         rafId = null;
-        pendingBatches.length = 0;
+        pending.length = 0;
     }
 
     return { start, stop };

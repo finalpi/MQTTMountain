@@ -8,27 +8,28 @@ import { normalize, highlight } from '@/utils/filter';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
 
+const msg = useMessageStore();
+const conn = useConnectionStore();
+const toast = useToast();
 const formatViewer = useFormatViewer();
 
-const isActiveView = computed(() =>
-    !!msg.activeConnectionId && msg.activeConnectionId === conn.selectedId
-);
+/** 当前 selected 的连接对应的 bucket（每个连接独立） */
+const bucket = computed(() => msg.bucketFor(conn.selectedId));
 
-const mismatchTip = computed(() => {
+/** 是否展示消息视图：当前 selected 的连接已 connected（或有历史缓存） */
+const hasActiveBucket = computed(() => !!conn.selectedId && msg.hasBucket(conn.selectedId));
+const isConnected = computed(() => conn.selectedState === 'connected' || conn.selectedState === 'reconnecting');
+const showView = computed(() => isConnected.value || hasActiveBucket.value);
+
+const placeholderTip = computed(() => {
     if (!conn.selectedId) return { emoji: '🔌', title: '还没有选择连接', desc: '请在「📡 连接管理」中选择或新建一个连接' };
-    if (!msg.activeConnectionId) return { emoji: '⚡', title: '该连接未建立', desc: '点击「🔌 连接」后可在此查看实时消息，或切换到「🔍 历史查询」查看已记录消息' };
-    const active = conn.list.find((c) => c.id === msg.activeConnectionId)?.name ?? msg.activeConnectionId;
-    const current = conn.selected?.name ?? '';
-    return { emoji: '🔀', title: `当前实时连接：${active}`, desc: `你正在查看「${current}」的配置；若要查看它的实时消息，请先切换过去并点击「连接」` };
+    return { emoji: '⚡', title: '该连接未建立', desc: '点击「🔌 连接」查看实时消息，或到「🔍 历史查询」找回已记录数据' };
 });
 
 type ViewMode = 'timeline' | 'topic';
 const viewMode = ref<ViewMode>('topic');
 const filterInput = ref('');
 const filterText = ref('');
-const msg = useMessageStore();
-const conn = useConnectionStore();
-const toast = useToast();
 
 let filterTimer: number | null = null;
 watch(filterInput, (v) => {
@@ -41,8 +42,9 @@ const normKey = computed(() => normalize(filterText.value));
 
 /** 时间线：按新到旧 */
 const timelineList = computed<MsgRow[]>(() => {
-    void msg.timelineVersion;
-    const arr = msg.timeline.snapshot();
+    const b = bucket.value;
+    void b.timelineVersion;
+    const arr = b.timeline.snapshot();
     const nk = normKey.value;
     if (!nk) return arr.slice().reverse();
     const out: MsgRow[] = [];
@@ -56,12 +58,12 @@ const timelineList = computed<MsgRow[]>(() => {
 type TopicSort = 'insert' | 'recent' | 'name' | 'count';
 const topicSort = ref<TopicSort>('name');
 
-/** 主题列表（默认按首次出现顺序，不随消息滚动重排） */
 const topicList = computed<TopicView[]>(() => {
-    void msg.topicsVersion;
+    const b = bucket.value;
+    void b.topicsVersion;
     const all: TopicView[] = [];
     const nk = normKey.value;
-    for (const v of msg.topics.values()) {
+    for (const v of b.topics.values()) {
         if (nk) {
             let hit = v.normTopic.indexOf(nk) >= 0;
             if (!hit) {
@@ -80,30 +82,31 @@ const topicList = computed<TopicView[]>(() => {
         case 'recent': all.sort((a, b) => b.lastTime - a.lastTime); break;
         case 'name': all.sort((a, b) => a.topic.localeCompare(b.topic)); break;
         case 'count': all.sort((a, b) => b.total - a.total); break;
-        case 'insert':
-        default:
-            break; // 保持 Map 插入顺序
+        default: break;
     }
     return all;
 });
 
 const selectedTopicView = computed<TopicView | null>(() => {
-    void msg.topicsVersion;
-    if (!msg.selectedTopic) return null;
-    return msg.topics.get(msg.selectedTopic) ?? null;
+    const b = bucket.value;
+    void b.topicsVersion;
+    if (!b.selectedTopic) return null;
+    return b.topics.get(b.selectedTopic) ?? null;
 });
 
-// 没选主题时，自动选中最活跃的第一条
 watchEffect(() => {
-    void msg.topicsVersion;
-    if (msg.selectedTopic) return;
+    const b = bucket.value;
+    void b.topicsVersion;
+    if (b.selectedTopic) return;
     if (topicList.value.length === 0) return;
-    msg.selectTopic(topicList.value[0].topic);
+    const cid = conn.selectedId;
+    if (!cid) return;
+    msg.selectTopic(cid, topicList.value[0].topic);
 });
 
-/** 当前选中主题详情（新到旧） */
 const selectedTopicMessages = computed<MsgRow[]>(() => {
-    void msg.topicsVersion;
+    const b = bucket.value;
+    void b.topicsVersion;
     const v = selectedTopicView.value;
     if (!v) return [];
     const arr = v.buf.snapshot();
@@ -120,45 +123,54 @@ const selectedTopicMessages = computed<MsgRow[]>(() => {
 function setMode(m: ViewMode): void { viewMode.value = m; }
 
 function togglePause(): void {
-    msg.paused = !msg.paused;
+    const cid = conn.selectedId;
+    if (!cid) return;
+    msg.setPaused(cid, !bucket.value.paused);
 }
 
 async function clearAll(): Promise<void> {
-    if (!confirm('清空当前连接的所有消息？（同时会删除本地日志文件）')) return;
     const cid = conn.selectedId;
-    msg.clearAll();
-    if (cid) await window.api.mqttClearLogs(cid);
+    if (!cid) return;
+    if (!confirm('清空当前连接的所有消息？（同时会删除本地日志文件）')) return;
+    msg.clearAll(cid);
+    await window.api.mqttClearLogs(cid);
     toast.success('已清空');
 }
 
 async function exportJson(): Promise<void> {
-    const rows = msg.timeline.snapshot();
+    const rows = bucket.value.timeline.snapshot();
     if (rows.length === 0) { toast.warning('没有消息可导出'); return; }
     exportMqttxJson(rows, `messages-${Date.now()}.json`);
     toast.success(`已导出 ${rows.length} 条`);
 }
 async function exportZip(): Promise<void> {
-    const rows = msg.timeline.snapshot();
+    const rows = bucket.value.timeline.snapshot();
     if (rows.length === 0) { toast.warning('没有消息可导出'); return; }
     await exportGroupedZip(rows, `messages-grouped-${Date.now()}.zip`);
     toast.success(`已导出 ${rows.length} 条（按主题分组）`);
 }
 
 function selectTopic(t: string): void {
-    msg.selectTopic(t);
+    const cid = conn.selectedId;
+    if (!cid) return;
+    msg.selectTopic(cid, t);
 }
 function clearTopic(t: string): void {
-    msg.clearTopic(t);
+    const cid = conn.selectedId;
+    if (!cid) return;
+    msg.clearTopic(cid, t);
 }
 function deleteTopic(t: string): void {
+    const cid = conn.selectedId;
+    if (!cid) return;
     if (!confirm(`删除主题「${t}」及其消息？`)) return;
-    msg.removeTopic(t);
+    msg.removeTopic(cid, t);
 }
 async function toggleDisable(v: TopicView): Promise<void> {
     const cid = conn.selectedId;
     if (!cid) return;
     const next = !v.disabled;
-    msg.setTopicDisabled(v.topic, next);
+    msg.setTopicDisabled(cid, v.topic, next);
     conn.toggleDisableTopic(cid, v.topic, next);
     if (next) await window.api.mqttDisableTopic({ connectionId: cid, topic: v.topic });
     else await window.api.mqttEnableTopic({ connectionId: cid, topic: v.topic });
@@ -197,7 +209,7 @@ function scrollToTop(smooth = true): void {
 
 // 当消息更新时，若仍处于「跟随」模式则保持在顶部
 watch(
-    () => [msg.timelineVersion, msg.topicsVersion, msg.selectedTopic, viewMode.value] as const,
+    () => [bucket.value.timelineVersion, bucket.value.topicsVersion, bucket.value.selectedTopic, viewMode.value, conn.selectedId] as const,
     async () => {
         if (!autoFollow.value) return;
         await nextTick();
@@ -227,19 +239,19 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
             <span class="spacer"></span>
             <button
                 class="btn btn-mini"
-                :class="msg.paused ? 'btn-warning' : ''"
+                :class="bucket.paused ? 'btn-warning' : ''"
                 @click="togglePause"
-                :title="msg.paused ? '恢复显示（数据库并未停止记录）' : '暂停显示新消息（主进程仍正常记录到数据库）'"
-            >{{ msg.paused ? '▶️ 恢复' : '⏸️ 暂停' }}</button>
+                :title="bucket.paused ? '恢复显示（数据库并未停止记录）' : '暂停显示新消息（主进程仍正常记录到数据库）'"
+            >{{ bucket.paused ? '▶️ 恢复' : '⏸️ 暂停' }}</button>
             <button class="btn btn-mini" @click="exportJson" title="导出完整 JSON">📥</button>
             <button class="btn btn-mini" @click="exportZip" title="按主题分组 ZIP">📦</button>
             <button class="btn btn-mini btn-danger" @click="clearAll" title="清空">🗑️</button>
         </div>
         <div class="panel-body">
-            <div v-if="!isActiveView" class="mismatch">
-                <div class="emoji">{{ mismatchTip.emoji }}</div>
-                <div class="title">{{ mismatchTip.title }}</div>
-                <div class="desc">{{ mismatchTip.desc }}</div>
+            <div v-if="!showView" class="mismatch">
+                <div class="emoji">{{ placeholderTip.emoji }}</div>
+                <div class="title">{{ placeholderTip.title }}</div>
+                <div class="desc">{{ placeholderTip.desc }}</div>
             </div>
 
             <template v-else>
@@ -290,7 +302,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                 v-for="t in topicList"
                                 :key="t.topic"
                                 class="t-item"
-                                :class="{ active: msg.selectedTopic === t.topic, disabled: t.disabled }"
+                                :class="{ active: bucket.selectedTopic === t.topic, disabled: t.disabled }"
                                 @click="selectTopic(t.topic)"
                                 @contextmenu.prevent="openContext($event, t.topic)"
                             >
@@ -328,18 +340,18 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 </div>
             </div>
 
-            <button v-show="showJumpBtn && !msg.paused" class="jump-top" @click="scrollToTop()" title="回到顶部查看最新">
+            <button v-show="showJumpBtn && !bucket.paused" class="jump-top" @click="scrollToTop()" title="回到顶部查看最新">
                 <span>↑ 新消息</span>
             </button>
 
-            <div v-if="msg.paused" class="paused-banner" title="点击顶部「▶️ 恢复」继续显示新消息">
+            <div v-if="bucket.paused" class="paused-banner" title="点击顶部「▶️ 恢复」继续显示新消息">
                 <span>⏸️ 已暂停显示新消息 · 主进程仍在记录到数据库</span>
             </div>
 
             <div v-if="contextMenu.visible" class="ctx" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }" @click.stop>
                 <button @click="clearTopic(contextMenu.topic!); closeContext()">清空该主题消息</button>
-                <button @click="toggleDisable(msg.topics.get(contextMenu.topic!)!); closeContext()">
-                    {{ msg.topics.get(contextMenu.topic!)?.disabled ? '恢复记录' : '禁用记录' }}
+                <button @click="toggleDisable(bucket.topics.get(contextMenu.topic!)!); closeContext()">
+                    {{ bucket.topics.get(contextMenu.topic!)?.disabled ? '恢复记录' : '禁用记录' }}
                 </button>
                 <button @click="deleteTopic(contextMenu.topic!); closeContext()">删除主题</button>
             </div>

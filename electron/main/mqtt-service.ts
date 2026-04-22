@@ -149,7 +149,7 @@ export class MqttService {
                 }
 
                 enqueueMessage(p.connectionId, topic, text, now);
-                this.enqueueIpc({ topic, payload: text, time: now, seq: ++this.seq }, ctx);
+                this.enqueueIpc({ connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq }, ctx);
                 if (++msgCount <= 3 || msgCount % 500 === 0) {
                     console.log(`[mqtt][${p.connectionId}] msg #${msgCount} (dup filtered: ${dupCount}) ${topic} (${text.length}B)`);
                 }

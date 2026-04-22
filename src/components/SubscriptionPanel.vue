@@ -65,6 +65,14 @@ async function resumeAll(): Promise<void> {
 
 const hasActive = computed(() => (selected.value?.subscriptions ?? []).some((s) => !s.paused));
 const hasPaused = computed(() => (selected.value?.subscriptions ?? []).some((s) => s.paused));
+
+/** 排序后的订阅列表：未暂停的在上，已暂停的在下，组内保持原插入顺序 */
+const orderedSubs = computed<SubscriptionConfig[]>(() => {
+    const raw = selected.value?.subscriptions ?? [];
+    const active = raw.filter((s) => !s.paused);
+    const paused = raw.filter((s) => s.paused);
+    return [...active, ...paused];
+});
 </script>
 
 <template>
@@ -97,7 +105,7 @@ const hasPaused = computed(() => (selected.value?.subscriptions ?? []).some((s) 
             <div class="list">
                 <div v-if="!selected || selected.subscriptions.length === 0" class="empty">暂无订阅</div>
                 <div
-                    v-for="s in selected?.subscriptions ?? []"
+                    v-for="s in orderedSubs"
                     :key="s.topic"
                     class="item"
                     :class="{ paused: s.paused }"

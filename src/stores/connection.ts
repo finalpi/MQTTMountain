@@ -28,7 +28,8 @@ export const useConnectionStore = defineStore('connection', () => {
 
     async function persist(): Promise<void> {
         const plain = JSON.parse(JSON.stringify(list.value)) as ConnectionConfig[];
-        await window.api.configWrite({ connections: plain, selectedId: selectedId.value });
+        const r = await window.api.configWrite({ connections: plain, selectedId: selectedId.value });
+        if (!r.success) throw new Error(r.message || '配置写入失败');
         dirty.value = false;
     }
 

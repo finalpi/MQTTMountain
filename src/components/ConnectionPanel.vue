@@ -13,6 +13,7 @@ const toast = useToast();
 const { sync: syncSubs, reset: resetSubs } = useSubscriptionSync();
 
 const showPassword = ref(false);
+const connecting = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 
 const selected = computed(() => conn.selected);
@@ -37,49 +38,71 @@ function onProtocolChange(v: MqttProtocol): void {
     conn.update(selected.value.id, patch);
 }
 
+async function saveConfig(): Promise<void> {
+    try {
+        await conn.persist();
+        toast.success('配置已保存');
+    } catch (e) {
+        toast.error('保存失败：' + (e as Error).message);
+    }
+}
+
 async function doConnect(): Promise<void> {
     const c = selected.value;
     if (!c) return;
     if (!c.host) { toast.error('请填写服务器地址'); return; }
     if (!c.port) { toast.error('请填写端口'); return; }
-    await conn.persist();
-    conn.setState(c.id, 'reconnecting');
-    const r = await window.api.mqttConnect({
-        connectionId: c.id,
-        protocol: c.protocol,
-        host: c.host,
-        port: Number(c.port),
-        path: c.path,
-        username: c.username,
-        password: c.password,
-        clientId: c.clientId,
-        disabledTopics: [...c.disabledTopics]
-    });
-    if (!r.success) {
-        toast.error('连接失败：' + (r.message || ''));
-        conn.setState(c.id, 'error', r.message);
-        return;
+    if (connecting.value) return;
+
+    connecting.value = true;
+    const label = c.name || `${c.host}:${c.port}`;
+    const wasDirty = conn.dirty;
+    try {
+        // 自动保存当前配置；失败只警告，不阻塞连接（可能只是磁盘 IO 临时问题）
+        try {
+            await conn.persist();
+        } catch (e) {
+            toast.error('配置保存失败：' + (e as Error).message + '，仍会尝试连接');
+        }
+        conn.setState(c.id, 'reconnecting');
+        const r = await window.api.mqttConnect({
+            connectionId: c.id,
+            protocol: c.protocol,
+            host: c.host,
+            port: Number(c.port),
+            path: c.path,
+            username: c.username,
+            password: c.password,
+            clientId: c.clientId,
+            disabledTopics: [...c.disabledTopics]
+        });
+        if (!r.success) {
+            toast.error(`连接失败（${label}）：${r.message || '未知错误'}`);
+            conn.setState(c.id, 'error', r.message);
+            return;
+        }
+        resetSubs(c.id);
+        await syncSubs(c, true);
+
+        // 为该连接的 bucket 预填历史（不影响其他连接）
+        msg.clearAll(c.id);
+        const recent = await window.api.mqttReadRecent({ connectionId: c.id, limit: 2000 });
+        if (recent.success && recent.data) msg.hydrate(c.id, recent.data);
+        toast.success(wasDirty ? `已连接：${label}（配置已自动保存）` : `已连接：${label}`);
+    } finally {
+        connecting.value = false;
     }
-    // broker 端订阅走「有效最外层集合」：本地列表保留全部，broker 只订不覆盖的那些
-    resetSubs(c.id);
-    await syncSubs(c, true);
-    // 切换消息区数据源到当前连接：清空 + 从日志恢复最近 2000 条
-    msg.clearAll();
-    const recent = await window.api.mqttReadRecent({ connectionId: c.id, limit: 2000 });
-    if (recent.success && recent.data) msg.hydrate(recent.data);
-    msg.setActiveConnection(c.id);
-    toast.success('已连接');
 }
 
 async function doDisconnect(): Promise<void> {
     const c = selected.value;
     if (!c) return;
+    const label = c.name || `${c.host}:${c.port}`;
     await window.api.mqttDisconnect(c.id);
     conn.setState(c.id, 'closed');
     resetSubs(c.id);
-    msg.setActiveConnection(null);
-    msg.clearAll();
-    toast.info('已断开');
+    msg.dropBucket(c.id);
+    toast.info(`已断开：${label}`);
 }
 
 function newConn(): void {
@@ -89,12 +112,13 @@ function newConn(): void {
 
 function selectConn(id: string): void {
     conn.select(id);
-    // 只切换配置，不动消息区：消息区永远显示 activeConnectionId 对应的连接
+    // 只切换配置；消息区会自动切到该连接的 bucket
 }
 
 function removeConn(id: string): void {
     if (!confirm('确定删除这个连接配置？')) return;
     window.api.mqttDisconnect(id);
+    msg.dropBucket(id);
     conn.remove(id);
 }
 
@@ -230,8 +254,10 @@ watch(
                         </div>
                     </div>
                     <div class="actions">
-                        <button class="btn btn-ghost" @click="conn.persist()">💾 保存</button>
-                        <button v-if="!isConnected" class="btn btn-primary" @click="doConnect">🔌 连接</button>
+                        <button class="btn btn-ghost" @click="saveConfig">💾 保存</button>
+                        <button v-if="!isConnected" class="btn btn-primary" :disabled="connecting" @click="doConnect">
+                            {{ connecting ? '连接中…' : '🔌 连接' }}
+                        </button>
                         <button v-else class="btn btn-danger" @click="doDisconnect">断开</button>
                     </div>
                 </div>
