@@ -242,7 +242,10 @@ onMounted(init);
 
                 <div class="topic-detail">
                     <div class="t-head">
-                        <span v-if="selectedTopic">{{ selectedTopic }}（{{ detail.length }} 条）</span>
+                        <template v-if="selectedTopic">
+                            <span class="t-head-name" :title="selectedTopic">{{ selectedTopic }}</span>
+                            <span class="t-head-count">{{ detail.length }} 条</span>
+                        </template>
                         <span v-else class="sub-empty">请从左侧选择主题</span>
                     </div>
                     <div v-if="selectedTopic" class="scroll-area">
@@ -376,6 +379,23 @@ onMounted(init);
     gap: 6px;
     flex: 0 0 auto;
 }
+.t-head-name {
+    flex: 1;
+    min-width: 0;
+    color: var(--accent-2);
+    font-family: 'JetBrains Mono', Consolas, monospace;
+    user-select: text;
+    cursor: text;
+    word-break: break-all;
+    line-height: 1.4;
+}
+.t-head-count {
+    flex: 0 0 auto;
+    font-weight: 400;
+    color: var(--text-3);
+    font-size: 11px;
+}
+
 .sort-select {
     background: var(--input-bg);
     border: 1px solid var(--border);

@@ -22,14 +22,20 @@ export function useMqttBridge() {
         rafId = requestAnimationFrame(() => {
             rafId = null;
             if (!pendingBatches.length) return;
+
+            // 暂停中：直接丢弃待处理批次（数据库/磁盘由主进程负责，不受此影响）
+            if (msg.paused) {
+                pendingBatches.length = 0;
+                return;
+            }
+
             let total = 0;
             for (const b of pendingBatches) total += b.length;
             const merged = new Array<MqttMessage>(total);
             let k = 0;
             for (const b of pendingBatches) for (let i = 0; i < b.length; i++) merged[k++] = b[i];
             pendingBatches.length = 0;
-            if (!msg.paused) msg.ingest(merged);
-            else msg.ingest(merged); // 暂停时也写入 store（保证计数/历史同步），UI 侧通过 paused 冻结刷新
+            msg.ingest(merged);
         });
     }
 

@@ -225,7 +225,12 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 <button class="tgl" :class="{ active: viewMode === 'topic' }" @click="setMode('topic')">📑 主题分组</button>
             </div>
             <span class="spacer"></span>
-            <button class="btn btn-mini" :class="msg.paused ? 'btn-warning' : ''" @click="togglePause" :title="msg.paused ? '恢复' : '暂停'">{{ msg.paused ? '▶️' : '⏸️' }}</button>
+            <button
+                class="btn btn-mini"
+                :class="msg.paused ? 'btn-warning' : ''"
+                @click="togglePause"
+                :title="msg.paused ? '恢复显示（数据库并未停止记录）' : '暂停显示新消息（主进程仍正常记录到数据库）'"
+            >{{ msg.paused ? '▶️ 恢复' : '⏸️ 暂停' }}</button>
             <button class="btn btn-mini" @click="exportJson" title="导出完整 JSON">📥</button>
             <button class="btn btn-mini" @click="exportZip" title="按主题分组 ZIP">📦</button>
             <button class="btn btn-mini btn-danger" @click="clearAll" title="清空">🗑️</button>
@@ -300,7 +305,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 </div>
                 <div class="topic-detail">
                     <div class="t-head">
-                        <span v-if="selectedTopicView">{{ selectedTopicView.topic }}</span>
+                        <span v-if="selectedTopicView" class="t-head-name" :title="selectedTopicView.topic">{{ selectedTopicView.topic }}</span>
                         <span v-else class="empty">请从左侧选择主题</span>
                     </div>
                     <div v-if="selectedTopicView" class="scroll-area" ref="topicScrollEl" @scroll.passive="onUserScroll">
@@ -323,9 +328,13 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 </div>
             </div>
 
-            <button v-show="showJumpBtn" class="jump-top" @click="scrollToTop()" title="回到顶部查看最新">
+            <button v-show="showJumpBtn && !msg.paused" class="jump-top" @click="scrollToTop()" title="回到顶部查看最新">
                 <span>↑ 新消息</span>
             </button>
+
+            <div v-if="msg.paused" class="paused-banner" title="点击顶部「▶️ 恢复」继续显示新消息">
+                <span>⏸️ 已暂停显示新消息 · 主进程仍在记录到数据库</span>
+            </div>
 
             <div v-if="contextMenu.visible" class="ctx" :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }" @click.stop>
                 <button @click="clearTopic(contextMenu.topic!); closeContext()">清空该主题消息</button>
@@ -446,6 +455,24 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     }
 }
 
+.paused-banner {
+    position: absolute;
+    left: 50%;
+    top: 70px;
+    transform: translateX(-50%);
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    background: rgba(245, 158, 11, 0.18);
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    color: #fbbf24;
+    box-shadow: 0 8px 20px -6px rgba(245, 158, 11, 0.35);
+    z-index: 5;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
 .jump-top {
     position: absolute;
     right: 18px;
@@ -496,6 +523,17 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     align-items: center;
     justify-content: space-between;
     gap: 6px;
+
+    .t-head-name {
+        flex: 1;
+        min-width: 0;
+        color: var(--accent-2);
+        font-family: 'JetBrains Mono', Consolas, monospace;
+        user-select: text;
+        cursor: text;
+        word-break: break-all;
+        line-height: 1.4;
+    }
 }
 .sort-select {
     background: var(--input-bg);
