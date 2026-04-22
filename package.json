@@ -1,6 +1,6 @@
 {
   "name": "mqttmountain",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "高性能 MQTT 客户端（Electron + Vue 3 + TS）",
   "main": "dist-electron/main/index.js",
   "author": "",
