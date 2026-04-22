@@ -1,0 +1,103 @@
+name: Build & Release
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+permissions:
+    contents: write
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - os: windows-latest
+                      platform: win
+                    - os: macos-latest
+                      platform: mac
+                    - os: ubuntu-latest
+                      platform: linux
+
+        runs-on: ${{ matrix.os }}
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: npm
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Rebuild native modules for Electron
+              run: npx electron-builder install-app-deps
+
+            # 先跑 vite 构建（渲染 + 主进程 + preload）
+            - name: Build renderer & main
+              run: npx vite build
+
+            # 兜底：没有 build/icon.png 时生成一个 512x512 纯色占位
+            - name: Ensure build icon exists
+              shell: bash
+              run: |
+                  mkdir -p build
+                  if [ ! -f build/icon.png ]; then
+                    python3 -c "
+                  import struct, zlib
+                  W = H = 512
+                  raw = b''
+                  for y in range(H):
+                      raw += b'\x00'
+                      for x in range(W):
+                          raw += b'\x33\x99\xee\xff'
+                  def chunk(tag, data):
+                      c = tag + data
+                      return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
+                  ihdr = struct.pack('>IIBBBBB', W, H, 8, 6, 0, 0, 0)
+                  with open('build/icon.png', 'wb') as f:
+                      f.write(b'\x89PNG\r\n\x1a\n')
+                      f.write(chunk(b'IHDR', ihdr))
+                      f.write(chunk(b'IDAT', zlib.compress(raw)))
+                      f.write(chunk(b'IEND', b''))
+                  "
+                  fi
+
+            - name: Package (Windows)
+              if: matrix.platform == 'win'
+              run: npx electron-builder --win --publish never
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Package (macOS)
+              if: matrix.platform == 'mac'
+              run: npx electron-builder --mac --publish never
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+            - name: Package (Linux)
+              if: matrix.platform == 'linux'
+              run: npx electron-builder --linux --publish never
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+            # 每个平台构建完直接上传到 Release
+            - name: Upload to GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  draft: false
+                  generate_release_notes: true
+                  files: |
+                      release/*.exe
+                      release/*.dmg
+                      release/*.AppImage
+                      release/*.deb
+                      release/*.zip
+                      release/*.tar.gz
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
