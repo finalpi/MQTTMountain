@@ -46,6 +46,9 @@ export const useMessageStore = defineStore('messages', () => {
     const publishHistoryVersion = ref(0);
 
     let maxPerTopic = 500;
+    // 渲染端全局自增 seq（永不复用），避免与主进程 seq 撞车导致 v-for key 重复
+    let localSeqGen = 0;
+    const nextSeq = (): number => ++localSeqGen;
 
     function setLimits(total: number, perTopic: number): void {
         maxPerTopic = Math.max(50, perTopic);
@@ -77,7 +80,7 @@ export const useMessageStore = defineStore('messages', () => {
         if (batch.length === 0) return;
         for (let i = 0; i < batch.length; i++) {
             const m = batch[i];
-            const row: MsgRow = { topic: m.topic, payload: m.payload, time: m.time, seq: m.seq };
+            const row: MsgRow = { topic: m.topic, payload: m.payload, time: m.time, seq: nextSeq() };
             timeline.push(row);
             const v = topics.get(m.topic);
             if (v) {
@@ -144,16 +147,15 @@ export const useMessageStore = defineStore('messages', () => {
     /** 用主进程返回的「最近消息」预填 */
     function hydrate(rows: { topic: string; payload: string; time: number }[]): void {
         if (!rows.length) return;
-        let seq = 0;
         const ordered = rows.slice().sort((a, b) => a.time - b.time);
         for (const r of ordered) {
-            const row: MsgRow = { topic: r.topic, payload: r.payload, time: r.time, seq: ++seq };
+            const row: MsgRow = { topic: r.topic, payload: r.payload, time: r.time, seq: nextSeq() };
             timeline.push(row);
             const v = ensureTopic(r.topic);
             v.buf.push(row);
             v.total++;
             v.lastTime = r.time;
-            v.lastSeq = seq;
+            v.lastSeq = row.seq;
         }
         timelineVersion.value++;
         topicsVersion.value++;

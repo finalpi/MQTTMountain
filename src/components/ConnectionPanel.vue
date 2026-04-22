@@ -3,12 +3,14 @@ import { computed, ref, watch } from 'vue';
 import { useConnectionStore } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
 import { useToast } from '@/composables/useToast';
+import { useSubscriptionSync } from '@/composables/useSubscriptionSync';
 import type { MqttProtocol } from '@shared/types';
 import { randomClientId } from '@/utils/format';
 
 const conn = useConnectionStore();
 const msg = useMessageStore();
 const toast = useToast();
+const { sync: syncSubs, reset: resetSubs } = useSubscriptionSync();
 
 const showPassword = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
@@ -58,11 +60,9 @@ async function doConnect(): Promise<void> {
         conn.setState(c.id, 'error', r.message);
         return;
     }
-    // 连接后恢复订阅（跳过已暂停的）
-    for (const sub of c.subscriptions) {
-        if (sub.paused) continue;
-        await window.api.mqttSubscribe({ connectionId: c.id, topic: sub.topic, qos: sub.qos });
-    }
+    // broker 端订阅走「有效最外层集合」：本地列表保留全部，broker 只订不覆盖的那些
+    resetSubs(c.id);
+    await syncSubs(c, true);
     // 切换消息区数据源到当前连接：清空 + 从日志恢复最近 2000 条
     msg.clearAll();
     const recent = await window.api.mqttReadRecent({ connectionId: c.id, limit: 2000 });
@@ -76,6 +76,7 @@ async function doDisconnect(): Promise<void> {
     if (!c) return;
     await window.api.mqttDisconnect(c.id);
     conn.setState(c.id, 'closed');
+    resetSubs(c.id);
     msg.setActiveConnection(null);
     msg.clearAll();
     toast.info('已断开');

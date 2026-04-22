@@ -3,11 +3,13 @@ import { ref, computed } from 'vue';
 import { useConnectionStore } from '@/stores/connection';
 import { useToast } from '@/composables/useToast';
 import { useUiPrefs } from '@/composables/useUiPrefs';
+import { useSubscriptionSync } from '@/composables/useSubscriptionSync';
 import type { SubscriptionConfig } from '@shared/types';
 
 const conn = useConnectionStore();
 const toast = useToast();
 const { prefs, toggleRight } = useUiPrefs();
+const { sync } = useSubscriptionSync();
 const topic = ref('test/#');
 const qos = ref<0 | 1 | 2>(0);
 const isOpen = computed(() => prefs.activeRight === 'sub');
@@ -21,59 +23,44 @@ async function doSubscribe(): Promise<void> {
     const t = topic.value.trim();
     if (!t) { toast.error('主题不能为空'); return; }
     if (!canOp.value) { toast.error('请先连接'); return; }
-    const r = await window.api.mqttSubscribe({ connectionId: c.id, topic: t, qos: qos.value });
-    if (import.meta.env.DEV) console.debug('[mqtt] subscribe result:', t, r);
-    if (r.success) {
-        conn.addSubscription(c.id, { topic: t, qos: qos.value, paused: false });
-        toast.success(`订阅成功：${t}`);
-    } else {
-        toast.error('订阅失败：' + (r.message || ''));
-    }
+
+    // 已存在（等同 filter 已订阅过），保持幂等
+    const existing = c.subscriptions.find((s) => s.topic === t);
+    if (existing) { toast.info(`已经订阅过：${t}`); return; }
+
+    // 本地先加；broker 层由 sync 决定是否真的下发 / 取消被覆盖的
+    conn.addSubscription(c.id, { topic: t, qos: qos.value, paused: false });
+    await sync(c, canOp.value);
+    toast.success(`订阅成功：${t}`);
 }
 
 async function doUnsubscribe(t: string): Promise<void> {
     const c = selected.value;
     if (!c) return;
-    if (canOp.value) await window.api.mqttUnsubscribe({ connectionId: c.id, topic: t });
     conn.removeSubscription(c.id, t);
+    await sync(c, canOp.value);
 }
 
 async function togglePause(s: SubscriptionConfig): Promise<void> {
     const c = selected.value;
     if (!c) return;
     const next = !s.paused;
-    if (canOp.value) {
-        if (next) {
-            const r = await window.api.mqttUnsubscribe({ connectionId: c.id, topic: s.topic });
-            if (!r.success) {
-                toast.error('暂停失败：' + (r.message || ''));
-                return;
-            }
-        } else {
-            const r = await window.api.mqttSubscribe({ connectionId: c.id, topic: s.topic, qos: s.qos });
-            if (!r.success) {
-                toast.error('恢复失败：' + (r.message || ''));
-                return;
-            }
-        }
-    }
     conn.setSubscriptionPaused(c.id, s.topic, next);
+    await sync(c, canOp.value);
     toast.info(next ? `已暂停：${s.topic}` : `已恢复：${s.topic}`);
 }
 
 async function pauseAll(): Promise<void> {
     const c = selected.value;
     if (!c) return;
-    for (const s of [...c.subscriptions]) {
-        if (!s.paused) await togglePause(s);
-    }
+    for (const s of c.subscriptions) if (!s.paused) conn.setSubscriptionPaused(c.id, s.topic, true);
+    await sync(c, canOp.value);
 }
 async function resumeAll(): Promise<void> {
     const c = selected.value;
     if (!c) return;
-    for (const s of [...c.subscriptions]) {
-        if (s.paused) await togglePause(s);
-    }
+    for (const s of c.subscriptions) if (s.paused) conn.setSubscriptionPaused(c.id, s.topic, false);
+    await sync(c, canOp.value);
 }
 
 const hasActive = computed(() => (selected.value?.subscriptions ?? []).some((s) => !s.paused));
