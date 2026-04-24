@@ -6,6 +6,7 @@ import { initStorage, shutdownStorage } from './storage';
 import { initSettings, getCurrentLogDir, readSettings } from './settings';
 import { MqttService } from './mqtt-service';
 import { runAutoDeleteAsync } from './storage';
+import { pluginManager } from './plugin-manager';
 import './constants';
 
 if (process.platform === 'win32') {
@@ -96,6 +97,7 @@ async function createWindow() {
 app.whenReady().then(async () => {
     initSettings();
     initStorage(getCurrentLogDir());
+    await pluginManager.init().catch((e) => console.error('[plugin] init:', e));
     mqttService = new MqttService(() => win);
     initIpc(mqttService);
     await createWindow();
@@ -116,6 +118,7 @@ app.on('before-quit', () => {
 app.on('window-all-closed', () => {
     mqttService?.shutdown();
     shutdownStorage();
+    pluginManager.shutdown();
     if (process.platform !== 'darwin') app.quit();
 });
 

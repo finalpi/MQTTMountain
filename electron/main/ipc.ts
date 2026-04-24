@@ -24,6 +24,8 @@ import {
     runAutoDeleteAsync
 } from './storage';
 import { APP_START_TIME } from './constants';
+import { pluginManager } from './plugin-manager';
+import { appendPublishHistory, readPublishHistory } from './publish-history';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -139,4 +141,93 @@ export function initIpc(mqttService: MqttService): void {
         return { success: true };
     });
     ipcMain.handle('app:getStartTime', () => ({ success: true, data: APP_START_TIME }));
+
+    ipcMain.handle('publishHistory:read', (_e, p: { connectionId: string; limit?: number }) => {
+        try {
+            return { success: true, data: readPublishHistory(p.connectionId, p.limit ?? 50) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('publishHistory:append', (_e, row: {
+        connectionId: string;
+        topic: string;
+        payload: string;
+        qos: number;
+        retain: boolean;
+        time: number;
+    }) => {
+        try {
+            appendPublishHistory(row);
+            return { success: true };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+
+    // ----------------- plugins -----------------
+    ipcMain.handle('plugin:list', () => {
+        try { return { success: true, data: pluginManager.list() }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:setEnabled', async (_e, p: { pluginId: string; enabled: boolean }) => {
+        try { await pluginManager.setEnabled(p.pluginId, p.enabled); return { success: true }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:installFromGit', async (_e, p: { url: string; ref?: string }) => {
+        try { const r = await pluginManager.installFromGit(p.url, p.ref); return { success: true, data: r }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:installFromPath', async (_e, localPath: string) => {
+        try { const r = await pluginManager.installFromPath(localPath); return { success: true, data: r }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:uninstall', async (_e, pluginId: string) => {
+        try { await pluginManager.uninstall(pluginId); return { success: true }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:reload', async (_e, pluginId: string) => {
+        try { await pluginManager.reload(pluginId); return { success: true }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:updateFromGit', async (_e, pluginId: string) => {
+        try { await pluginManager.updateFromGit(pluginId); return { success: true }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:decode', async (_e, p: { topic: string; payload: string }) => {
+        try { return { success: true, data: await pluginManager.decode(p.topic, p.payload) }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:decodeBatch', async (_e, items: { topic: string; payload: string }[]) => {
+        try { return { success: true, data: await pluginManager.decodeBatch(items) }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:topicLabels', async (_e, topics: string[]) => {
+        try { return { success: true, data: await pluginManager.topicLabels(topics) }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:openDir', async () => {
+        try { await shell.openPath(pluginManager.pluginsDir); return { success: true }; }
+        catch (e) { return { success: false, message: (e as Error).message }; }
+    });
+    ipcMain.handle('plugin:pluginsDir', () => ({ success: true, data: pluginManager.pluginsDir }));
+    ipcMain.handle('plugin:chooseLocalDir', async () => {
+        try {
+            const r = await dialog.showOpenDialog(win() ?? undefined!, {
+                title: '选择本地插件目录',
+                properties: ['openDirectory']
+            });
+            if (r.canceled || !r.filePaths.length) return { success: true, data: null };
+            return { success: true, data: { path: r.filePaths[0] } };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('plugin:readViewHtml', async (_e, p: { pluginId: string; viewId: string }) => {
+        try {
+            return { success: true, data: pluginManager.readViewHtml(p.pluginId, p.viewId) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
 }

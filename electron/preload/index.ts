@@ -9,6 +9,7 @@ import type {
     PublishPayload,
     ApiResult
 } from '../../shared/types';
+import type { DecodedResult, PluginRecord } from '../../shared/plugin';
 
 const invoke = <T = unknown>(ch: string, ...args: unknown[]) =>
     ipcRenderer.invoke(ch, ...args) as Promise<ApiResult<T>>;
@@ -41,6 +42,28 @@ const api = {
 
     appRelaunch: () => invoke('app:relaunch'),
     appGetStartTime: () => invoke<number>('app:getStartTime'),
+    publishHistoryRead: (p: { connectionId: string; limit?: number }) =>
+        invoke<Array<{ connectionId: string; topic: string; payload: string; qos: number; retain: boolean; time: number }>>('publishHistory:read', p),
+    publishHistoryAppend: (row: { connectionId: string; topic: string; payload: string; qos: number; retain: boolean; time: number }) =>
+        invoke('publishHistory:append', row),
+
+    // ---------------- plugins ----------------
+    pluginList: () => invoke<PluginRecord[]>('plugin:list'),
+    pluginSetEnabled: (p: { pluginId: string; enabled: boolean }) => invoke('plugin:setEnabled', p),
+    pluginInstallFromGit: (p: { url: string; ref?: string }) => invoke<PluginRecord>('plugin:installFromGit', p),
+    pluginInstallFromPath: (localPath: string) => invoke<PluginRecord>('plugin:installFromPath', localPath),
+    pluginUninstall: (pluginId: string) => invoke('plugin:uninstall', pluginId),
+    pluginReload: (pluginId: string) => invoke('plugin:reload', pluginId),
+    pluginUpdateFromGit: (pluginId: string) => invoke('plugin:updateFromGit', pluginId),
+    pluginDecode: (p: { topic: string; payload: string }) => invoke<DecodedResult | null>('plugin:decode', p),
+    pluginDecodeBatch: (items: { topic: string; payload: string }[]) =>
+        invoke<(DecodedResult | null)[]>('plugin:decodeBatch', items),
+    pluginTopicLabels: (topics: string[]) => invoke<Record<string, string>>('plugin:topicLabels', topics),
+    pluginOpenDir: () => invoke('plugin:openDir'),
+    pluginsDir: () => invoke<string>('plugin:pluginsDir'),
+    pluginChooseLocalDir: () => invoke<{ path: string } | null>('plugin:chooseLocalDir'),
+    pluginReadViewHtml: (p: { pluginId: string; viewId: string }) =>
+        invoke<{ html: string; baseUrl: string }>('plugin:readViewHtml', p),
 
     onMqttMessages: (cb: (batch: MqttMessage[]) => void) => {
         const listener = (_e: IpcRendererEvent, batch: MqttMessage[]) => cb(batch);

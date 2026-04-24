@@ -4,13 +4,22 @@ import { useConnectionStore } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
 import { useToast } from '@/composables/useToast';
 import { useUiPrefs } from '@/composables/useUiPrefs';
+import { usePluginStore } from '@/stores/plugins';
+import { useParamMemory } from '@/composables/useParamMemory';
 import { shortTime } from '@/utils/format';
+import type { SenderDefinition } from '@shared/plugin';
 
 const conn = useConnectionStore();
 const msg = useMessageStore();
 const toast = useToast();
 const { prefs, toggleRight } = useUiPrefs();
+const plugins = usePluginStore();
+const paramMem = useParamMemory();
 const isOpen = computed(() => prefs.activeRight === 'pub');
+
+function datalistId(paramKey: string): string {
+    return `mm-paramlist-${paramKey}`;
+}
 
 const topic = ref('test/message');
 const qos = ref<0 | 1 | 2>(0);
@@ -113,7 +122,15 @@ async function doPublish(): Promise<void> {
         retain: retain.value
     });
     if (r.success) {
-        msg.pushPublishHistory(c.id, { topic: topic.value.trim(), payload: payload.value, qos: qos.value, retain: retain.value, time: Date.now() });
+        const item = { topic: topic.value.trim(), payload: payload.value, qos: qos.value, retain: retain.value, time: Date.now() };
+        msg.pushPublishHistory(c.id, item);
+        await window.api.publishHistoryAppend({ connectionId: c.id, ...item });
+        // 发送成功后把当前 sender 的参数值记入历史，下次可下拉选择
+        if (activeSender.value?.params) {
+            for (const pr of activeSender.value.params) {
+                paramMem.remember(pr.key, paramValues.value[pr.key]);
+            }
+        }
         toast.success('已发送');
     } else {
         toast.error('发送失败：' + (r.message || ''));
@@ -125,6 +142,98 @@ function repeat(item: { topic: string; payload: string; qos: number; retain: boo
     payload.value = item.payload;
     qos.value = item.qos as 0 | 1 | 2;
     retain.value = item.retain;
+}
+
+/** 插件提供的发送模板，按插件分组用于下拉展示 */
+const senderGroups = computed(() => {
+    const map = new Map<string, (SenderDefinition & { pluginId: string; pluginName: string })[]>();
+    for (const s of plugins.allSenders) {
+        const key = s.pluginName;
+        if (!map.has(key)) map.set(key, []);
+        map.get(key)!.push(s);
+    }
+    return [...map.entries()].map(([name, items]) => ({ name, items }));
+});
+
+const paramValues = ref<Record<string, string>>({});
+const paramSuggestionCache = ref<Record<string, string[]>>({});
+const activeSender = ref<(SenderDefinition & { pluginId: string; pluginName: string }) | null>(null);
+
+function cloudSnFromTopic(topicText: string | undefined): string | undefined {
+    const parts = String(topicText || '').split('/');
+    if ((parts[0] === 'thing' || parts[0] === 'sys') && parts[1] === 'product' && parts[2]) {
+        return parts[2];
+    }
+    return undefined;
+}
+
+function suggestionListFor(paramKey: string): string[] {
+    const values = new Set<string>();
+    const addAll = (items: Array<string | undefined>): void => {
+        for (const item of items) {
+            if (typeof item === 'string' && item.trim()) values.add(item.trim());
+        }
+    };
+
+    if (paramKey === 'airportSn') {
+        addAll(paramMem.suggestionsFor('airportSn'));
+        addAll(paramMem.suggestionsFor('gateway'));
+    } else {
+        addAll(paramMem.suggestionsFor(paramKey));
+    }
+
+    const bucket = msg.bucketFor(conn.selectedId);
+    void bucket.timelineVersion;
+    void bucket.publishHistoryVersion;
+
+    if (paramKey === 'airportSn' || paramKey === 'droneSn') {
+        for (const row of bucket.timeline.snapshot()) {
+            const meta = row.decoded?.meta;
+            if (!meta || meta.family !== 'dji-shangyun') continue;
+            if (paramKey === 'airportSn' && typeof meta.airportSn === 'string') values.add(meta.airportSn);
+            if (paramKey === 'droneSn' && typeof meta.droneSn === 'string') values.add(meta.droneSn);
+        }
+    }
+
+    if (paramKey === 'airportSn') {
+        for (const item of bucket.publishHistory.snapshot()) {
+            const sn = cloudSnFromTopic(item.topic);
+            if (sn) values.add(sn);
+        }
+    }
+
+    return [...values];
+}
+
+function applyTemplate(tpl: string, vals: Record<string, string>): string {
+    return tpl.replace(/\{(\w+)\}/g, (_, k) => vals[k] ?? `{${k}}`);
+}
+
+function pickSender(id: string): void {
+    const s = plugins.allSenders.find((x) => x.id === id);
+    if (!s) { activeSender.value = null; return; }
+    activeSender.value = s;
+    paramValues.value = {};
+    paramSuggestionCache.value = {};
+    for (const pr of s.params ?? []) {
+        // 优先用记忆里最近一次的值，其次用插件声明的 default
+        const suggestions = suggestionListFor(pr.key);
+        paramSuggestionCache.value[pr.key] = suggestions;
+        const memo = suggestions[0];
+        const initial = memo != null && memo !== '' ? memo : String(pr.default ?? '');
+        paramValues.value[pr.key] = initial;
+    }
+    topic.value = applyTemplate(s.topic, paramValues.value);
+    payload.value = applyTemplate(s.payloadTemplate, paramValues.value);
+    if (s.qos != null) qos.value = s.qos;
+    if (s.retain != null) retain.value = s.retain;
+}
+
+function onParamInput(): void {
+    const s = activeSender.value;
+    if (!s) return;
+    topic.value = applyTemplate(s.topic, paramValues.value);
+    payload.value = applyTemplate(s.payloadTemplate, paramValues.value);
 }
 
 const historyList = computed(() => {
@@ -142,6 +251,43 @@ const historyList = computed(() => {
             <span class="chev">{{ isOpen ? '▾' : '▸' }}</span>
         </div>
         <div v-if="isOpen" class="panel-body">
+            <div v-if="senderGroups.length" class="field">
+                <label>🧩 插件模板</label>
+                <select :value="activeSender?.id ?? ''" @change="pickSender(($event.target as HTMLSelectElement).value)">
+                    <option value="">— 自定义发送 —</option>
+                    <optgroup v-for="g in senderGroups" :key="g.name" :label="g.name">
+                        <option v-for="s in g.items" :key="s.id" :value="s.id">{{ s.name }}</option>
+                    </optgroup>
+                </select>
+            </div>
+            <div v-if="activeSender && (activeSender.params?.length ?? 0) > 0" class="sender-params">
+                <div v-for="p in activeSender.params" :key="p.key" class="field">
+                    <label>
+                        <span>{{ p.label }}{{ p.required ? ' *' : '' }}</span>
+                        <span
+                            v-if="p.type !== 'select' && (paramSuggestionCache[p.key] ?? []).length"
+                            class="mem-tag"
+                            :title="(paramSuggestionCache[p.key] ?? []).join('\n')"
+                        >🕘 {{ (paramSuggestionCache[p.key] ?? []).length }} 条历史</span>
+                    </label>
+                    <select v-if="p.type === 'select'" v-model="paramValues[p.key]" @change="onParamInput">
+                        <option v-for="opt in (p.options ?? [])" :key="opt" :value="opt">{{ opt }}</option>
+                    </select>
+                    <input
+                        v-else
+                        :type="p.type === 'number' ? 'number' : 'text'"
+                        v-model="paramValues[p.key]"
+                        :placeholder="p.placeholder"
+                        :list="p.type === 'number' ? undefined : datalistId(p.key)"
+                        @input="onParamInput"
+                        @focus="paramSuggestionCache[p.key] = suggestionListFor(p.key)"
+                    />
+                    <datalist v-if="p.type !== 'number' && p.type !== 'select'" :id="datalistId(p.key)">
+                        <option v-for="v in (paramSuggestionCache[p.key] ?? [])" :key="v" :value="v" />
+                    </datalist>
+                </div>
+            </div>
+
             <div class="field">
                 <label>目标主题</label>
                 <input v-model="topic" placeholder="test/topic" />
@@ -223,6 +369,28 @@ const historyList = computed(() => {
     }
 }
 
+.sender-params {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+
+    .field label {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 8px;
+    }
+    .mem-tag {
+        font-size: 10px;
+        color: var(--accent);
+        background: rgba(124, 92, 255, 0.12);
+        padding: 1px 6px;
+        border-radius: 999px;
+        white-space: nowrap;
+        cursor: help;
+    }
+}
+
 .payload-label {
     display: flex;
     align-items: center;
@@ -295,10 +463,10 @@ const historyList = computed(() => {
 }
 
 .history {
-    margin-top: 6px;
+    margin-top: 10px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 8px;
 
     > label {
         font-size: 11px;
@@ -306,39 +474,66 @@ const historyList = computed(() => {
         position: sticky;
         top: 0;
         background: var(--surface);
-        padding: 2px 0;
+        padding: 2px 0 4px;
     }
 
     .item {
         display: flex;
+        flex-wrap: wrap;
         gap: 8px;
-        align-items: center;
-        padding: 5px 8px;
+        align-items: flex-start;
+        padding: 10px;
         background: var(--card-bg);
-        border-radius: 6px;
+        border: 1px solid var(--border);
+        border-radius: 10px;
         font-size: 12px;
         cursor: pointer;
+        user-select: text;
+        transition: background 0.15s, border-color 0.15s, transform 0.15s;
 
         &:hover {
             background: var(--card-hover-bg);
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
         }
 
         .time {
             font-family: 'JetBrains Mono', Consolas, monospace;
             color: var(--text-3);
             font-size: 11px;
+            flex: 0 0 auto;
+        }
+        .pill {
+            padding: 2px 8px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: var(--surface-2);
+            color: var(--text-2);
+            font-size: 10px;
+            font-weight: 600;
+            flex: 0 0 auto;
         }
         .t {
+            flex: 1 1 100%;
             color: var(--accent-2);
             font-family: 'JetBrains Mono', Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            word-break: break-all;
         }
         .p {
-            flex: 1;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
+            flex: 1 1 100%;
             color: var(--text-2);
             font-family: 'JetBrains Mono', Consolas, monospace;
+            white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.5;
+            background: rgba(0, 0, 0, 0.16);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 8px;
+            padding: 10px;
+            max-height: 120px;
+            overflow: auto;
         }
     }
 }

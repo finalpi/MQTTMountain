@@ -1,44 +1,78 @@
 <script setup lang="ts">
-import { onMounted, onBeforeUnmount, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import AppHeader from './components/AppHeader.vue';
 import ConnectionPanel from './components/ConnectionPanel.vue';
 import SubscriptionPanel from './components/SubscriptionPanel.vue';
 import PublishPanel from './components/PublishPanel.vue';
 import MessageViewer from './components/MessageViewer.vue';
 import HistoryPanel from './components/HistoryPanel.vue';
+import PluginPanel from './components/PluginPanel.vue';
+import PluginWebView from './components/PluginWebView.vue';
 import SettingsPanel from './components/SettingsPanel.vue';
 import ToastHost from './components/ToastHost.vue';
 import FormatViewerModal from './components/FormatViewerModal.vue';
 import { useConnectionStore } from './stores/connection';
 import { useMessageStore } from './stores/messages';
 import { useSettingsStore } from './stores/settings';
+import { usePluginStore } from './stores/plugins';
 import { useMqttBridge } from './composables/useMqttBridge';
+import { installPluginHostBridge } from './composables/usePluginHostBridge';
 import { useToast } from './composables/useToast';
 import { useFocusFix } from './composables/useFocusFix';
 
 const conn = useConnectionStore();
 const msg = useMessageStore();
 const settings = useSettingsStore();
+const plugins = usePluginStore();
 const { start, stop } = useMqttBridge();
 const toast = useToast();
 useFocusFix();
+let teardownPluginHostBridge: (() => void) | null = null;
 
-type MainTab = 'messages' | 'history';
+type StaticMainTab = 'messages' | 'history' | 'plugins';
+type MainTab = StaticMainTab | `plugin:${string}`;
+
 const mainTab = ref<MainTab>('messages');
 const leftCollapsed = ref(false);
 const rightCollapsed = ref(false);
 
+const pluginCenterViews = computed(() => plugins.centerViews);
+const activePluginView = computed(() => {
+    if (!mainTab.value.startsWith('plugin:')) return null;
+    const id = mainTab.value.slice('plugin:'.length);
+    return pluginCenterViews.value.find((view) => view.id === id) ?? null;
+});
+
 onMounted(async () => {
-    await Promise.all([conn.load(), settings.load()]);
+    await Promise.all([conn.load(), settings.load(), plugins.refresh()]);
     msg.setLimits(settings.state.maxMemoryMessages, settings.state.maxPerTopic);
+    await Promise.all(
+        conn.list.map(async (item) => {
+            const r = await window.api.publishHistoryRead({ connectionId: item.id, limit: 50 });
+            if (r.success && r.data) {
+                msg.replacePublishHistory(item.id, r.data.map((row) => ({
+                    topic: row.topic,
+                    payload: row.payload,
+                    qos: row.qos,
+                    retain: row.retain,
+                    time: row.time
+                })));
+            }
+        })
+    );
     start();
+    teardownPluginHostBridge = installPluginHostBridge();
 
     window.api.onAutoDeleteDone((files) => {
         if (files > 0) toast.info(`已自动清理 ${files} 个过期日志文件`);
     });
 });
 
-onBeforeUnmount(() => stop());
+onBeforeUnmount(() => {
+    stop();
+    teardownPluginHostBridge?.();
+    teardownPluginHostBridge = null;
+});
 </script>
 
 <template>
@@ -57,8 +91,17 @@ onBeforeUnmount(() => stop());
                         :title="leftCollapsed ? '展开左栏' : '收起左栏'"
                         @click="leftCollapsed = !leftCollapsed"
                     >‹</button>
-                    <button class="tab" :class="{ active: mainTab === 'messages' }" @click="mainTab = 'messages'">💬 实时消息</button>
-                    <button class="tab" :class="{ active: mainTab === 'history' }" @click="mainTab = 'history'">🔍 历史查询</button>
+                    <button class="tab" :class="{ active: mainTab === 'messages' }" @click="mainTab = 'messages'">实时消息</button>
+                    <button class="tab" :class="{ active: mainTab === 'history' }" @click="mainTab = 'history'">历史查询</button>
+                    <button
+                        v-for="view in pluginCenterViews"
+                        :key="view.pluginId + ':' + view.id"
+                        class="tab"
+                        :class="{ active: mainTab === `plugin:${view.id}` }"
+                        :title="view.description || view.pluginName"
+                        @click="mainTab = `plugin:${view.id}`"
+                    >{{ view.name }}</button>
+                    <button class="tab" :class="{ active: mainTab === 'plugins' }" @click="mainTab = 'plugins'">插件</button>
                     <span class="tab-spacer"></span>
                     <button
                         class="col-toggle"
@@ -70,6 +113,12 @@ onBeforeUnmount(() => stop());
                 <div class="tab-body">
                     <MessageViewer v-show="mainTab === 'messages'" />
                     <HistoryPanel v-show="mainTab === 'history'" />
+                    <PluginWebView
+                        v-if="activePluginView?.type === 'web'"
+                        v-show="mainTab === `plugin:${activePluginView.id}`"
+                        :view="activePluginView"
+                    />
+                    <PluginPanel v-show="mainTab === 'plugins'" />
                 </div>
             </section>
 
@@ -135,15 +184,23 @@ onBeforeUnmount(() => stop());
     gap: 12px;
 }
 
-/* 显式占位，避免折叠后 center 自动流到第一列的 grid 坑 */
 .left {
     grid-column: 1;
 }
+
 .center {
     grid-column: 2;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    gap: 0;
 }
+
 .right {
     grid-column: 3;
+    overflow: hidden;
+    padding-right: 2px;
 }
 
 .left {
@@ -151,14 +208,6 @@ onBeforeUnmount(() => stop());
         flex: 1;
         min-height: 0;
     }
-}
-
-.center {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    overflow: hidden;
-    gap: 0;
 }
 
 .tabs {
@@ -183,6 +232,7 @@ onBeforeUnmount(() => stop());
         &:hover {
             color: var(--text-0);
         }
+
         &.active {
             color: var(--text-0);
             background: var(--surface);
@@ -211,12 +261,12 @@ onBeforeUnmount(() => stop());
         transition: background 0.15s, transform 0.2s, color 0.15s;
         font-family: inherit;
         line-height: 1;
-        padding: 0 0 2px;
 
         &:hover {
             background: var(--card-hover-bg);
             color: var(--text-0);
         }
+
         &.flipped {
             transform: rotate(180deg);
         }
@@ -237,23 +287,22 @@ onBeforeUnmount(() => stop());
         background: transparent;
         backdrop-filter: none;
     }
+
     :deep(> section.panel > .panel-head) {
         padding: 10px 16px;
     }
 }
 
 .right {
-    overflow: hidden;
-    padding-right: 2px;
-
     :deep(> .panel) {
         flex: 0 0 auto;
     }
-    /* 当前展开的那一项撑满剩余空间；body 内部自行滚动 */
+
     :deep(> .panel.open) {
         flex: 1 1 0;
         min-height: 0;
     }
+
     :deep(> .panel.open > .panel-body) {
         overflow-y: auto;
     }

@@ -1,0 +1,40 @@
+{
+    "id": "com.example.demo",
+    "name": "示例插件",
+    "version": "1.0.0",
+    "description": "演示 MQTTMountain 插件的最小骨架：声明式 sender + decode + topicLabel",
+    "author": "example",
+    "homepage": "https://github.com/your-name/mqttmountain-plugin-example",
+    "main": "index.js",
+    "engines": { "mqttmountain": ">=1.0.0" },
+    "topicPatterns": [
+        "demo/+/events",
+        "demo/+/state"
+    ],
+    "senders": [
+        {
+            "id": "demo.ping",
+            "name": "🏓 Ping 测试",
+            "group": "调试",
+            "topic": "demo/{deviceId}/services",
+            "payloadTemplate": "{\"method\":\"ping\",\"data\":{\"from\":\"{from}\"}}",
+            "qos": 0,
+            "params": [
+                { "key": "deviceId", "label": "设备 ID", "required": true, "placeholder": "device-001" },
+                { "key": "from", "label": "发送方", "default": "mqtt-mountain" }
+            ]
+        },
+        {
+            "id": "demo.reboot",
+            "name": "🔄 重启设备",
+            "group": "控制",
+            "topic": "demo/{deviceId}/services",
+            "payloadTemplate": "{\"method\":\"device_reboot\",\"data\":{\"delay_sec\":{delay}}}",
+            "qos": 1,
+            "params": [
+                { "key": "deviceId", "label": "设备 ID", "required": true },
+                { "key": "delay", "label": "延迟秒数", "type": "number", "default": 3 }
+            ]
+        }
+    ]
+}

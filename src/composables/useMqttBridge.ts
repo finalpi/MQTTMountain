@@ -1,49 +1,80 @@
 import { watch } from 'vue';
 import { useConnectionStore, type ConnState } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
+import { useParamMemory } from './useParamMemory';
 import type { MqttMessage } from '@shared/types';
 
-interface PendingItem { connId: string; batch: MqttMessage[] }
+interface PendingItem {
+    connId: string;
+    batch: MqttMessage[];
+}
 
-/**
- * 桥接主进程批量消息 → 渲染侧 store。
- * 收到一批消息后用 requestAnimationFrame 合并，避免每批都触发响应式刷新。
- */
 export function useMqttBridge() {
     const conn = useConnectionStore();
     const msg = useMessageStore();
+    const paramMem = useParamMemory();
     let unsubMsg: (() => void) | null = null;
     let unsubState: (() => void) | null = null;
     let stopWatch: (() => void) | null = null;
 
     const pending: PendingItem[] = [];
     let rafId: number | null = null;
+    let flushing = false;
+
+    async function flush(): Promise<void> {
+        if (flushing || pending.length === 0) return;
+        flushing = true;
+        try {
+            const byConn = new Map<string, MqttMessage[]>();
+            for (const it of pending.splice(0, pending.length)) {
+                let arr = byConn.get(it.connId);
+                if (!arr) {
+                    arr = [];
+                    byConn.set(it.connId, arr);
+                }
+                for (let i = 0; i < it.batch.length; i++) arr.push(it.batch[i]);
+            }
+
+            for (const [connId, list] of byConn) {
+                let decodedBatch: Awaited<ReturnType<typeof window.api.pluginDecodeBatch>>['data'] | undefined;
+                try {
+                    const result = await window.api.pluginDecodeBatch(
+                        list.map((item) => ({ topic: item.topic, payload: item.payload }))
+                    );
+                    if (result.success && result.data) decodedBatch = result.data;
+                } catch (error) {
+                    if (import.meta.env.DEV) console.warn('[plugin decode batch]', error);
+                }
+
+                if (decodedBatch) {
+                    for (let i = 0; i < decodedBatch.length; i++) {
+                        const decoded = decodedBatch[i];
+                        if (!decoded?.rememberParams) continue;
+                        for (const [key, value] of Object.entries(decoded.rememberParams)) {
+                            if (value != null) paramMem.remember(key, String(value));
+                        }
+                    }
+                }
+
+                msg.ingest(connId, list, decodedBatch);
+            }
+        } finally {
+            flushing = false;
+            if (pending.length > 0) schedule();
+        }
+    }
 
     function schedule(): void {
         if (rafId != null) return;
-        rafId = requestAnimationFrame(() => {
+        rafId = requestAnimationFrame(async () => {
             rafId = null;
-            if (!pending.length) return;
-
-            // 按 connectionId 聚合，分别投递到各自的 bucket
-            const byConn = new Map<string, MqttMessage[]>();
-            for (const it of pending) {
-                let arr = byConn.get(it.connId);
-                if (!arr) { arr = []; byConn.set(it.connId, arr); }
-                for (let i = 0; i < it.batch.length; i++) arr.push(it.batch[i]);
-            }
-            pending.length = 0;
-
-            for (const [connId, list] of byConn) {
-                msg.ingest(connId, list);
-            }
+            await flush();
         });
     }
 
     function start(): void {
         unsubMsg = window.api.onMqttMessages((batch) => {
             if (!batch.length) return;
-            // 同一批次里的所有消息都是同一 connectionId（主进程按连接分离），取第一条即可
             const connId = batch[0].connectionId;
             if (!connId) return;
             if (import.meta.env.DEV) {
@@ -60,7 +91,6 @@ export function useMqttBridge() {
             conn.setState(p.connectionId, p.state as ConnState, p.message);
         });
 
-        // 选中连接 / 选中主题变化时告知主进程当前关注主题，降采样保护它
         stopWatch = watch(
             () => {
                 const cid = conn.selectedId;
@@ -75,9 +105,12 @@ export function useMqttBridge() {
     }
 
     function stop(): void {
-        unsubMsg?.(); unsubMsg = null;
-        unsubState?.(); unsubState = null;
-        stopWatch?.(); stopWatch = null;
+        unsubMsg?.();
+        unsubMsg = null;
+        unsubState?.();
+        unsubState = null;
+        stopWatch?.();
+        stopWatch = null;
         if (rafId != null) cancelAnimationFrame(rafId);
         rafId = null;
         pending.length = 0;

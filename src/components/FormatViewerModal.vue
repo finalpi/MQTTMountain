@@ -4,9 +4,28 @@ import { useFormatViewer } from '@/composables/useFormatViewer';
 import { useToast } from '@/composables/useToast';
 import { formatTime } from '@/utils/format';
 import { escapeHtml } from '@/utils/filter';
+import type { DecodedResult } from '@shared/plugin';
 
 const { state, close } = useFormatViewer();
 const toast = useToast();
+
+const decoded = ref<DecodedResult | null>(null);
+const decoding = ref(false);
+
+watch(
+    () => [state.visible, state.raw, state.topic] as const,
+    async ([vis, raw, topic]) => {
+        decoded.value = null;
+        if (!vis || !raw) return;
+        decoding.value = true;
+        try {
+            const r = await window.api.pluginDecode({ topic, payload: raw });
+            if (r.success && r.data) decoded.value = r.data;
+        } finally {
+            decoding.value = false;
+        }
+    }
+);
 
 const search = ref('');
 const caseSensitive = ref(false);
@@ -214,6 +233,16 @@ const title = computed(() => state.topic || '消息内容');
                         </div>
                     </header>
 
+                    <div v-if="decoded" class="fv-decoded">
+                        <div v-if="decoded.summary" class="summary">🧩 {{ decoded.summary }}</div>
+                        <div v-if="decoded.highlights && decoded.highlights.length" class="highlights">
+                            <div v-for="(h, i) in decoded.highlights" :key="i" class="hl-item">
+                                <span class="k">{{ h.label }}</span>
+                                <span class="v">{{ h.value }}</span>
+                            </div>
+                        </div>
+                    </div>
+
                     <pre
                         class="fv-body"
                         ref="bodyEl"
@@ -344,6 +373,42 @@ const title = computed(() => state.topic || '消息内容');
 .fv-actions {
     display: flex;
     gap: 6px;
+}
+
+.fv-decoded {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(124, 92, 255, 0.08);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+
+    .summary {
+        font-size: 13px;
+        color: var(--text-0);
+        font-weight: 600;
+    }
+    .highlights {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 14px;
+
+        .hl-item {
+            display: inline-flex;
+            gap: 6px;
+            align-items: baseline;
+            font-size: 12px;
+            font-family: 'JetBrains Mono', Consolas, monospace;
+            .k {
+                color: var(--text-3);
+                &::after { content: ':'; }
+            }
+            .v {
+                color: var(--accent-2);
+                font-weight: 600;
+            }
+        }
+    }
 }
 
 .fv-body {

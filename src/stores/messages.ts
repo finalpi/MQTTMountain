@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { markRaw, reactive } from 'vue';
 import { RingBuffer } from '@/utils/ringBuffer';
 import type { MqttMessage } from '@shared/types';
+import type { DecodedResult } from '@shared/plugin';
 
 /** 单条消息（渲染侧） */
 export interface MsgRow {
@@ -9,6 +10,7 @@ export interface MsgRow {
     payload: string;
     time: number;
     seq: number;
+    decoded?: DecodedResult | null;
 }
 
 /** 按主题的聚合视图 */
@@ -54,7 +56,7 @@ export const useMessageStore = defineStore('messages', () => {
     let localSeqGen = 0;
     const nextSeq = (): number => ++localSeqGen;
 
-    const buckets = reactive(new Map<string, MsgBucket>());
+    const buckets = reactive(new Map<string, MsgBucket>()) as Map<string, MsgBucket>;
 
     function createBucket(): MsgBucket {
         return {
@@ -115,13 +117,19 @@ export const useMessageStore = defineStore('messages', () => {
         return v;
     }
 
-    function ingest(connectionId: string, batch: MqttMessage[]): void {
+    function ingest(connectionId: string, batch: MqttMessage[], decodedBatch?: (DecodedResult | null)[]): void {
         if (!connectionId || batch.length === 0) return;
         const b = bucketFor(connectionId);
         if (b.paused) return; // 该连接单独暂停显示
         for (let i = 0; i < batch.length; i++) {
             const m = batch[i];
-            const row: MsgRow = { topic: m.topic, payload: m.payload, time: m.time, seq: nextSeq() };
+            const row: MsgRow = {
+                topic: m.topic,
+                payload: m.payload,
+                time: m.time,
+                seq: nextSeq(),
+                decoded: decodedBatch?.[i] ?? null
+            };
             b.timeline.push(row);
             const existing = b.topics.get(m.topic);
             if (existing) {
@@ -195,6 +203,15 @@ export const useMessageStore = defineStore('messages', () => {
         b.publishCount++;
     }
 
+    function replacePublishHistory(connectionId: string, items: PublishHistoryItem[]): void {
+        const b = bucketFor(connectionId);
+        b.publishHistory.clear();
+        for (const item of items.slice().sort((a, b2) => a.time - b2.time)) {
+            b.publishHistory.push(item);
+        }
+        b.publishHistoryVersion++;
+    }
+
     function setPaused(connectionId: string, paused: boolean): void {
         const b = bucketFor(connectionId);
         b.paused = paused;
@@ -235,6 +252,7 @@ export const useMessageStore = defineStore('messages', () => {
         selectTopic,
         setTopicDisabled,
         pushPublishHistory,
+        replacePublishHistory,
         setPaused,
         dropBucket
     };
