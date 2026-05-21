@@ -71,6 +71,7 @@ export interface HistoryQueryOptions {
     keyword?: string;
     keywords?: string[];
     keywordLogic?: 'and' | 'or';
+    conditions?: HistoryKeywordCondition[];
     topic?: string;
     limit?: number;
     offset?: number;

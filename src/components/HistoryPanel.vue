@@ -14,7 +14,7 @@ import type {
 import { datetimeLocalToTs, formatTime, shortTime, tsToDatetimeLocal } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
 import { parseReplayFile, replayRowsFromHistory, type ReplayMessage } from '@/utils/replay';
-import { highlight, normalize, type SearchLogic } from '@/utils/filter';
+import { highlight, type SearchLogic } from '@/utils/filter';
 
 const formatViewer = useFormatViewer();
 const replay = useMqttReplay();
@@ -50,12 +50,16 @@ const rows = ref<HistoryMessage[]>([]);
 const dataSource = ref<'history' | 'imported'>('history');
 const selectedTopic = ref<string | null>(null);
 const loading = ref(false);
+const loadingMore = ref(false);
 const exporting = ref(false);
-const queryLimit = ref(10000);
-const queryWasCapped = ref(false);
+const queryLimit = ref(500);
+const hasMoreHistory = ref(false);
+const topicScrollEl = ref<HTMLElement | null>(null);
 const detailScrollEl = ref<HTMLElement | null>(null);
 const detailVisibleCount = ref(120);
+const topicVisibleCount = ref(200);
 const DETAIL_BATCH = 120;
+const TOPIC_BATCH = 200;
 
 const replayQos = ref<0 | 1 | 2>(0);
 const replayRetain = ref(false);
@@ -141,52 +145,46 @@ const detail = computed<HistoryMessage[]>(() => {
     return replay.state.running ? matched.slice().reverse() : matched;
 });
 const visibleDetail = computed<HistoryMessage[]>(() => detail.value.slice(0, detailVisibleCount.value));
+const visibleTopics = computed<TopicGroup[]>(() => grouped.value.slice(0, topicVisibleCount.value));
 const visibleCountLabel = computed(() => displayRows.value.length);
 const dataSourceLabel = computed(() => {
     if (replay.state.running) return `回放预览：${replay.state.sourceName}`;
     return dataSource.value === 'imported' ? `导入数据：${importedName.value || '未命名文件'}` : '历史查询结果';
 });
 
-function matchesKeywordConditions(row: HistoryMessage): boolean {
-    const active = keywordConditions.value
-        .map((item) => ({ join: item.join, term: normalize(item.term.trim()) }))
+function activeKeywordConditions(): HistoryKeywordCondition[] {
+    return keywordConditions.value
+        .map((item) => ({ term: item.term.trim(), join: item.join }))
         .filter((item) => item.term);
-    if (active.length === 0) return true;
-    const hay = normalize(row.topic + row.payload);
-    let result = hay.includes(active[0].term);
-    for (let i = 1; i < active.length; i++) {
-        const item = active[i];
-        const hit = hay.includes(item.term);
-        if (item.join === 'or') result = result || hit;
-        else if (item.join === 'not') result = result && !hit;
-        else result = result && hit;
+}
+
+async function loadHistoryPage(offset: number): Promise<HistoryMessage[] | null> {
+    const r = await window.api.historyQuery({
+        ...buildHistoryQueryOptions(queryLimit.value + 1, offset),
+        conditions: activeKeywordConditions()
+    });
+    if (!r.success || !r.data) {
+        toast.error('查询失败：' + (r.message || ''));
+        return null;
     }
-    return result;
+    hasMoreHistory.value = r.data.length > queryLimit.value;
+    return r.data.slice(0, queryLimit.value);
 }
 
 async function query(): Promise<void> {
-    const st = datetimeLocalToTs(startTime.value);
-    const et = datetimeLocalToTs(endTime.value);
-    queryWasCapped.value = false;
+    hasMoreHistory.value = false;
     loading.value = true;
-    const r = await window.api.historyQuery({
-        connectionId: scope.value === 'current' ? conn.selectedId : null,
-        startTime: st || undefined,
-        endTime: et || undefined,
-        limit: queryLimit.value + 1
-    });
-    loading.value = false;
-    if (r.success && r.data) {
-        queryWasCapped.value = r.data.length > queryLimit.value;
-        rows.value = r.data.slice(0, queryLimit.value).filter(matchesKeywordConditions);
+    try {
+        const page = await loadHistoryPage(0);
+        if (!page) return;
+        rows.value = page;
         dataSource.value = 'history';
         selectedTopic.value = rows.value.length > 0 ? rows.value[0].topic : null;
+        topicVisibleCount.value = TOPIC_BATCH;
         if (rows.value.length === 0) toast.info('无匹配结果');
-        else if (queryWasCapped.value) toast.warning(`结果过多，已先展示前 ${rows.value.length} 条，请缩小范围后再查`);
-        else toast.success(`找到 ${rows.value.length} 条`);
-    } else {
-        queryWasCapped.value = false;
-        toast.error('查询失败：' + (r.message || ''));
+        else toast.success(hasMoreHistory.value ? `已加载 ${rows.value.length} 条，向下滚动继续加载` : `找到 ${rows.value.length} 条`);
+    } finally {
+        loading.value = false;
     }
 }
 
@@ -275,6 +273,7 @@ function buildHistoryQueryOptions(limit: number, offset = 0) {
         connectionId: scope.value === 'current' ? conn.selectedId : null,
         startTime: st || undefined,
         endTime: et || undefined,
+        conditions: activeKeywordConditions(),
         limit,
         offset
     } as const;
@@ -288,10 +287,7 @@ function buildExportRequest(format: 'json' | 'zip'): HistoryExportRequest {
             startTime: datetimeLocalToTs(startTime.value) || undefined,
             endTime: datetimeLocalToTs(endTime.value) || undefined
         },
-        conditions: keywordConditions.value.map<HistoryKeywordCondition>((item) => ({
-            term: item.term,
-            join: item.join
-        }))
+        conditions: activeKeywordConditions()
     };
 }
 
@@ -305,8 +301,7 @@ async function collectRowsForExport(): Promise<HistoryMessage[]> {
         if (!r.success || !r.data) {
             throw new Error(r.message || '查询历史失败');
         }
-        const filtered = r.data.filter(matchesKeywordConditions);
-        all.push(...filtered);
+        all.push(...r.data);
         if (r.data.length < batchSize) break;
         offset += r.data.length;
     }
@@ -437,16 +432,43 @@ function resetDetailWindow(): void {
     });
 }
 
+function loadMoreTopics(): void {
+    if (topicVisibleCount.value >= grouped.value.length) return;
+    topicVisibleCount.value = Math.min(grouped.value.length, topicVisibleCount.value + TOPIC_BATCH);
+}
+
+async function loadMoreHistory(): Promise<void> {
+    if (dataSource.value !== 'history' || loading.value || loadingMore.value || !hasMoreHistory.value) return;
+    loadingMore.value = true;
+    try {
+        const page = await loadHistoryPage(rows.value.length);
+        if (!page) return;
+        rows.value.push(...page);
+        if (!selectedTopic.value && rows.value.length) selectedTopic.value = rows.value[0].topic;
+    } finally {
+        loadingMore.value = false;
+    }
+}
+
 function loadMoreDetail(): void {
     if (detailVisibleCount.value >= detail.value.length) return;
     detailVisibleCount.value = Math.min(detail.value.length, detailVisibleCount.value + DETAIL_BATCH);
 }
 
-function onDetailScroll(): void {
+async function onTopicScroll(): Promise<void> {
+    const el = topicScrollEl.value;
+    if (!el) return;
+    if (el.scrollTop + el.clientHeight < el.scrollHeight - 160) return;
+    loadMoreTopics();
+    await loadMoreHistory();
+}
+
+async function onDetailScroll(): Promise<void> {
     const el = detailScrollEl.value;
     if (!el) return;
     if (el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
         loadMoreDetail();
+        if (visibleDetail.value.length >= detail.value.length) await loadMoreHistory();
     }
 }
 
@@ -499,7 +521,7 @@ async function onImportChange(event: Event): Promise<void> {
         importedRows.value = await parseReplayFile(file);
         importedName.value = file.name;
         dataSource.value = 'imported';
-        queryWasCapped.value = false;
+        hasMoreHistory.value = false;
         selectedTopic.value = importedHistoryRows.value[0]?.topic ?? null;
         toast.success(`已导入 ${importedRows.value.length} 条回放数据`);
     } catch (error) {
@@ -604,11 +626,11 @@ watch(
                     <div class="field">
                         <label>结果上限</label>
                         <select v-model.number="queryLimit" @keydown.enter="query">
+                            <option :value="500">500</option>
+                            <option :value="1000">1,000</option>
                             <option :value="2000">2,000</option>
                             <option :value="5000">5,000</option>
                             <option :value="10000">10,000</option>
-                            <option :value="20000">20,000</option>
-                            <option :value="50000">50,000</option>
                         </select>
                     </div>
                     <button class="btn btn-primary query-btn" :disabled="loading" @click="query">
@@ -645,8 +667,8 @@ watch(
                     @click="pickQuick(q)"
                 >{{ q.label }}</button>
             </div>
-            <div v-if="queryWasCapped && !loading" class="query-note">
-                当前结果已触达上限 {{ queryLimit.toLocaleString() }} 条。建议缩小时间范围、限定连接或增加关键字后再查。
+            <div v-if="(hasMoreHistory || loadingMore) && !loading" class="query-note">
+                {{ loadingMore ? '正在加载更多历史结果...' : `已加载 ${rows.length.toLocaleString()} 条，继续向下滚动可加载更多。` }}
             </div>
 
             <div class="replay-panel">
@@ -742,10 +764,10 @@ watch(
                             <option value="count">消息量</option>
                         </select>
                     </div>
-                    <div class="scroll-area">
+                    <div ref="topicScrollEl" class="scroll-area" @scroll.passive="onTopicScroll">
                         <div class="t-list">
                             <div
-                                v-for="g in grouped"
+                                v-for="g in visibleTopics"
                                 :key="g.topic"
                                 class="t-item"
                                 :class="{ active: selectedTopic === g.topic }"
@@ -757,6 +779,12 @@ watch(
                                     <span class="ago">{{ shortTime(g.lastTime) }}</span>
                                 </div>
                             </div>
+                            <button
+                                v-if="visibleTopics.length < grouped.length || hasMoreHistory"
+                                class="load-more-btn"
+                                :disabled="loadingMore"
+                                @click="loadMoreTopics(); loadMoreHistory()"
+                            >{{ loadingMore ? '加载中...' : '加载更多' }}</button>
                         </div>
                     </div>
                 </div>

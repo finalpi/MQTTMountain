@@ -314,13 +314,30 @@ function parseKeywordTerms(input: string | string[]): string[] {
     return out;
 }
 
+function matchesConditions(hay: string, conditions: NonNullable<HistoryQueryOptions['conditions']>): boolean {
+    const active = conditions
+        .map((item) => ({ join: item.join, term: normalizeKeyword(item.term) }))
+        .filter((item) => item.term);
+    if (active.length === 0) return true;
+    let result = hay.includes(active[0].term);
+    for (let i = 1; i < active.length; i++) {
+        const item = active[i];
+        const hit = hay.includes(item.term);
+        if (item.join === 'or') result = result || hit;
+        else if (item.join === 'not') result = result && !hit;
+        else result = result && hit;
+    }
+    return result;
+}
+
 export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
     flushStorage();
     const st = opts.startTime != null && opts.startTime > 0 ? opts.startTime : -8640000000000000;
     const et = opts.endTime != null && opts.endTime > 0 ? opts.endTime : 8640000000000000;
     const limit = Math.min(500_000, Math.max(1, opts.limit ?? 500));
     const offset = Math.max(0, opts.offset ?? 0);
-    const terms = parseKeywordTerms(opts.keywords?.length ? opts.keywords : (opts.keyword ? [opts.keyword] : []));
+    const conditions = opts.conditions?.length ? opts.conditions : null;
+    const terms = conditions ? [] : parseKeywordTerms(opts.keywords?.length ? opts.keywords : (opts.keyword ? [opts.keyword] : []));
     const keywordLogic = opts.keywordLogic === 'or' ? 'or' : 'and';
     const topicFilter = opts.topic && opts.topic.trim() ? opts.topic.trim() : null;
 
@@ -376,12 +393,16 @@ export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
                     for (let j = decoded.length - 1; j >= 0; j--) {
                         const m = decoded[j];
                         if (m.time < st || m.time > et) continue;
-                        if (terms.length) {
+                        if (conditions || terms.length) {
                             const hay = (m.topic + m.payload).replace(/\s+/gu, '').toLowerCase();
-                            const hit = keywordLogic === 'or'
-                                ? terms.some((term) => hay.includes(term))
-                                : terms.every((term) => hay.includes(term));
-                            if (!hit) continue;
+                            if (conditions) {
+                                if (!matchesConditions(hay, conditions)) continue;
+                            } else {
+                                const hit = keywordLogic === 'or'
+                                    ? terms.some((term) => hay.includes(term))
+                                    : terms.every((term) => hay.includes(term));
+                                if (!hit) continue;
+                            }
                         }
                         if (skipped < offset) {
                             skipped++;

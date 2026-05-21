@@ -20,7 +20,6 @@ import {
 } from './settings';
 import {
     clearLogs,
-    queryHistory,
     readRecentByConnection,
     runAutoDeleteAsync
 } from './storage';
@@ -29,6 +28,7 @@ import { pluginManager } from './plugin-manager';
 import { appendPublishHistory, readPublishHistory } from './publish-history';
 import { checkForUpdates, openReleasesPage } from './update-service';
 import { exportHistoryToFile } from './history-export';
+import { queryHistoryAsync } from './history-query';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -76,9 +76,9 @@ export function initIpc(mqttService: MqttService): void {
     });
 
     // history
-    ipcMain.handle('history:query', (_e, opts: HistoryQueryOptions) => {
+    ipcMain.handle('history:query', async (_e, opts: HistoryQueryOptions) => {
         try {
-            return { success: true, data: queryHistory(opts || {}) };
+            return { success: true, data: await queryHistoryAsync(opts || {}) };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }

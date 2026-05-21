@@ -171,13 +171,21 @@ function togglePause(): void {
     msg.setPaused(cid, !bucket.value.paused);
 }
 
-async function clearAll(): Promise<void> {
+function clearAll(): void {
     const cid = conn.selectedId;
     if (!cid) return;
-    if (!confirm('清空当前连接的所有消息？（同时会删除本地日志文件）')) return;
+    if (!confirm('清空当前连接当前显示的 MQTT 消息？本地历史日志不会删除。')) return;
+    msg.clearAll(cid);
+    toast.success('已清屏');
+}
+
+async function clearLocalLogs(): Promise<void> {
+    const cid = conn.selectedId;
+    if (!cid) return;
+    if (!confirm('删除当前连接的本地历史日志？当前显示也会清空，删除后无法从历史查询找回。')) return;
     msg.clearAll(cid);
     await window.api.mqttClearLogs(cid);
-    toast.success('已清空');
+    toast.success('已删除本地历史日志');
 }
 
 async function exportJson(): Promise<void> {
@@ -295,7 +303,8 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
             >{{ bucket.paused ? '▶️ 恢复' : '⏸️ 暂停' }}</button>
             <button class="btn btn-mini" @click="exportJson" title="导出完整 JSON">📥</button>
             <button class="btn btn-mini" @click="exportZip" title="按主题分组 ZIP">📦</button>
-            <button class="btn btn-mini btn-danger" @click="clearAll" title="清空">🗑️</button>
+            <button class="btn btn-mini" @click="clearAll" title="清屏当前连接显示，不删除历史日志">清屏</button>
+            <button class="btn btn-mini btn-danger" @click="clearLocalLogs" title="删除当前连接本地历史日志">删日志</button>
         </div>
         <div class="panel-body">
             <div v-if="!showView" class="mismatch">
