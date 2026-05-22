@@ -73,6 +73,7 @@ export interface HistoryQueryOptions {
     keywordLogic?: 'and' | 'or';
     conditions?: HistoryKeywordCondition[];
     topic?: string;
+    order?: 'desc' | 'asc';
     limit?: number;
     offset?: number;
 }
@@ -117,6 +118,38 @@ export interface HistoryExportProgress {
     format?: 'json' | 'zip';
 }
 
+export interface HistoryIndexStatus {
+    totalFiles: number;
+    indexedFiles: number;
+    incompleteFiles: number;
+    totalMessages: number;
+    fts5Enabled: boolean;
+}
+
+export interface HistoryIndexRequest {
+    connectionId?: string | null;
+}
+
+export interface HistoryIndexResult extends HistoryIndexStatus {
+    processedFiles: number;
+    processedBuckets: number;
+    processedMessages: number;
+}
+
+export interface HistoryIndexProgress {
+    stage: 'checking' | 'indexing' | 'done' | 'error';
+    connectionId?: string;
+    filePath?: string;
+    processedFiles: number;
+    totalFiles: number;
+    processedBuckets: number;
+    processedMessages: number;
+    totalBuckets?: number;
+    percent?: number;
+    message?: string;
+    fts5Enabled?: boolean;
+}
+
 export interface ApiResult<T = unknown> {
     success: boolean;
     message?: string;
@@ -146,6 +179,8 @@ export type IpcChannels = {
     'mqtt:clearLogs': (connectionId?: string | null) => ApiResult<{ deletedFiles: number }>;
     'history:query': (opts: HistoryQueryOptions) => ApiResult<HistoryMessage[]>;
     'history:export': (req: HistoryExportRequest) => ApiResult<HistoryExportResult>;
+    'history:indexStatus': (req?: HistoryIndexRequest) => ApiResult<HistoryIndexStatus>;
+    'history:buildIndex': (req?: HistoryIndexRequest) => ApiResult<HistoryIndexResult>;
     'history:openExportDir': (filePath: string) => ApiResult;
     'config:read': () => ApiResult<ConnectionsFile>;
     'config:write': (data: ConnectionsFile) => ApiResult;
@@ -168,4 +203,5 @@ export type IpcEvents = {
     'app:autoDeleteDone': (files: number) => void;
     'window:focused': () => void;
     'history:exportProgress': (p: HistoryExportProgress) => void;
+    'history:indexProgress': (p: HistoryIndexProgress) => void;
 };

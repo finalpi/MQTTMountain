@@ -6,6 +6,10 @@ import type {
     HistoryExportProgress,
     HistoryExportRequest,
     HistoryExportResult,
+    HistoryIndexProgress,
+    HistoryIndexRequest,
+    HistoryIndexResult,
+    HistoryIndexStatus,
     HistoryQueryOptions,
     HistoryMessage,
     MqttMessage,
@@ -34,6 +38,8 @@ const api = {
 
     historyQuery: (opts: HistoryQueryOptions) => invoke<HistoryMessage[]>('history:query', opts),
     historyExport: (req: HistoryExportRequest) => invoke<HistoryExportResult>('history:export', req),
+    historyIndexStatus: (req?: HistoryIndexRequest) => invoke<HistoryIndexStatus>('history:indexStatus', req),
+    historyBuildIndex: (req?: HistoryIndexRequest) => invoke<HistoryIndexResult>('history:buildIndex', req),
     historyOpenExportDir: (filePath: string) => invoke('history:openExportDir', filePath),
 
     configRead: () => invoke<ConnectionsFile>('config:read'),
@@ -106,6 +112,11 @@ const api = {
         const listener = (_e: IpcRendererEvent, p: HistoryExportProgress) => cb(p);
         ipcRenderer.on('history:exportProgress', listener);
         return () => ipcRenderer.removeListener('history:exportProgress', listener);
+    },
+    onHistoryIndexProgress: (cb: (p: HistoryIndexProgress) => void) => {
+        const listener = (_e: IpcRendererEvent, p: HistoryIndexProgress) => cb(p);
+        ipcRenderer.on('history:indexProgress', listener);
+        return () => ipcRenderer.removeListener('history:indexProgress', listener);
     }
 };
 

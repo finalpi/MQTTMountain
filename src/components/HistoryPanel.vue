@@ -8,6 +8,8 @@ import { useMqttReplay, type ReplaySpeed } from '@/composables/useMqttReplay';
 import type {
     HistoryExportProgress,
     HistoryExportRequest,
+    HistoryIndexProgress,
+    HistoryIndexStatus,
     HistoryKeywordCondition,
     HistoryMessage
 } from '@shared/types';
@@ -42,10 +44,18 @@ interface ExportDialogState {
     dirPath: string;
 }
 
+interface IndexState {
+    running: boolean;
+    status: HistoryIndexStatus | null;
+    progress: HistoryIndexProgress | null;
+    message: string;
+}
+
 const startTime = ref<string>('');
 const endTime = ref<string>('');
 const keywordConditions = ref<KeywordCondition[]>([{ term: '', join: 'and' }]);
 const scope = ref<'current' | 'all'>('current');
+const historyOrder = ref<'desc' | 'asc'>('desc');
 const rows = ref<HistoryMessage[]>([]);
 const dataSource = ref<'history' | 'imported'>('history');
 const selectedTopic = ref<string | null>(null);
@@ -72,6 +82,12 @@ const fileInput = ref<HTMLInputElement | null>(null);
 
 type TopicSort = 'name' | 'count' | 'recent';
 const topicSort = ref<TopicSort>('name');
+const indexState = ref<IndexState>({
+    running: false,
+    status: null,
+    progress: null,
+    message: ''
+});
 const exportDialog = ref<ExportDialogState>({
     open: false,
     running: false,
@@ -151,6 +167,17 @@ const dataSourceLabel = computed(() => {
     if (replay.state.running) return `回放预览：${replay.state.sourceName}`;
     return dataSource.value === 'imported' ? `导入数据：${importedName.value || '未命名文件'}` : '历史查询结果';
 });
+const indexSummary = computed(() => {
+    if (indexState.value.running && indexState.value.progress) {
+        const p = indexState.value.progress;
+        const percent = p.percent != null ? ` ${Math.round(p.percent)}%` : '';
+        return `正在建立历史索引${percent}：${p.processedFiles}/${p.totalFiles} 个文件，${p.processedMessages.toLocaleString()} 条消息`;
+    }
+    const status = indexState.value.status;
+    if (!status || status.totalFiles === 0) return '暂无历史日志文件需要索引';
+    if (status.incompleteFiles > 0) return `有 ${status.incompleteFiles}/${status.totalFiles} 个历史文件未建立索引，条件查询可能较慢`;
+    return `历史索引已完成：${status.indexedFiles} 个文件，${status.totalMessages.toLocaleString()} 条消息`;
+});
 
 function activeKeywordConditions(): HistoryKeywordCondition[] {
     return keywordConditions.value
@@ -202,6 +229,30 @@ function removeKeywordCondition(index: number): void {
 }
 
 let appStart = 0;
+async function refreshIndexStatus(): Promise<void> {
+    const r = await window.api.historyIndexStatus({ connectionId: scope.value === 'current' ? conn.selectedId : null });
+    if (r.success && r.data) indexState.value.status = r.data;
+}
+
+async function buildIndex(): Promise<void> {
+    if (indexState.value.running) return;
+    indexState.value.running = true;
+    indexState.value.progress = null;
+    indexState.value.message = '正在启动索引任务...';
+    try {
+        const r = await window.api.historyBuildIndex({ connectionId: scope.value === 'current' ? conn.selectedId : null });
+        if (!r.success || !r.data) {
+            toast.error('索引建立失败：' + (r.message || ''));
+            return;
+        }
+        indexState.value.status = r.data;
+        toast.success(`索引完成：${r.data.processedMessages.toLocaleString()} 条消息`);
+    } finally {
+        indexState.value.running = false;
+        await refreshIndexStatus();
+    }
+}
+
 async function init(): Promise<void> {
     const r = await window.api.appGetStartTime();
     if (r.success && r.data) {
@@ -209,6 +260,7 @@ async function init(): Promise<void> {
         startTime.value = tsToDatetimeLocal(r.data);
     }
     endTime.value = tsToDatetimeLocal(Date.now());
+    await refreshIndexStatus();
 }
 
 function setEndNow(): void {
@@ -274,6 +326,7 @@ function buildHistoryQueryOptions(limit: number, offset = 0) {
         startTime: st || undefined,
         endTime: et || undefined,
         conditions: activeKeywordConditions(),
+        order: historyOrder.value,
         limit,
         offset
     } as const;
@@ -547,6 +600,12 @@ async function replayPreferredRows(): Promise<void> {
 
 onMounted(init);
 
+const offHistoryIndexProgress = window.api.onHistoryIndexProgress((progress) => {
+    indexState.value.progress = progress;
+    indexState.value.message = progress.message || indexState.value.message;
+    if (progress.stage === 'done' || progress.stage === 'error') indexState.value.running = false;
+});
+
 const offHistoryExportProgress = window.api.onHistoryExportProgress((progress) => {
     if (!exportDialog.value.open) return;
     exportDialog.value.stage = progress.stage;
@@ -570,11 +629,12 @@ const offHistoryExportProgress = window.api.onHistoryExportProgress((progress) =
 });
 
 onBeforeUnmount(() => {
+    offHistoryIndexProgress();
     offHistoryExportProgress();
 });
 
 watch(
-    () => [selectedTopic.value, replay.state.running, displayRows.value.length] as const,
+    () => [selectedTopic.value, replay.state.running, dataSource.value] as const,
     () => resetDetailWindow(),
     { flush: 'post' }
 );
@@ -624,6 +684,13 @@ watch(
                         </select>
                     </div>
                     <div class="field">
+                        <label>显示顺序</label>
+                        <select v-model="historyOrder" @keydown.enter="query">
+                            <option value="desc">倒序（新→旧）</option>
+                            <option value="asc">顺序（旧→新）</option>
+                        </select>
+                    </div>
+                    <div class="field">
                         <label>结果上限</label>
                         <select v-model.number="queryLimit" @keydown.enter="query">
                             <option :value="500">500</option>
@@ -666,6 +733,12 @@ watch(
                     :class="{ active: activeQuick === q.key }"
                     @click="pickQuick(q)"
                 >{{ q.label }}</button>
+            </div>
+            <div class="query-note index-note" :class="{ warn: indexState.status?.incompleteFiles }">
+                <span>{{ indexState.message || indexSummary }}</span>
+                <button class="btn btn-mini" :disabled="indexState.running" @click="buildIndex">
+                    {{ indexState.running ? '索引中...' : '建立/重建索引' }}
+                </button>
             </div>
             <div v-if="(hasMoreHistory || loadingMore) && !loading" class="query-note">
                 {{ loadingMore ? '正在加载更多历史结果...' : `已加载 ${rows.length.toLocaleString()} 条，继续向下滚动可加载更多。` }}
@@ -882,7 +955,7 @@ watch(
 
 .controls-main {
     display: grid;
-    grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) minmax(140px, 180px) minmax(120px, 140px) auto;
+    grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) minmax(140px, 180px) minmax(150px, 170px) minmax(120px, 140px) auto;
     gap: 8px;
     align-items: end;
 
@@ -1099,6 +1172,22 @@ watch(
     background: rgba(245, 158, 11, 0.08);
     color: #fcd34d;
     font-size: 12px;
+}
+
+.index-note {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: center;
+    border-color: rgba(74, 222, 128, 0.28);
+    background: rgba(34, 197, 94, 0.08);
+    color: #86efac;
+
+    &.warn {
+        border-color: rgba(245, 158, 11, 0.28);
+        background: rgba(245, 158, 11, 0.08);
+        color: #fcd34d;
+    }
 }
 
 .replay-panel {

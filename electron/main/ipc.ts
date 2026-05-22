@@ -28,6 +28,7 @@ import { pluginManager } from './plugin-manager';
 import { appendPublishHistory, readPublishHistory } from './publish-history';
 import { checkForUpdates, openReleasesPage } from './update-service';
 import { exportHistoryToFile } from './history-export';
+import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
 import { queryHistoryAsync } from './history-query';
 
 function win(): BrowserWindow | null {
@@ -79,6 +80,20 @@ export function initIpc(mqttService: MqttService): void {
     ipcMain.handle('history:query', async (_e, opts: HistoryQueryOptions) => {
         try {
             return { success: true, data: await queryHistoryAsync(opts || {}) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('history:indexStatus', (_e, req?: { connectionId?: string | null }) => {
+        try {
+            return { success: true, data: readHistoryIndexStatus(req || {}) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('history:buildIndex', async (event, req?: { connectionId?: string | null }) => {
+        try {
+            return { success: true, data: await buildHistoryIndex(event.sender, req || {}) };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
