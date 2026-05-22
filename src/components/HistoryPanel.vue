@@ -260,7 +260,7 @@ async function init(): Promise<void> {
         startTime.value = tsToDatetimeLocal(r.data);
     }
     endTime.value = tsToDatetimeLocal(Date.now());
-    await refreshIndexStatus();
+    void refreshIndexStatus();
 }
 
 function setEndNow(): void {

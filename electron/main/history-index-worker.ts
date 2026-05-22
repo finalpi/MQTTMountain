@@ -115,6 +115,7 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
     let processedMessages = 0;
     let fts5Enabled = false;
     try {
+        db.pragma('busy_timeout = 5000');
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
         db.pragma('temp_store = MEMORY');
@@ -130,19 +131,33 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
             `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, payload, search_text)
              VALUES (?, ?, ?, ?, ?, ?)`
         );
-        const rows = db.prepare('SELECT bucket_ts, topic, blob FROM buckets ORDER BY bucket_ts ASC, topic ASC').iterate() as Iterable<{ bucket_ts: number; topic: string; blob: Buffer }>;
-        const writeBucket = db.transaction((row: { bucket_ts: number; topic: string; blob: Buffer }) => {
-            const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
-            for (let i = 0; i < decoded.length; i++) {
-                const item = decoded[i];
-                insertStmt.run(row.bucket_ts, row.topic, i, item.time, item.payload, normalizeSearchText(row.topic, item.payload));
+        const selectStmt = db.prepare(
+            `SELECT bucket_ts, topic, blob FROM buckets
+             WHERE bucket_ts > ? OR (bucket_ts = ? AND topic > ?)
+             ORDER BY bucket_ts ASC, topic ASC
+             LIMIT ?`
+        );
+        const writeRows = db.transaction((rows: { bucket_ts: number; topic: string; blob: Buffer }[]) => {
+            for (const row of rows) {
+                const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
+                for (let i = 0; i < decoded.length; i++) {
+                    const item = decoded[i];
+                    insertStmt.run(row.bucket_ts, row.topic, i, item.time, item.payload, normalizeSearchText(row.topic, item.payload));
+                }
+                processedBuckets++;
+                processedMessages += decoded.length;
             }
-            processedBuckets++;
-            processedMessages += decoded.length;
         });
         let lastReport = 0;
-        for (const row of rows) {
-            writeBucket(row);
+        let lastBucketTs = -8640000000;
+        let lastTopic = '';
+        while (processedBuckets < totalBuckets) {
+            const rows = selectStmt.all(lastBucketTs, lastBucketTs, lastTopic, 256) as { bucket_ts: number; topic: string; blob: Buffer }[];
+            if (rows.length === 0) break;
+            writeRows(rows);
+            const tail = rows[rows.length - 1];
+            lastBucketTs = tail.bucket_ts;
+            lastTopic = tail.topic;
             const now = Date.now();
             if (now - lastReport > 300) {
                 lastReport = now;

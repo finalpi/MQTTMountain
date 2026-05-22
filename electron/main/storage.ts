@@ -541,11 +541,8 @@ export function getHistoryIndexStatus(connectionId?: string | null): HistoryInde
                 if (complete && version === HISTORY_INDEX_SCHEMA_VERSION) status.indexedFiles++;
                 else status.incompleteFiles++;
                 if (getIndexMeta(db, 'fts5_enabled') === '1') status.fts5Enabled = true;
-                const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'history_messages'").get();
-                if (row) {
-                    const count = db.prepare('SELECT COUNT(*) AS count FROM history_messages').get() as { count: number };
-                    status.totalMessages += count.count;
-                }
+                const indexedCount = Number(getIndexMeta(db, 'indexed_message_count') || 0);
+                if (Number.isFinite(indexedCount) && indexedCount > 0) status.totalMessages += indexedCount;
             } catch {
                 status.incompleteFiles++;
             } finally {
