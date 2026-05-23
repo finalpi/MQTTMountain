@@ -7,6 +7,7 @@ import { useFormatViewer } from '@/composables/useFormatViewer';
 import { highlight, normalize, type SearchLogic } from '@/utils/filter';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
+import type { HistoryKeywordCondition, HistoryMessage } from '@shared/types';
 
 const msg = useMessageStore();
 const conn = useConnectionStore();
@@ -35,6 +36,12 @@ interface FilterCondition {
 }
 const filterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
 const activeFilterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
+const DETAIL_HISTORY_LIMIT = 200;
+const selectedTopicHistoryRows = ref<HistoryMessage[]>([]);
+const selectedTopicHistoryOffset = ref(0);
+const selectedTopicHistoryHasMore = ref(false);
+const selectedTopicHistoryLoading = ref(false);
+const selectedTopicHistoryLoadedOnce = ref(false);
 
 let filterTimer: number | null = null;
 watch(filterConditions, (v) => {
@@ -46,6 +53,13 @@ watch(filterConditions, (v) => {
 onUnmounted(() => { if (filterTimer != null) clearTimeout(filterTimer); });
 
 const highlightTerms = computed(() => activeFilterConditions.value.map((item) => item.term));
+const activeFilterKey = computed(() => JSON.stringify(activeHistoryConditions()));
+
+function activeHistoryConditions(): HistoryKeywordCondition[] {
+    return activeFilterConditions.value
+        .map((item) => ({ term: item.term.trim(), join: item.join }))
+        .filter((item) => item.term);
+}
 
 function addFilterCondition(): void {
     filterConditions.value.push({ term: '', join: 'and' });
@@ -148,7 +162,15 @@ watchEffect(() => {
     msg.selectTopic(cid, topicList.value[0].topic);
 });
 
-const selectedTopicMessages = computed<MsgRow[]>(() => {
+function messageDedupeKey(row: Pick<MsgRow, 'topic' | 'time' | 'payload'>): string {
+    return JSON.stringify([row.topic, row.time, row.payload]);
+}
+
+function messageRenderKey(row: MsgRow): string {
+    return `${row.seq}:${row.topic}:${row.time}:${row.payload.length}`;
+}
+
+function realtimeSelectedTopicRows(): MsgRow[] {
     const b = bucket.value;
     void b.topicsVersion;
     const v = selectedTopicView.value;
@@ -161,7 +183,95 @@ const selectedTopicMessages = computed<MsgRow[]>(() => {
         if (matchesFilterConditions(r.topic + r.payload)) out.push(r);
     }
     return out;
+}
+
+const selectedTopicMessages = computed<MsgRow[]>(() => {
+    const rows = realtimeSelectedTopicRows();
+    const seen = new Set(rows.map(messageDedupeKey));
+    selectedTopicHistoryRows.value.forEach((row, index) => {
+        const key = messageDedupeKey(row);
+        if (seen.has(key)) return;
+        seen.add(key);
+        rows.push({
+            topic: row.topic,
+            payload: row.payload,
+            time: row.time,
+            seq: -index - 1,
+            decoded: null
+        });
+    });
+    return rows;
 });
+
+const selectedTopicHistoryStatus = computed(() => {
+    if (!selectedTopicView.value) return '';
+    if (selectedTopicHistoryLoading.value) return '加载历史中...';
+    if (selectedTopicHistoryLoadedOnce.value && selectedTopicHistoryHasMore.value) return `已含历史 ${selectedTopicHistoryRows.value.length} 条`;
+    if (selectedTopicHistoryLoadedOnce.value) return `历史已加载 ${selectedTopicHistoryRows.value.length} 条`;
+    return '可加载历史';
+});
+
+const showSelectedTopicHistoryAction = computed(() => {
+    if (!selectedTopicView.value) return false;
+    return selectedTopicHistoryLoading.value || !selectedTopicHistoryLoadedOnce.value || selectedTopicHistoryHasMore.value;
+});
+
+const selectedTopicHistoryActionText = computed(() => {
+    if (selectedTopicHistoryLoading.value) return '加载历史中...';
+    if (!selectedTopicHistoryLoadedOnce.value) return '加载历史消息';
+    return selectedTopicHistoryHasMore.value ? '加载更多历史' : '没有更多历史';
+});
+
+function selectedTopicHistoryRequestKey(): string {
+    return JSON.stringify({ connectionId: conn.selectedId, topic: bucket.value.selectedTopic, conditions: activeHistoryConditions() });
+}
+
+function resetSelectedTopicHistory(): void {
+    selectedTopicHistoryRows.value = [];
+    selectedTopicHistoryOffset.value = 0;
+    selectedTopicHistoryHasMore.value = false;
+    selectedTopicHistoryLoading.value = false;
+    selectedTopicHistoryLoadedOnce.value = false;
+}
+
+async function loadSelectedTopicHistoryPage(offset: number): Promise<HistoryMessage[] | null> {
+    const connectionId = conn.selectedId;
+    const topic = selectedTopicView.value?.topic;
+    if (!connectionId || !topic) return null;
+    const r = await window.api.historyQuery({
+        connectionId,
+        topic,
+        conditions: activeHistoryConditions(),
+        order: 'desc',
+        limit: DETAIL_HISTORY_LIMIT + 1,
+        offset
+    });
+    if (!r.success || !r.data) {
+        toast.error('加载历史失败：' + (r.message || ''));
+        return null;
+    }
+    if (selectedTopicHistoryRequestKey() !== JSON.stringify({ connectionId, topic, conditions: activeHistoryConditions() })) return null;
+    selectedTopicHistoryHasMore.value = r.data.length > DETAIL_HISTORY_LIMIT;
+    return r.data.slice(0, DETAIL_HISTORY_LIMIT);
+}
+
+async function loadMoreSelectedTopicHistory(): Promise<void> {
+    if (selectedTopicHistoryLoading.value) return;
+    if (selectedTopicHistoryLoadedOnce.value && !selectedTopicHistoryHasMore.value) return;
+    if (!conn.selectedId || !selectedTopicView.value) return;
+    const requestKey = selectedTopicHistoryRequestKey();
+    selectedTopicHistoryLoading.value = true;
+    try {
+        const page = await loadSelectedTopicHistoryPage(selectedTopicHistoryOffset.value);
+        if (!page) return;
+        if (requestKey !== selectedTopicHistoryRequestKey()) return;
+        selectedTopicHistoryRows.value.push(...page);
+        selectedTopicHistoryOffset.value += page.length;
+        selectedTopicHistoryLoadedOnce.value = true;
+    } finally {
+        if (requestKey === selectedTopicHistoryRequestKey()) selectedTopicHistoryLoading.value = false;
+    }
+}
 
 function setMode(m: ViewMode): void { viewMode.value = m; }
 
@@ -176,6 +286,7 @@ function clearAll(): void {
     if (!cid) return;
     if (!confirm('清空当前连接当前显示的 MQTT 消息？本地历史日志不会删除。')) return;
     msg.clearAll(cid);
+    resetSelectedTopicHistory();
     toast.success('已清屏');
 }
 
@@ -184,6 +295,7 @@ async function clearLocalLogs(): Promise<void> {
     if (!cid) return;
     if (!confirm('删除当前连接的本地历史日志？当前显示也会清空，删除后无法从历史查询找回。')) return;
     msg.clearAll(cid);
+    resetSelectedTopicHistory();
     await window.api.mqttClearLogs(cid);
     toast.success('已删除本地历史日志');
 }
@@ -210,12 +322,15 @@ function clearTopic(t: string): void {
     const cid = conn.selectedId;
     if (!cid) return;
     msg.clearTopic(cid, t);
+    if (bucket.value.selectedTopic === t) resetSelectedTopicHistory();
 }
 function deleteTopic(t: string): void {
     const cid = conn.selectedId;
     if (!cid) return;
     if (!confirm(`删除主题「${t}」及其消息？`)) return;
+    const wasSelected = bucket.value.selectedTopic === t;
     msg.removeTopic(cid, t);
+    if (wasSelected) resetSelectedTopicHistory();
 }
 async function toggleDisable(v: TopicView): Promise<void> {
     const cid = conn.selectedId;
@@ -255,6 +370,9 @@ function onUserScroll(): void {
         showJumpBtn.value = false;
         autoFollow.value = true;
     }
+    if (viewMode.value === 'topic' && el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
+        void loadMoreSelectedTopicHistory();
+    }
 }
 
 function scrollToTop(smooth = true): void {
@@ -264,6 +382,15 @@ function scrollToTop(smooth = true): void {
     autoFollow.value = true;
     showJumpBtn.value = false;
 }
+
+watch(
+    () => [conn.selectedId, bucket.value.selectedTopic, activeFilterKey.value] as const,
+    async () => {
+        resetSelectedTopicHistory();
+        await nextTick();
+        if (topicScrollEl.value) topicScrollEl.value.scrollTop = 0;
+    }
+);
 
 // 当消息更新时，若仍处于「跟随」模式则保持在顶部
 watch(
@@ -397,13 +524,14 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                     <div class="t-head">
                         <span v-if="selectedTopicView" class="t-head-name" :title="selectedTopicView.topic">{{ selectedTopicView.topic }}</span>
                         <span v-else class="empty">请从左侧选择主题</span>
+                        <span v-if="selectedTopicView" class="history-status">{{ selectedTopicMessages.length }} 条 · {{ selectedTopicHistoryStatus }}</span>
                     </div>
                     <div v-if="selectedTopicView" class="scroll-area" ref="topicScrollEl" @scroll.passive="onUserScroll">
                         <div v-if="selectedTopicMessages.length === 0" class="empty">该主题暂无消息</div>
                         <div v-else class="msg-list">
                             <div
                                 v-for="m in selectedTopicMessages"
-                                :key="m.seq"
+                                :key="messageRenderKey(m)"
                                 class="msg-card cv-auto"
                                 @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                             >
@@ -413,6 +541,11 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                 </div>
                                 <pre class="msg-body" v-html="highlight(m.payload, highlightTerms)"></pre>
                             </div>
+                        </div>
+                        <div v-if="showSelectedTopicHistoryAction" class="history-footer">
+                            <button class="history-load-btn" :disabled="selectedTopicHistoryLoading" @click="loadMoreSelectedTopicHistory">
+                                {{ selectedTopicHistoryActionText }}
+                            </button>
                         </div>
                     </div>
                 </div>
@@ -751,6 +884,13 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
         word-break: break-all;
         line-height: 1.4;
     }
+    .history-status {
+        flex: 0 0 auto;
+        color: var(--text-3);
+        font-size: 11px;
+        font-weight: 500;
+        white-space: nowrap;
+    }
 }
 .sort-select {
     background: var(--input-bg);
@@ -856,6 +996,34 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     display: flex;
     flex-direction: column;
     gap: 6px;
+}
+
+.history-footer {
+    padding: 8px 6px 12px;
+    display: flex;
+    justify-content: center;
+}
+.history-load-btn {
+    min-width: 120px;
+    height: 32px;
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--input-bg);
+    color: var(--text-2);
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+        color: var(--text-0);
+        border-color: var(--border-strong);
+        background: var(--card-hover-bg);
+    }
+    &:disabled {
+        cursor: wait;
+        opacity: 0.65;
+    }
 }
 
 /* 让浏览器自动跳过离屏卡片的布局/渲染，近似虚拟化 */
