@@ -1,0 +1,3 @@
+[submodule "plugins/MQTTMountain-Shangyun-Plugin"]
+	path = plugins/MQTTMountain-Shangyun-Plugin
+	url = https://github.com/finalpi/MQTTMountain-Shangyun-Plugin.git

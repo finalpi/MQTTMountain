@@ -76,6 +76,7 @@ my-plugin/
 
 - `topic` / `payloadTemplate` 支持 `{paramKey}` 占位，会用用户填入的参数替换
 - `params[]` 声明用户要填什么，`type` 可为 `string / number / boolean / select`
+- `params[].suggestionKeys` 可额外指定参数记忆 key，并支持 `{paramKey}` 占位；例如 `liveVideoIds:{gateway}` 会在 `gateway` 变化后读取对应机场的视频流缓存作为下拉候选
 - `group` 同组 sender 会在下拉菜单中归到一起
 
 ---

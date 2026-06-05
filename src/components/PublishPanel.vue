@@ -165,7 +165,12 @@ async function publishMessage(draft?: PayloadDraft): Promise<void> {
         // 发送成功后把当前 sender 的参数值记入历史，下次可下拉选择
         if (activeSender.value?.params) {
             for (const pr of activeSender.value.params) {
-                paramMem.remember(pr.key, paramValues.value[pr.key]);
+                const value = paramValues.value[pr.key];
+                paramMem.remember(pr.key, value);
+                for (const key of pr.suggestionKeys ?? []) {
+                    const resolved = resolveSuggestionKey(key);
+                    if (!resolved.includes('{')) paramMem.remember(resolved, value);
+                }
             }
         }
         toast.success('已发送');
@@ -202,7 +207,11 @@ const activeSender = ref<(SenderDefinition & { pluginId: string; pluginName: str
 const lastTemplateTopic = ref('');
 const lastTemplatePayload = ref('');
 
-function suggestionListFor(paramKey: string): string[] {
+function resolveSuggestionKey(key: string): string {
+    return applyTemplate(key, paramValues.value);
+}
+
+function suggestionListFor(paramKey: string, suggestionKeys: string[] = []): string[] {
     const values = new Set<string>();
     const addAll = (items: Array<string | undefined>): void => {
         for (const item of items) {
@@ -210,9 +219,25 @@ function suggestionListFor(paramKey: string): string[] {
         }
     };
 
-    addAll(paramMem.suggestionsFor(paramKey));
+    let hasResolvedSuggestionKey = false;
+    for (const key of suggestionKeys) {
+        const resolved = resolveSuggestionKey(key);
+        if (resolved.includes('{')) continue;
+        hasResolvedSuggestionKey = true;
+        addAll(paramMem.suggestionsFor(resolved));
+    }
+    if (!suggestionKeys.length || !hasResolvedSuggestionKey) addAll(paramMem.suggestionsFor(paramKey));
 
     return [...values];
+}
+
+function stableSuggestionList(previous: string[], next: string[]): string[] {
+    const nextSet = new Set(next);
+    const stable = previous.filter((item) => nextSet.has(item));
+    for (const item of next) {
+        if (!stable.includes(item)) stable.push(item);
+    }
+    return stable;
 }
 
 function applyTemplate(tpl: string, vals: Record<string, string>): string {
@@ -244,7 +269,7 @@ function pickSender(id: string): void {
     paramSuggestionCache.value = {};
     for (const pr of s.params ?? []) {
         // 优先用记忆里最近一次的值，其次用插件声明的 default
-        const suggestions = suggestionListFor(pr.key);
+        const suggestions = suggestionListFor(pr.key, pr.suggestionKeys ?? []);
         paramSuggestionCache.value[pr.key] = suggestions;
         const memo = suggestions[0];
         const initial = memo != null && memo !== '' ? memo : String(pr.default ?? '');
@@ -255,16 +280,33 @@ function pickSender(id: string): void {
     if (s.retain != null) retain.value = s.retain;
 }
 
-function onParamInput(): void {
+function refreshParamSuggestions(changedKey?: string): void {
     const s = activeSender.value;
     if (!s) return;
+    for (const pr of s.params ?? []) {
+        const previousSuggestions = paramSuggestionCache.value[pr.key] ?? [];
+        const suggestions = stableSuggestionList(previousSuggestions, suggestionListFor(pr.key, pr.suggestionKeys ?? []));
+        paramSuggestionCache.value[pr.key] = suggestions;
+        const dependsOnChanged = !!changedKey && (pr.suggestionKeys ?? []).some((key) => key.includes(`{${changedKey}}`));
+        if (!dependsOnChanged || !suggestions.length) continue;
+        const current = paramValues.value[pr.key];
+        if (!current || previousSuggestions.includes(current)) {
+            paramValues.value[pr.key] = suggestions[0];
+        }
+    }
+}
+
+function onParamInput(changedKey?: string): void {
+    const s = activeSender.value;
+    if (!s) return;
+    refreshParamSuggestions(changedKey);
     syncTemplateOutput(s);
 }
 
 function onSuggestionPick(paramKey: string, value: string): void {
     if (!value) return;
     paramValues.value[paramKey] = value;
-    onParamInput();
+    onParamInput(paramKey);
 }
 
 function actionLabel(action: SenderParamAction): string {
@@ -273,7 +315,7 @@ function actionLabel(action: SenderParamAction): string {
 
 function fillParamValue(paramKey: string, value: string): void {
     paramValues.value[paramKey] = value;
-    onParamInput();
+    onParamInput(paramKey);
 }
 
 async function runParamAction(paramKey: string, action: SenderParamAction): Promise<void> {
@@ -284,13 +326,26 @@ async function runParamAction(paramKey: string, action: SenderParamAction): Prom
         senderId: s.id,
         paramKey,
         actionId: action.id,
-        params: { ...paramValues.value }
+        params: {
+            ...paramValues.value,
+            __paramSuggestions: JSON.stringify(paramMem.state.data)
+        }
     });
     if (!result.success) {
         toast.error(result.message || '参数动作执行失败');
         return;
     }
-    fillParamValue(paramKey, String(result.data ?? ''));
+    const data = result.data;
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+        const changedKeys = Object.keys(data);
+        for (const [key, value] of Object.entries(data)) {
+            paramValues.value[key] = String(value ?? '');
+        }
+        for (const key of changedKeys) refreshParamSuggestions(key);
+        onParamInput();
+        return;
+    }
+    fillParamValue(paramKey, String(data ?? ''));
 }
 
 watch(
@@ -300,13 +355,13 @@ watch(
         if (!s) return;
         let changed = false;
         for (const pr of s.params ?? []) {
-            const suggestions = suggestionListFor(pr.key);
+            const previousSuggestions = paramSuggestionCache.value[pr.key] ?? [];
+            const suggestions = stableSuggestionList(previousSuggestions, suggestionListFor(pr.key, pr.suggestionKeys ?? []));
             const latest = suggestions[0];
             if (!latest) continue;
             const current = paramValues.value[pr.key];
-            const previousSuggestions = paramSuggestionCache.value[pr.key] ?? [];
             paramSuggestionCache.value[pr.key] = suggestions;
-            if (!current || previousSuggestions.includes(current)) {
+            if (!current) {
                 paramValues.value[pr.key] = latest;
                 changed = true;
             }
@@ -359,8 +414,12 @@ const historyList = computed(() => {
                             >{{ actionLabel(action) }}</button>
                         </span>
                     </label>
-                    <select v-if="p.type === 'select'" v-model="paramValues[p.key]" @change="onParamInput">
-                        <option v-for="opt in (p.options ?? [])" :key="opt" :value="opt">{{ opt }}</option>
+                    <select
+                        v-if="p.type === 'select' && (p.options?.length || (paramSuggestionCache[p.key] ?? []).length)"
+                        v-model="paramValues[p.key]"
+                        @change="onParamInput(p.key)"
+                    >
+                        <option v-for="opt in (p.options?.length ? p.options : (paramSuggestionCache[p.key] ?? []))" :key="opt" :value="opt">{{ opt }}</option>
                     </select>
                     <select
                         v-else-if="p.type !== 'number' && (paramSuggestionCache[p.key] ?? []).length"
@@ -376,8 +435,8 @@ const historyList = computed(() => {
                         :type="p.type === 'number' ? 'number' : 'text'"
                         v-model="paramValues[p.key]"
                         :placeholder="p.placeholder"
-                        @input="onParamInput"
-                        @focus="paramSuggestionCache[p.key] = suggestionListFor(p.key)"
+                        @input="onParamInput(p.key)"
+                        @focus="paramSuggestionCache[p.key] = suggestionListFor(p.key, p.suggestionKeys ?? [])"
                     />
                 </div>
             </div>

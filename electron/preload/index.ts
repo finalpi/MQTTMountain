@@ -81,7 +81,7 @@ const api = {
         paramKey: string;
         actionId: string;
         params: Record<string, string>;
-    }) => invoke<string | number | boolean>('plugin:senderParamAction', p),
+    }) => invoke<string | number | boolean | Record<string, string | number | boolean>>('plugin:senderParamAction', p),
     pluginOpenDir: () => invoke('plugin:openDir'),
     pluginsDir: () => invoke<string>('plugin:pluginsDir'),
     pluginChooseLocalDir: () => invoke<{ path: string } | null>('plugin:chooseLocalDir'),

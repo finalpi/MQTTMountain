@@ -308,7 +308,7 @@ class PluginManager {
     async senderParamAction(
         pluginId: string,
         request: { senderId: string; paramKey: string; actionId: string; params: Record<string, string> }
-    ): Promise<string | number | boolean> {
+    ): Promise<string | number | boolean | Record<string, string | number | boolean>> {
         const p = this.plugins.get(pluginId);
         if (!p || !p.enabled || !p.loaded || !p.runtime?.senderParamAction) {
             throw new Error('插件未提供参数动作：' + pluginId);

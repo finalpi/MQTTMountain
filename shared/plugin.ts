@@ -62,6 +62,8 @@ export interface SenderParamActionRequest {
     params: Record<string, string>;
 }
 
+export type SenderParamActionResult = string | number | boolean | Record<string, string | number | boolean>;
+
 /** 插件发送模板的一个参数 */
 export interface SenderParam {
     key: string;
@@ -69,6 +71,8 @@ export interface SenderParam {
     /** 默认 'string' */
     type?: 'string' | 'number' | 'boolean' | 'select';
     options?: string[];
+    /** 从参数记忆里额外读取候选项；支持 `{paramKey}` 占位，例如 `liveVideoIds:{gateway}`。 */
+    suggestionKeys?: string[];
     default?: string | number | boolean;
     placeholder?: string;
     required?: boolean;
@@ -107,7 +111,7 @@ export interface DecodedResult {
      * 宿主收到消息时会自动写入，后续发送时参数下拉就有这些值。
      * 例：{ sn: "8UUXNCJ00A0XWG", gateway: "8UUXNCJ00A0XWG" }
      */
-    rememberParams?: Record<string, string>;
+    rememberParams?: Record<string, string | string[]>;
     /**
      * 宿主可消费的业务元信息。
      * 这部分应尽量保持“插件负责识别，宿主负责展示”。
@@ -160,8 +164,8 @@ export interface PluginRuntime {
      */
     topicLabel?: (topic: string) => string | null;
 
-    /** 点击 sender 参数动作按钮时调用，返回要填入该参数的值。 */
-    senderParamAction?: (request: SenderParamActionRequest) => string | number | boolean | Promise<string | number | boolean>;
+    /** 点击 sender 参数动作按钮时调用，返回要填入该参数的值；返回对象时会批量填充多个参数。 */
+    senderParamAction?: (request: SenderParamActionRequest) => SenderParamActionResult | Promise<SenderParamActionResult>;
 
     /** 激活时调用（用户启用插件后、第一次使用前触发一次） */
     activate?: (ctx: PluginContext) => void | Promise<void>;

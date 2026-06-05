@@ -49,7 +49,13 @@ export function useMqttBridge() {
                         const decoded = decodedBatch[i];
                         if (!decoded?.rememberParams) continue;
                         for (const [key, value] of Object.entries(decoded.rememberParams)) {
-                            if (value != null) paramMem.remember(key, String(value));
+                            if (Array.isArray(value)) {
+                                for (let i = value.length - 1; i >= 0; i -= 1) {
+                                    paramMem.remember(key, value[i]);
+                                }
+                            } else if (value != null) {
+                                paramMem.remember(key, String(value));
+                            }
                         }
                     }
                 }
