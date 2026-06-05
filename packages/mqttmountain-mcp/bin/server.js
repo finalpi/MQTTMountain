@@ -9,11 +9,14 @@ import { z } from 'zod';
 
 const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_LIMIT = 5000;
+const INDEX_QUERY_CHUNK_SIZE = 1000;
+const BUCKET_QUERY_CHUNK_SIZE = 256;
+const HISTORY_INDEX_SCHEMA_VERSION = '1';
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
 const DEFAULT_PAYLOAD_PREVIEW_CHARS = 300;
-const PACKAGE_VERSION = '0.1.2';
+const PACKAGE_VERSION = '0.1.3';
 
 function printHelp() {
   process.stdout.write(`mqttmountain-mcp ${PACKAGE_VERSION}
@@ -266,6 +269,52 @@ function normalizeKeyword(value) {
   return String(value || '').replace(/\s+/gu, '').toLowerCase();
 }
 
+function parseKeywordTerms(input) {
+  if (!input) return [];
+  const raw = Array.isArray(input) ? input : [input];
+  return raw.map(normalizeKeyword).filter(Boolean);
+}
+
+function normalizeConditions(conditions) {
+  if (!Array.isArray(conditions)) return [];
+  return conditions
+    .map((item) => ({
+      term: normalizeKeyword(item?.term || ''),
+      join: ['and', 'or', 'not'].includes(item?.join) ? item.join : 'and'
+    }))
+    .filter((item) => item.term);
+}
+
+function matchesConditions(hay, conditions) {
+  if (!conditions.length) return true;
+  let matched = true;
+  let initialized = false;
+  for (const condition of conditions) {
+    const hit = hay.includes(condition.term);
+    if (!initialized) {
+      matched = condition.join === 'not' ? !hit : hit;
+      initialized = true;
+      continue;
+    }
+    if (condition.join === 'or') matched = matched || hit;
+    else if (condition.join === 'not') matched = matched && !hit;
+    else matched = matched && hit;
+  }
+  return matched;
+}
+
+function matchesSearchText(hay, conditions, terms, keywordLogic = 'and') {
+  if (conditions.length) return matchesConditions(hay, conditions);
+  if (!terms.length) return true;
+  return keywordLogic === 'or'
+    ? terms.some((term) => hay.includes(term))
+    : terms.every((term) => hay.includes(term));
+}
+
+function matchesText(topic, payload, conditions, terms, keywordLogic = 'and') {
+  return matchesSearchText(normalizeKeyword(String(topic || '') + String(payload || '')), conditions, terms, keywordLogic);
+}
+
 function connectionMatches(item, query) {
   const terms = expandConnectionSearchTerms(query);
   const hay = normalizeKeyword([
@@ -502,58 +551,179 @@ function readMessageStatus(logDir, options) {
   };
 }
 
+function tableExists(db, tableName) {
+  const row = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?").get(tableName);
+  return !!row;
+}
+
+function getIndexMeta(db, key) {
+  if (!tableExists(db, 'history_index_meta')) return null;
+  const row = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get(key);
+  return row ? String(row.value ?? '') : null;
+}
+
+function hasUsableIndex(db) {
+  if (!tableExists(db, 'history_messages')) return false;
+  return getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION
+    && getIndexMeta(db, 'index_complete') === '1';
+}
+
+function buildQueryState(options) {
+  const startTime = Number.isFinite(options.startTime) ? options.startTime : -8640000000000000;
+  const endTime = Number.isFinite(options.endTime) ? options.endTime : 8640000000000000;
+  const conditions = normalizeConditions(options.conditions);
+  const terms = conditions.length
+    ? []
+    : parseKeywordTerms(Array.isArray(options.keywords) && options.keywords.length ? options.keywords : options.keyword);
+  return {
+    startTime,
+    endTime,
+    limit: Math.min(MAX_LIMIT, Math.max(1, options.limit || 200)),
+    offset: Math.max(0, Number.isFinite(options.offset) ? Math.floor(options.offset) : 0),
+    order: options.order === 'asc' ? 'asc' : 'desc',
+    keywordLogic: options.keywordLogic === 'or' ? 'or' : 'and',
+    topic: options.topic && options.topic.trim() ? options.topic.trim() : null,
+    conditions,
+    terms,
+    skipped: 0,
+    out: []
+  };
+}
+
+function acceptHistoryMessage(state, message, searchText) {
+  const hay = searchText ?? normalizeKeyword(String(message.topic || '') + String(message.payload || ''));
+  if (!matchesSearchText(hay, state.conditions, state.terms, state.keywordLogic)) return false;
+  if (state.skipped < state.offset) {
+    state.skipped += 1;
+    return false;
+  }
+  state.out.push(message);
+  return state.out.length >= state.limit;
+}
+
+function queryIndexedFile(db, connectionId, state) {
+  let sql = 'SELECT time_ms, topic, payload, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+  const params = [state.startTime, state.endTime];
+  if (state.topic) {
+    sql += ' AND topic = ?';
+    params.push(state.topic);
+  }
+  sql += state.order === 'asc'
+    ? ' ORDER BY time_ms ASC, topic ASC, msg_index ASC'
+    : ' ORDER BY time_ms DESC, topic DESC, msg_index DESC';
+  sql += ' LIMIT ? OFFSET ?';
+
+  let offset = 0;
+  while (state.out.length < state.limit) {
+    const rows = db.prepare(sql).all(...params, INDEX_QUERY_CHUNK_SIZE, offset);
+    if (!rows.length) break;
+    for (const row of rows) {
+      const done = acceptHistoryMessage(state, {
+        connectionId,
+        topic: row.topic,
+        payload: row.payload,
+        time: row.time_ms
+      }, row.search_text || '');
+      if (done) return;
+    }
+    offset += rows.length;
+    if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;
+  }
+}
+
+function queryBucketFile(db, connectionId, state) {
+  const secMin = Math.floor(Math.max(state.startTime, -8640000000) / 1000);
+  const secMax = Math.ceil(Math.min(state.endTime, 8640000000000) / 1000);
+  let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
+  const params = [secMin, secMax];
+  if (state.topic) {
+    sql += ' AND topic = ?';
+    params.push(state.topic);
+  }
+  sql += state.order === 'asc'
+    ? ' ORDER BY bucket_ts ASC, topic ASC'
+    : ' ORDER BY bucket_ts DESC, topic DESC';
+  sql += ' LIMIT ? OFFSET ?';
+
+  let offset = 0;
+  while (state.out.length < state.limit) {
+    const rows = db.prepare(sql).all(...params, BUCKET_QUERY_CHUNK_SIZE, offset);
+    if (!rows.length) break;
+    for (const row of rows) {
+      const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
+      const start = state.order === 'asc' ? 0 : decoded.length - 1;
+      const end = state.order === 'asc' ? decoded.length : -1;
+      const step = state.order === 'asc' ? 1 : -1;
+      for (let i = start; i !== end; i += step) {
+        const message = decoded[i];
+        if (message.time < state.startTime || message.time > state.endTime) continue;
+        const done = acceptHistoryMessage(state, message);
+        if (done) return;
+      }
+    }
+    offset += rows.length;
+    if (rows.length < BUCKET_QUERY_CHUNK_SIZE) break;
+  }
+}
+
 function queryHistory(logDir, options) {
-  const startTime = options.startTime && options.startTime > 0 ? options.startTime : -8640000000000000;
-  const endTime = options.endTime && options.endTime > 0 ? options.endTime : 8640000000000000;
-  const limit = Math.min(MAX_LIMIT, Math.max(1, options.limit || 200));
-  const keyword = normalizeKeyword(options.keyword || '');
-  const topic = options.topic && options.topic.trim() ? options.topic.trim() : null;
+  const state = buildQueryState(options);
   const connectionIds = options.connectionId
     ? [options.connectionId]
     : listLogConnectionIds(logDir);
 
-  const secMin = Math.floor(Math.max(startTime, -8640000000) / 1000);
-  const secMax = Math.ceil(Math.min(endTime, 8640000000000) / 1000);
-  const out = [];
-
   for (const connectionId of connectionIds) {
-    const files = listDayFiles(logDir, connectionId, true)
+    if (state.out.length >= state.limit) break;
+    const files = listDayFiles(logDir, connectionId, state.order !== 'asc')
       .filter((filePath) => {
         const dayKey = path.basename(filePath, '.db');
-        return dayEndTsFromKey(dayKey) >= startTime && dayStartTsFromKey(dayKey) <= endTime;
+        return dayEndTsFromKey(dayKey) >= state.startTime && dayStartTsFromKey(dayKey) <= state.endTime;
       });
 
     for (const filePath of files) {
-      if (out.length >= limit) break;
+      if (state.out.length >= state.limit) break;
       const db = new Database(filePath, { readonly: true, fileMustExist: true });
       try {
-        let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
-        const params = [secMin, secMax];
-        if (topic) {
-          sql += ' AND topic = ?';
-          params.push(topic);
-        }
-        sql += ' ORDER BY bucket_ts DESC';
-        const rows = db.prepare(sql).all(...params);
-        for (const row of rows) {
-          const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
-          for (let i = decoded.length - 1; i >= 0; i--) {
-            const message = decoded[i];
-            if (message.time < startTime || message.time > endTime) continue;
-            if (keyword && normalizeKeyword(message.topic + message.payload).indexOf(keyword) < 0) continue;
-            out.push(message);
-            if (out.length >= limit) break;
-          }
-          if (out.length >= limit) break;
-        }
+        if (hasUsableIndex(db)) queryIndexedFile(db, connectionId, state);
+        else queryBucketFile(db, connectionId, state);
       } finally {
         db.close();
       }
     }
   }
 
-  out.sort((a, b) => b.time - a.time);
-  return out.slice(0, limit);
+  return state.out;
+}
+
+function readHistoryIndexStatus(logDir, options) {
+  const connectionIds = options.connectionId ? [options.connectionId] : listLogConnectionIds(logDir);
+  const status = {
+    totalFiles: 0,
+    indexedFiles: 0,
+    incompleteFiles: 0,
+    totalMessages: 0,
+    fts5Enabled: false
+  };
+
+  for (const connectionId of connectionIds) {
+    for (const filePath of listDayFiles(logDir, connectionId, true)) {
+      status.totalFiles += 1;
+      const db = new Database(filePath, { readonly: true, fileMustExist: true });
+      try {
+        const complete = getIndexMeta(db, 'index_complete') === '1'
+          && getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION;
+        const messageCount = Number(getIndexMeta(db, 'indexed_message_count') || 0);
+        if (complete) status.indexedFiles += 1;
+        else status.incompleteFiles += 1;
+        if (Number.isFinite(messageCount)) status.totalMessages += messageCount;
+        status.fts5Enabled = status.fts5Enabled || getIndexMeta(db, 'fts5_enabled') === '1';
+      } finally {
+        db.close();
+      }
+    }
+  }
+
+  return status;
 }
 
 function jsonText(data) {
@@ -679,6 +849,30 @@ async function main() {
   );
 
   server.registerTool(
+    'mqttmountain_history_index_status',
+    {
+      title: 'Read MQTT History Index Status',
+      description: 'Report how many MQTTMountain history DB files have complete indexed search tables.',
+      inputSchema: z.object({
+        connectionId: z.string().optional().describe('Optional MQTTMountain connection id. Omit to scan all log folders.'),
+        connectionName: z.string().optional().describe('Optional exact MQTTMountain connection name.'),
+        connectionKeyword: z.string().optional().describe('Fuzzy connection keyword, for example "深圳星扬" or "xingyang-szga".')
+      })
+    },
+    async (input) => {
+      const connectionId = resolveConnectionId(userDataDir, logDir, input);
+      const query = connectionId ? { ...input, connectionId } : input;
+      return jsonText({
+        logDir,
+        connectionId,
+        connectionName: input.connectionName,
+        connectionKeyword: input.connectionKeyword,
+        status: readHistoryIndexStatus(logDir, query)
+      });
+    }
+  );
+
+  server.registerTool(
     'mqttmountain_query_history',
     {
       title: 'Query MQTT Message History',
@@ -689,6 +883,14 @@ async function main() {
         connectionKeyword: z.string().optional().describe('Fuzzy connection keyword, for example "深圳星扬" or "xingyang-szga".'),
         topic: z.string().optional().describe('Exact MQTT topic filter.'),
         keyword: z.string().optional().describe('Substring search across topic and payload. Whitespace is ignored.'),
+        keywords: z.array(z.string()).optional().describe('Multiple keyword terms. Whitespace is ignored.'),
+        keywordLogic: z.enum(['and', 'or']).default('and').describe('How to combine keywords when conditions are not provided.'),
+        conditions: z.array(z.object({
+          term: z.string(),
+          join: z.enum(['and', 'or', 'not'])
+        })).optional().describe('Advanced keyword conditions. Conditions take precedence over keyword/keywords.'),
+        order: z.enum(['desc', 'asc']).default('desc').describe('Sort order by message time.'),
+        offset: z.number().int().min(0).default(0).describe('Number of matched messages to skip for pagination.'),
         startTime: z.number().optional().describe('Start timestamp in milliseconds since Unix epoch.'),
         endTime: z.number().optional().describe('End timestamp in milliseconds since Unix epoch.'),
         limit: z.number().int().min(1).max(MAX_LIMIT).default(200)

@@ -41,4 +41,54 @@ If MQTTMountain uses a custom log directory, pass it explicitly:
 - `mqttmountain_recent_messages`: Read recent messages for one connection. Accepts `connectionId` or `connectionName`, plus optional exact `topic`.
 - `mqttmountain_message_status`: Read a compact recent-message summary in one call. Accepts `connectionId`, `connectionName`, or fuzzy `connectionKeyword`, plus optional `topic`, `topicKeyword`, `keyword`, and `minutes`.
 - `mqttmountain_payload_samples`: Read compact latest payload samples. Returns JSON keys, common fields, byte length, and short previews by default.
-- `mqttmountain_query_history`: Query persisted messages by connection, topic, keyword, and time range. Accepts `connectionId` or `connectionName`.
+- `mqttmountain_history_index_status`: Report how many history DB files have complete indexed search tables.
+- `mqttmountain_query_history`: Query persisted messages by connection, topic, keyword, and time range. Accepts `connectionId`, `connectionName`, or fuzzy `connectionKeyword`.
+
+## History search
+
+`mqttmountain_query_history` uses MQTTMountain's per-day `history_messages` index when a day database has a complete index. If an index is missing or incomplete, the tool automatically falls back to decoding the original `buckets` table, so old logs still work.
+
+Time values use Unix timestamps in milliseconds:
+
+```json
+{
+  "connectionKeyword": "深圳星扬",
+  "startTime": 1780588800000,
+  "endTime": 1780675200000,
+  "keyword": "camera_screen_drag",
+  "limit": 100
+}
+```
+
+Keyword matching is case-insensitive and ignores whitespace. Multiple keyword search is supported:
+
+```json
+{
+  "connectionKeyword": "深圳星扬",
+  "keywords": ["alarm", "battery"],
+  "keywordLogic": "and",
+  "order": "desc",
+  "limit": 100,
+  "offset": 0
+}
+```
+
+Advanced conditions take precedence over `keyword` and `keywords`:
+
+```json
+{
+  "conditions": [
+    { "term": "alarm", "join": "and" },
+    { "term": "offline", "join": "or" },
+    { "term": "debug", "join": "not" }
+  ],
+  "order": "asc",
+  "limit": 200
+}
+```
+
+Use `offset` with `limit` for pagination. `order` can be `desc` or `asc`.
+
+## Recent status and samples
+
+`mqttmountain_message_status` and `mqttmountain_payload_samples` accept `startTime` and `endTime`. If `startTime` is omitted, they use `minutes` as a lookback window ending at `endTime` or now. Their `keyword` search also ignores whitespace and is case-insensitive.
