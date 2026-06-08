@@ -35,6 +35,15 @@ jobs:
               with:
                   python-version: '3.11'
 
+            - name: Cache Electron downloads
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      ~/.cache/electron
+                      ~/Library/Caches/electron
+                      ~/AppData/Local/electron/Cache
+                  key: ${{ runner.os }}-electron-32.3.3
+
             - name: Install dependencies
               run: npm ci
 
@@ -82,20 +91,41 @@ jobs:
 
             - name: Package (Windows)
               if: matrix.platform == 'win'
-              run: npx electron-builder --win --publish never
+              shell: bash
+              run: |
+                  for i in 1 2 3; do
+                    npx electron-builder --win --publish never && exit 0
+                    echo "Package attempt $i failed; retrying..."
+                    sleep 20
+                  done
+                  exit 1
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
             - name: Package (macOS)
               if: matrix.platform == 'mac'
-              run: npx electron-builder --mac --publish never
+              shell: bash
+              run: |
+                  for i in 1 2 3; do
+                    npx electron-builder --mac --publish never && exit 0
+                    echo "Package attempt $i failed; retrying..."
+                    sleep 20
+                  done
+                  exit 1
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   CSC_IDENTITY_AUTO_DISCOVERY: 'false'
 
             - name: Package (Linux)
               if: matrix.platform == 'linux'
-              run: npx electron-builder --linux --publish never
+              shell: bash
+              run: |
+                  for i in 1 2 3; do
+                    npx electron-builder --linux --publish never && exit 0
+                    echo "Package attempt $i failed; retrying..."
+                    sleep 20
+                  done
+                  exit 1
               env:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
