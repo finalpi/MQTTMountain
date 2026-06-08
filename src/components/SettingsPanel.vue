@@ -14,6 +14,32 @@ const updater = useUpdater();
 const isOpen = computed(() => prefs.activeRight === 'settings');
 
 async function save(): Promise<void> {
+    const changeInfo = await window.api.settingsGetLogDirChangeInfo(settings.state.logDir);
+    if (!changeInfo.success) {
+        toast.error(changeInfo.message || '检查日志目录变更失败');
+        return;
+    }
+
+    if (changeInfo.data?.changed && changeInfo.data.sourceFiles > 0) {
+        const { sourceDir, targetDir, sourceFiles } = changeInfo.data;
+        const migrate = confirm(`原日志目录中有 ${sourceFiles} 个日志文件。\n\n是否迁移到新目录？\n\n确定：迁移\n取消：继续选择是否删除原始数据`);
+        if (migrate) {
+            const r = await window.api.settingsMigrateLogDirData({ sourceDir, targetDir });
+            if (!r.success) {
+                toast.error(r.message || '迁移原始数据失败');
+                return;
+            }
+            toast.success(`已迁移 ${r.data?.files ?? sourceFiles} 个日志文件`);
+        } else if (confirm('是否删除原始日志数据？\n\n删除后无法从历史查询找回。')) {
+            const r = await window.api.settingsDeleteLogDirData({ sourceDir });
+            if (!r.success) {
+                toast.error(r.message || '删除原始数据失败');
+                return;
+            }
+            toast.success(`已删除 ${r.data?.files ?? sourceFiles} 个日志文件`);
+        }
+    }
+
     const r = await settings.save();
     msg.setLimits(settings.state.maxMemoryMessages, settings.state.maxPerTopic);
     toast.success('设置已保存');

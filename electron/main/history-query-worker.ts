@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import type { HistoryKeywordJoin, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
 
 const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
-const HISTORY_INDEX_SCHEMA_VERSION = '1';
+const HISTORY_INDEX_SCHEMA_VERSION = '2';
 
 interface QueryWorkerData {
     opts: HistoryQueryOptions;
@@ -135,11 +135,13 @@ function queryIndexedFile(
     out: HistoryMessage[]
 ): void {
     const chunkSize = 1000;
+    const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
+    const bucketCache = new Map<string, HistoryMessage[]>();
     let lastTime: number | null = null;
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        let sql = 'SELECT time_ms, topic, msg_index, payload, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+        let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
         const params: Array<number | string> = [st, et];
         if (topicFilter) {
             sql += ' AND topic = ?';
@@ -157,7 +159,7 @@ function queryIndexedFile(
             ? ' ORDER BY time_ms DESC, topic DESC, msg_index DESC LIMIT ?'
             : ' ORDER BY time_ms ASC, topic ASC, msg_index ASC LIMIT ?';
         params.push(chunkSize);
-        const rows = db.prepare(sql).all(...params) as { time_ms: number; topic: string; msg_index: number; payload: string; search_text: string }[];
+        const rows = db.prepare(sql).all(...params) as { bucket_ts: number; time_ms: number; topic: string; msg_index: number; search_text: string }[];
         if (rows.length === 0) break;
         for (const row of rows) {
             if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
@@ -165,7 +167,16 @@ function queryIndexedFile(
                 skippedRef.value++;
                 continue;
             }
-            out.push({ connectionId: fe.san, topic: row.topic, payload: row.payload, time: row.time_ms });
+            const cacheKey = `${row.bucket_ts}|${row.topic}`;
+            let decoded = bucketCache.get(cacheKey);
+            if (!decoded) {
+                const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
+                decoded = bucket ? decodeBucket(bucket.blob, row.bucket_ts, row.topic) : [];
+                bucketCache.set(cacheKey, decoded);
+            }
+            const item = decoded[row.msg_index];
+            if (!item) continue;
+            out.push({ connectionId: fe.san, topic: row.topic, payload: item.payload, time: row.time_ms });
             if (out.length >= limit) break;
         }
         const tail = rows[rows.length - 1];

@@ -11,7 +11,7 @@ const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_LIMIT = 5000;
 const INDEX_QUERY_CHUNK_SIZE = 1000;
 const BUCKET_QUERY_CHUNK_SIZE = 256;
-const HISTORY_INDEX_SCHEMA_VERSION = '1';
+const HISTORY_INDEX_SCHEMA_VERSION = '2';
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
@@ -602,8 +602,10 @@ function acceptHistoryMessage(state, message, searchText) {
 }
 
 function queryIndexedFile(db, connectionId, state) {
-  let sql = 'SELECT time_ms, topic, payload, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+  let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
   const params = [state.startTime, state.endTime];
+  const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
+  const bucketCache = new Map();
   if (state.topic) {
     sql += ' AND topic = ?';
     params.push(state.topic);
@@ -618,13 +620,27 @@ function queryIndexedFile(db, connectionId, state) {
     const rows = db.prepare(sql).all(...params, INDEX_QUERY_CHUNK_SIZE, offset);
     if (!rows.length) break;
     for (const row of rows) {
-      const done = acceptHistoryMessage(state, {
+      if (!matchesSearchText(row.search_text || '', state.conditions, state.terms, state.keywordLogic)) continue;
+      if (state.skipped < state.offset) {
+        state.skipped += 1;
+        continue;
+      }
+      const cacheKey = `${row.bucket_ts}|${row.topic}`;
+      let decoded = bucketCache.get(cacheKey);
+      if (!decoded) {
+        const bucket = bucketStmt.get(row.bucket_ts, row.topic);
+        decoded = bucket ? decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId) : [];
+        bucketCache.set(cacheKey, decoded);
+      }
+      const item = decoded[row.msg_index];
+      if (!item) continue;
+      state.out.push({
         connectionId,
         topic: row.topic,
-        payload: row.payload,
+        payload: item.payload,
         time: row.time_ms
-      }, row.search_text || '');
-      if (done) return;
+      });
+      if (state.out.length >= state.limit) return;
     }
     offset += rows.length;
     if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;

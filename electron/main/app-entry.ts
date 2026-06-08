@@ -1,8 +1,8 @@
 import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { initIpc } from './ipc';
-import { initStorage, shutdownStorage } from './storage';
-import { initSettings, getCurrentLogDir, readSettings } from './settings';
+import { clearLogsWithoutConnections, initStorage, shutdownStorage } from './storage';
+import { initSettings, getCurrentLogDir, readConnections, readSettings } from './settings';
 import { MqttService } from './mqtt-service';
 import { runAutoDeleteAsync } from './storage';
 import { pluginManager } from './plugin-manager';
@@ -89,6 +89,7 @@ app.on('second-instance', () => {
 app.whenReady().then(async () => {
     initSettings();
     initStorage(getCurrentLogDir());
+    clearLogsWithoutConnections(readConnections().connections.map((c) => c.id));
     await pluginManager.init().catch((e) => console.error('[plugin] init:', e));
     mqttService = new MqttService(() => win);
     initIpc(mqttService);

@@ -36,6 +36,19 @@ export interface AppSettings {
     logDir: string;
 }
 
+export interface LogDirChangeInfo {
+    changed: boolean;
+    sourceDir: string;
+    targetDir: string;
+    sourceFiles: number;
+}
+
+export interface LogDirDataResult {
+    files: number;
+    sourceDir: string;
+    targetDir?: string;
+}
+
 /** 批量从主进程推到渲染进程的单条消息 */
 export interface MqttMessage {
     connectionId: string;
@@ -186,6 +199,9 @@ export type IpcChannels = {
     'config:write': (data: ConnectionsFile) => ApiResult;
     'settings:get': () => ApiResult<AppSettings>;
     'settings:set': (s: AppSettings) => ApiResult<{ needRestart: boolean }>;
+    'settings:getLogDirChangeInfo': (logDir: string) => ApiResult<LogDirChangeInfo>;
+    'settings:migrateLogDirData': (p: { sourceDir: string; targetDir: string }) => ApiResult<LogDirDataResult>;
+    'settings:deleteLogDirData': (p: { sourceDir: string }) => ApiResult<LogDirDataResult>;
     'settings:getDefaultLogDir': () => ApiResult<string>;
     'settings:getCurrentLogDir': () => ApiResult<string>;
     'settings:chooseLogDir': () => ApiResult<{ path: string } | null>;

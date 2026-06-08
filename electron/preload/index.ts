@@ -2,6 +2,8 @@ import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron';
 import type {
     AppSettings,
     ConnectionsFile,
+    LogDirChangeInfo,
+    LogDirDataResult,
     ConnectPayload,
     HistoryExportProgress,
     HistoryExportRequest,
@@ -47,6 +49,9 @@ const api = {
 
     settingsGet: () => invoke<AppSettings>('settings:get'),
     settingsSet: (s: AppSettings) => invoke<{ needRestart: boolean }>('settings:set', s),
+    settingsGetLogDirChangeInfo: (logDir: string) => invoke<LogDirChangeInfo>('settings:getLogDirChangeInfo', logDir),
+    settingsMigrateLogDirData: (p: { sourceDir: string; targetDir: string }) => invoke<LogDirDataResult>('settings:migrateLogDirData', p),
+    settingsDeleteLogDirData: (p: { sourceDir: string }) => invoke<LogDirDataResult>('settings:deleteLogDirData', p),
     settingsGetDefaultLogDir: () => invoke<string>('settings:getDefaultLogDir'),
     settingsGetCurrentLogDir: () => invoke<string>('settings:getCurrentLogDir'),
     settingsChooseLogDir: () => invoke<{ path: string } | null>('settings:chooseLogDir'),

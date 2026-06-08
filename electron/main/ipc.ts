@@ -6,6 +6,8 @@ import type {
     AppSettings,
     ConnectionsFile,
     ConnectPayload,
+    LogDirChangeInfo,
+    LogDirDataResult,
     HistoryExportRequest,
     HistoryQueryOptions,
     PublishPayload
@@ -20,6 +22,8 @@ import {
 } from './settings';
 import {
     clearLogs,
+    clearLogsWithoutConnections,
+    closeAllLogDbs,
     readRecentByConnection,
     runAutoDeleteAsync
 } from './storage';
@@ -33,6 +37,87 @@ import { queryHistoryAsync } from './history-query';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
+}
+
+function normalizeDirForCompare(dir: string): string {
+    return path.resolve(dir).replace(/[\\/]+$/u, '').toLowerCase();
+}
+
+function resolveRequestedLogDir(logDir: string): string {
+    const trimmed = typeof logDir === 'string' ? logDir.trim() : '';
+    return trimmed || getDefaultLogDir();
+}
+
+function countLogDbFiles(root: string): number {
+    if (!fs.existsSync(root)) return 0;
+    let total = 0;
+    const stack = [root];
+    while (stack.length) {
+        const dir = stack.pop()!;
+        for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+            const fp = path.join(dir, item.name);
+            if (item.isDirectory()) stack.push(fp);
+            else if (/^\d{4}-\d{2}-\d{2}\.db(?:-wal|-shm)?$/u.test(item.name)) total++;
+        }
+    }
+    return total;
+}
+
+function getLogDirChangeInfo(logDir: string): LogDirChangeInfo {
+    const sourceDir = getCurrentLogDir();
+    const targetDir = resolveRequestedLogDir(logDir);
+    const changed = normalizeDirForCompare(sourceDir) !== normalizeDirForCompare(targetDir);
+    return {
+        changed,
+        sourceDir,
+        targetDir,
+        sourceFiles: changed ? countLogDbFiles(sourceDir) : 0
+    };
+}
+
+function isSubPath(parentDir: string, childDir: string): boolean {
+    const parent = normalizeDirForCompare(parentDir);
+    const child = normalizeDirForCompare(childDir);
+    return child.startsWith(`${parent}${path.sep}`);
+}
+
+function assertCurrentLogDir(sourceDir: string): void {
+    if (normalizeDirForCompare(sourceDir) !== normalizeDirForCompare(getCurrentLogDir())) {
+        throw new Error('源目录不是当前日志目录');
+    }
+}
+
+function assertDifferentLogDirs(sourceDir: string, targetDir?: string): void {
+    if (!targetDir) return;
+    if (normalizeDirForCompare(sourceDir) === normalizeDirForCompare(targetDir)) {
+        throw new Error('源目录和目标目录相同');
+    }
+    if (isSubPath(sourceDir, targetDir) || isSubPath(targetDir, sourceDir)) {
+        throw new Error('源目录和目标目录不能互为父子目录');
+    }
+}
+
+function migrateLogDirData(sourceDir: string, targetDir: string): LogDirDataResult {
+    assertCurrentLogDir(sourceDir);
+    assertDifferentLogDirs(sourceDir, targetDir);
+    closeAllLogDbs();
+    const files = countLogDbFiles(sourceDir);
+    if (files > 0) {
+        fs.mkdirSync(targetDir, { recursive: true });
+        fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
+        fs.rmSync(sourceDir, { recursive: true, force: true });
+    }
+    return { files, sourceDir, targetDir };
+}
+
+function deleteLogDirData(sourceDir: string): LogDirDataResult {
+    assertCurrentLogDir(sourceDir);
+    closeAllLogDbs();
+    const files = countLogDbFiles(sourceDir);
+    if (files > 0 && fs.existsSync(sourceDir)) {
+        fs.rmSync(sourceDir, { recursive: true, force: true });
+    }
+    return { files, sourceDir };
 }
 
 export function initIpc(mqttService: MqttService): void {
@@ -131,8 +216,15 @@ export function initIpc(mqttService: MqttService): void {
     ipcMain.handle('config:read', () => ({ success: true, data: readConnections() }));
     ipcMain.handle('config:write', (_e, data: ConnectionsFile) => {
         try {
+            const prev = readConnections();
             writeConnections(data);
-            return { success: true };
+            const prevIds = new Set((prev.connections ?? []).map((c) => c.id));
+            const nextIds = new Set((data.connections ?? []).map((c) => c.id));
+            const hasRemovedConnection = [...prevIds].some((id) => !nextIds.has(id));
+            const cleanup = hasRemovedConnection
+                ? clearLogsWithoutConnections((data.connections ?? []).map((c) => c.id))
+                : { deletedFiles: 0, deletedDirs: 0 };
+            return { success: true, data: cleanup };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
@@ -148,6 +240,27 @@ export function initIpc(mqttService: MqttService): void {
                 if (w && !w.isDestroyed()) w.webContents.send('app:autoDeleteDone', files);
             });
             return { success: true, data: r };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('settings:getLogDirChangeInfo', (_e, logDir: string) => {
+        try {
+            return { success: true, data: getLogDirChangeInfo(logDir) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('settings:migrateLogDirData', (_e, p: { sourceDir: string; targetDir: string }) => {
+        try {
+            return { success: true, data: migrateLogDirData(p.sourceDir, p.targetDir) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('settings:deleteLogDirData', (_e, p: { sourceDir: string }) => {
+        try {
+            return { success: true, data: deleteLogDirData(p.sourceDir) };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }

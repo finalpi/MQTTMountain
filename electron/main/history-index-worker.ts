@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult, HistoryMessage } from '../../shared/types';
 
 const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
-const HISTORY_INDEX_SCHEMA_VERSION = '1';
+const HISTORY_INDEX_SCHEMA_VERSION = '2';
 const port = parentPort;
 
 interface IndexWorkerData {
@@ -53,18 +53,34 @@ function setIndexMeta(db: Database.Database, key: string, value: string | number
     ).run(key, String(value));
 }
 
+function getIndexMeta(db: Database.Database, key: string): string | null {
+    try {
+        const row = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get(key) as { value: string } | undefined;
+        return row?.value ?? null;
+    } catch {
+        return null;
+    }
+}
+
 function ensureHistoryIndexSchema(db: Database.Database): void {
     db.exec(`
         CREATE TABLE IF NOT EXISTS history_index_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         ) WITHOUT ROWID;
+    `);
+    const version = getIndexMeta(db, 'schema_version');
+    const hasPayloadColumn = db.prepare('PRAGMA table_info(history_messages)').all()
+        .some((col) => (col as { name?: string }).name === 'payload');
+    if (version !== HISTORY_INDEX_SCHEMA_VERSION || hasPayloadColumn) {
+        db.exec('DROP TABLE IF EXISTS history_messages;');
+    }
+    db.exec(`
         CREATE TABLE IF NOT EXISTS history_messages (
             bucket_ts INTEGER NOT NULL,
             topic TEXT NOT NULL,
             msg_index INTEGER NOT NULL,
             time_ms INTEGER NOT NULL,
-            payload TEXT NOT NULL,
             search_text TEXT NOT NULL,
             PRIMARY KEY (bucket_ts, topic, msg_index)
         ) WITHOUT ROWID;
@@ -128,8 +144,8 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
         const totalRow = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(count), 0) AS messages FROM buckets').get() as { count: number; messages: number };
         const totalBuckets = totalRow.count;
         const insertStmt = db.prepare(
-            `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, payload, search_text)
-             VALUES (?, ?, ?, ?, ?, ?)`
+            `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
+             VALUES (?, ?, ?, ?, ?)`
         );
         const selectStmt = db.prepare(
             `SELECT bucket_ts, topic, blob FROM buckets
@@ -142,7 +158,7 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                 const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
                 for (let i = 0; i < decoded.length; i++) {
                     const item = decoded[i];
-                    insertStmt.run(row.bucket_ts, row.topic, i, item.time, item.payload, normalizeSearchText(row.topic, item.payload));
+                    insertStmt.run(row.bucket_ts, row.topic, i, item.time, normalizeSearchText(row.topic, item.payload));
                 }
                 processedBuckets++;
                 processedMessages += decoded.length;

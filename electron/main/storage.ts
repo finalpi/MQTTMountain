@@ -22,7 +22,7 @@ import type { HistoryIndexStatus, HistoryKeywordJoin, HistoryMessage, HistoryQue
 
 const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_OPEN_LOG_DBS = 24;
-const HISTORY_INDEX_SCHEMA_VERSION = '1';
+const HISTORY_INDEX_SCHEMA_VERSION = '2';
 
 let LOG_ROOT = '';
 const logDbCache = new Map<string, { db: Database.Database; getStmt: Database.Statement; upsertStmt: Database.Statement }>();
@@ -97,12 +97,20 @@ function ensureHistoryIndexSchema(db: Database.Database): void {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         ) WITHOUT ROWID;
+    `);
+    const version = getIndexMeta(db, 'schema_version');
+    const hasPayloadColumn = db.prepare("PRAGMA table_info(history_messages)").all()
+        .some((col) => (col as { name?: string }).name === 'payload');
+    const resetIndex = version !== HISTORY_INDEX_SCHEMA_VERSION || hasPayloadColumn;
+    if (resetIndex) {
+        db.exec('DROP TABLE IF EXISTS history_messages;');
+    }
+    db.exec(`
         CREATE TABLE IF NOT EXISTS history_messages (
             bucket_ts INTEGER NOT NULL,
             topic TEXT NOT NULL,
             msg_index INTEGER NOT NULL,
             time_ms INTEGER NOT NULL,
-            payload TEXT NOT NULL,
             search_text TEXT NOT NULL,
             PRIMARY KEY (bucket_ts, topic, msg_index)
         ) WITHOUT ROWID;
@@ -115,7 +123,7 @@ function ensureHistoryIndexSchema(db: Database.Database): void {
          ON CONFLICT(key) DO UPDATE SET value=excluded.value`
     ).run(HISTORY_INDEX_SCHEMA_VERSION);
     const complete = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get('index_complete') as { value: string } | undefined;
-    if (!complete) {
+    if (resetIndex || !complete) {
         const row = db.prepare('SELECT COUNT(*) AS count FROM buckets').get() as { count: number };
         setIndexMeta(db, 'index_complete', row.count > 0 ? '0' : '1');
         setIndexMeta(db, 'indexed_message_count', 0);
@@ -145,13 +153,13 @@ function normalizeSearchText(topic: string, payload: string): string {
 function replaceBucketIndex(db: Database.Database, bucketSec: number, topic: string, items: { payload: string; tsMs: number }[]): void {
     const deleteStmt = db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     const insertStmt = db.prepare(
-        `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, payload, search_text)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
+         VALUES (?, ?, ?, ?, ?)`
     );
     deleteStmt.run(bucketSec, topic);
     for (let i = 0; i < items.length; i++) {
         const item = items[i];
-        insertStmt.run(bucketSec, topic, i, item.tsMs, item.payload, normalizeSearchText(topic, item.payload));
+        insertStmt.run(bucketSec, topic, i, item.tsMs, normalizeSearchText(topic, item.payload));
     }
 }
 
@@ -554,38 +562,62 @@ export function getHistoryIndexStatus(connectionId?: string | null): HistoryInde
 }
 
 // ---------------- clear ----------------
+function closeLogDbsForSan(san: string): void {
+    for (const [k, v] of [...logDbCache.entries()]) {
+        if (k.startsWith(`${san}|`)) {
+            try { v.db.close(); } catch {}
+            logDbCache.delete(k);
+        }
+    }
+}
+
+function countDayDbFiles(dir: string): number {
+    if (!fs.existsSync(dir)) return 0;
+    return fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f) || /^\d{4}-\d{2}-\d{2}\.db(?:-wal|-shm)$/u.test(f)).length;
+}
+
+export function closeAllLogDbs(): void {
+    flushStorage();
+    for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
+    logDbCache.clear();
+}
+
 export function clearLogs(connectionId?: string | null): { deletedFiles: number } {
     flushStorage();
     let deleted = 0;
     if (connectionId) {
         const san = sanitizeConnectionId(connectionId);
-        for (const [k, v] of [...logDbCache.entries()]) {
-            if (k.startsWith(`${san}|`)) {
-                try { v.db.close(); } catch {}
-                logDbCache.delete(k);
-            }
-        }
+        closeLogDbsForSan(san);
         const dir = path.join(LOG_ROOT, san);
         if (fs.existsSync(dir)) {
-            const files = fs.readdirSync(dir).filter((f) => f.endsWith('.db'));
-            deleted = files.length;
+            deleted = countDayDbFiles(dir);
             fs.rmSync(dir, { recursive: true, force: true });
         }
     } else {
-        for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
-        logDbCache.clear();
+        closeAllLogDbs();
         if (fs.existsSync(LOG_ROOT)) {
             const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
-            for (const s of subs) {
-                const dir = path.join(LOG_ROOT, s.name);
-                const files = fs.readdirSync(dir).filter((f) => f.endsWith('.db'));
-                deleted += files.length;
-            }
+            for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
             fs.rmSync(LOG_ROOT, { recursive: true, force: true });
         }
         fs.mkdirSync(LOG_ROOT, { recursive: true });
     }
     return { deletedFiles: deleted };
+}
+
+export function clearLogsWithoutConnections(connectionIds: string[]): { deletedFiles: number; deletedDirs: number } {
+    flushStorage();
+    const valid = new Set(connectionIds.filter(Boolean).map((id) => sanitizeConnectionId(id)));
+    let deletedDirs = 0;
+    if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
+    const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+    for (const d of dirs) {
+        if (valid.has(d.name)) continue;
+        closeLogDbsForSan(d.name);
+        fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
+        deletedDirs++;
+    }
+    return { deletedFiles: 0, deletedDirs };
 }
 
 // ---------------- cleanup ----------------
@@ -604,10 +636,11 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
                 const dirs = fs.readdirSync(logRoot, { withFileTypes: true }).filter((d) => d.isDirectory());
                 for (const d of dirs) {
                     const sub = path.join(logRoot, d.name);
-                    const files = fs.readdirSync(sub).filter((f) => /^\\d{4}-\\d{2}-\\d{2}\\.db$/.test(f));
+                    const files = fs.readdirSync(sub).filter((f) => /^\\d{4}-\\d{2}-\\d{2}\\.db(?:-wal|-shm)?$/.test(f));
                     for (const f of files) {
-                        const dk = f.replace(/\\.db$/, '');
-                        const [y, m, dd] = dk.split('-').map(Number);
+                        const match = /^(\\d{4}-\\d{2}-\\d{2})\\.db(?:-wal|-shm)?$/.exec(f);
+                        if (!match) continue;
+                        const [y, m, dd] = match[1].split('-').map(Number);
                         const dayEnd = new Date(y, m - 1, dd, 23, 59, 59, 999).getTime();
                         if (dayEnd < cutoff) {
                             try { fs.unlinkSync(path.join(sub, f)); removed++; } catch {}
@@ -627,7 +660,5 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
 }
 
 export function shutdownStorage(): void {
-    flushStorage();
-    for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
-    logDbCache.clear();
+    closeAllLogDbs();
 }
