@@ -2,9 +2,9 @@ import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { initIpc } from './ipc';
 import { clearLogsWithoutConnections, initStorage, shutdownStorage } from './storage';
-import { initSettings, getCurrentLogDir, readConnections, readSettings } from './settings';
+import { initSettings, getCurrentLogDir, readConnections } from './settings';
 import { MqttService } from './mqtt-service';
-import { runAutoDeleteAsync } from './storage';
+import { startAutoDeleteScheduler, stopAutoDeleteScheduler } from './auto-delete-scheduler';
 import { pluginManager } from './plugin-manager';
 import './constants';
 
@@ -94,21 +94,17 @@ app.whenReady().then(async () => {
     mqttService = new MqttService(() => win);
     initIpc(mqttService);
     await createWindow();
-
-    const s = readSettings();
-    if (s.autoDeleteDays > 0) {
-        runAutoDeleteAsync(s.autoDeleteDays, (files) => {
-            if (win && !win.isDestroyed()) win.webContents.send('app:autoDeleteDone', files);
-        });
-    }
+    startAutoDeleteScheduler(() => win);
 });
 
 app.on('before-quit', () => {
+    stopAutoDeleteScheduler();
     mqttService?.flush();
     shutdownStorage();
 });
 
 app.on('window-all-closed', () => {
+    stopAutoDeleteScheduler();
     mqttService?.shutdown();
     shutdownStorage();
     pluginManager.shutdown();

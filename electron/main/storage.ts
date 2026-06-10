@@ -621,8 +621,11 @@ export function clearLogsWithoutConnections(connectionIds: string[]): { deletedF
 }
 
 // ---------------- cleanup ----------------
-export function runAutoDeleteAsync(days: number, onDone: (files: number) => void): void {
-    if (days <= 0) return;
+export function runAutoDeleteAsync(days: number, onDone: (files: number) => void, onFinish?: () => void): void {
+    if (days <= 0) {
+        onFinish?.();
+        return;
+    }
     const cutoff = Date.now() - days * 86_400_000;
     const { Worker } = require('node:worker_threads');
     const code = `
@@ -652,11 +655,22 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
         } catch (e) { parentPort.postMessage({ removed, error: e.message }); }
     `;
     const w = new Worker(code, { eval: true, workerData: { logRoot: LOG_ROOT, cutoff } });
+    let finished = false;
+    const finish = () => {
+        if (finished) return;
+        finished = true;
+        onFinish?.();
+    };
     w.once('message', (msg: { removed: number; error?: string }) => {
         if (msg.error) console.error('[storage] auto-delete worker:', msg.error);
         if (msg.removed > 0) onDone(msg.removed);
+        finish();
     });
-    w.once('error', (e: Error) => console.error('[storage] auto-delete worker err:', e));
+    w.once('error', (e: Error) => {
+        console.error('[storage] auto-delete worker err:', e);
+        finish();
+    });
+    w.once('exit', finish);
 }
 
 export function shutdownStorage(): void {

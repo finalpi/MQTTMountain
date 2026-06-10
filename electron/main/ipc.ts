@@ -24,12 +24,12 @@ import {
     clearLogs,
     clearLogsWithoutConnections,
     closeAllLogDbs,
-    readRecentByConnection,
-    runAutoDeleteAsync
+    readRecentByConnection
 } from './storage';
 import { APP_START_TIME } from './constants';
 import { pluginManager } from './plugin-manager';
 import { appendPublishHistory, readPublishHistory } from './publish-history';
+import { rescheduleAutoDelete } from './auto-delete-scheduler';
 import { checkForUpdates, openReleasesPage } from './update-service';
 import { exportHistoryToFile } from './history-export';
 import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
@@ -235,10 +235,7 @@ export function initIpc(mqttService: MqttService): void {
     ipcMain.handle('settings:set', (_e, s: AppSettings) => {
         try {
             const r = writeSettings(s);
-            runAutoDeleteAsync(s.autoDeleteDays, (files) => {
-                const w = win();
-                if (w && !w.isDestroyed()) w.webContents.send('app:autoDeleteDone', files);
-            });
+            rescheduleAutoDelete(true);
             return { success: true, data: r };
         } catch (e) {
             return { success: false, message: (e as Error).message };
