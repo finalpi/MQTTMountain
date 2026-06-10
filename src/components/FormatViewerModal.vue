@@ -272,6 +272,42 @@ function prevMatch(): void {
     focusCurrent();
 }
 
+function placeTimePop(e: Event): void {
+    const target = e.target instanceof Element ? e.target.closest<HTMLElement>('.json-time, .k-time') : null;
+    if (!target) return;
+    const pop = target.querySelector<HTMLElement>('.time-pop');
+    if (!pop) return;
+
+    const originalDisplay = pop.style.display;
+    const originalVisibility = pop.style.visibility;
+    pop.style.display = 'block';
+    pop.style.visibility = 'hidden';
+    const popHeight = pop.offsetHeight || 72;
+    const popWidth = pop.offsetWidth || 260;
+    pop.style.display = originalDisplay;
+    pop.style.visibility = originalVisibility;
+
+    const triggerRect = target.getBoundingClientRect();
+    const containerRect = bodyEl.value?.getBoundingClientRect();
+    const viewTop = Math.max(0, containerRect?.top ?? 0);
+    const viewBottom = Math.min(window.innerHeight, containerRect?.bottom ?? window.innerHeight);
+    const viewLeft = Math.max(0, containerRect?.left ?? 0);
+    const viewRight = Math.min(window.innerWidth, containerRect?.right ?? window.innerWidth);
+    const gap = 8;
+
+    const spaceBelow = viewBottom - triggerRect.bottom - gap;
+    const spaceAbove = triggerRect.top - viewTop - gap;
+    const placeAbove = spaceBelow < popHeight && spaceAbove > spaceBelow;
+    const centerX = triggerRect.left + triggerRect.width / 2;
+    const alignLeft = centerX - popWidth / 2 < viewLeft;
+    const alignRight = !alignLeft && centerX + popWidth / 2 > viewRight;
+
+    target.classList.toggle('time-pop-above', placeAbove);
+    target.classList.toggle('time-pop-below', !placeAbove);
+    target.classList.toggle('time-pop-align-left', alignLeft);
+    target.classList.toggle('time-pop-align-right', alignRight);
+}
+
 async function copyAll(): Promise<void> {
     try {
         await navigator.clipboard.writeText(formatted.value.text);
@@ -416,7 +452,13 @@ const title = computed(() => displayTopic.value || '消息内容');
                                 </span>
                                 <span v-else>发送成功，等待真实回执...</span>
                             </div>
-                            <div class="fv-body fv-preview" ref="bodyEl" :class="{ 'is-json': formatted.isJson && !previewReplyRaw }">
+                            <div
+                                class="fv-body fv-preview"
+                                ref="bodyEl"
+                                :class="{ 'is-json': formatted.isJson && !previewReplyRaw }"
+                                @mouseover="placeTimePop"
+                                @focusin="placeTimePop"
+                            >
                                 <div v-if="previewReplyRaw" class="reply-raw-shell">
                                     <div class="reply-raw-head">真实回执原文</div>
                                     <pre class="fv-raw reply-raw" v-html="escapeHtml(previewReplyRaw)"></pre>
@@ -452,6 +494,8 @@ const title = computed(() => displayTopic.value || '消息内容');
                         class="fv-body"
                         ref="bodyEl"
                         :class="{ 'is-json': formatted.isJson, 'has-reply-blocks': previewReplyBlocks.length > 0 }"
+                        @mouseover="placeTimePop"
+                        @focusin="placeTimePop"
                     >
                         <div v-if="previewReplyBlocks.length" class="reply-block-list">
                             <section v-for="(block, idx) in previewReplyBlocks" :key="idx" class="reply-block" :class="block.status || 'info'">
@@ -1102,7 +1146,6 @@ const title = computed(() => displayTopic.value || '消息内容');
 :deep(.json-time .time-pop) {
     position: absolute;
     left: 50%;
-    bottom: calc(100% + 8px);
     z-index: 3;
     display: none;
     min-width: 260px;
@@ -1120,18 +1163,56 @@ const title = computed(() => displayTopic.value || '消息内容');
     white-space: normal;
     word-break: normal;
 }
+:deep(.k-time.time-pop-below .time-pop),
+:deep(.json-time.time-pop-below .time-pop) {
+    top: calc(100% + 8px);
+}
+:deep(.k-time.time-pop-above .time-pop),
+:deep(.json-time.time-pop-above .time-pop) {
+    bottom: calc(100% + 8px);
+}
+:deep(.k-time.time-pop-align-left .time-pop),
+:deep(.json-time.time-pop-align-left .time-pop) {
+    left: 0;
+    transform: none;
+}
+:deep(.k-time.time-pop-align-right .time-pop),
+:deep(.json-time.time-pop-align-right .time-pop) {
+    right: 0;
+    left: auto;
+    transform: none;
+}
 :deep(.k-time .time-pop::after),
 :deep(.json-time .time-pop::after) {
     content: '';
     position: absolute;
     left: 50%;
-    top: 100%;
     width: 8px;
     height: 8px;
+    background: rgba(8, 13, 30, 0.98);
+}
+:deep(.k-time.time-pop-below .time-pop::after),
+:deep(.json-time.time-pop-below .time-pop::after) {
+    top: 0;
+    transform: translate(-50%, -5px) rotate(45deg);
+    border-left: 1px solid rgba(125, 211, 252, 0.35);
+    border-top: 1px solid rgba(125, 211, 252, 0.35);
+}
+:deep(.k-time.time-pop-above .time-pop::after),
+:deep(.json-time.time-pop-above .time-pop::after) {
+    top: 100%;
     transform: translate(-50%, -4px) rotate(45deg);
     border-right: 1px solid rgba(125, 211, 252, 0.35);
     border-bottom: 1px solid rgba(125, 211, 252, 0.35);
-    background: rgba(8, 13, 30, 0.98);
+}
+:deep(.k-time.time-pop-align-left .time-pop::after),
+:deep(.json-time.time-pop-align-left .time-pop::after) {
+    left: 18px;
+}
+:deep(.k-time.time-pop-align-right .time-pop::after),
+:deep(.json-time.time-pop-align-right .time-pop::after) {
+    right: 18px;
+    left: auto;
 }
 :deep(.k-time .time-pop span),
 :deep(.json-time .time-pop span) {
