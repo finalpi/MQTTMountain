@@ -1,8 +1,7 @@
 /**
  * MQTT 服务：
  *  - 单进程内支持多连接（按 connectionId 复用 / 互不影响）
- *  - 入站消息批量推送到渲染进程（33ms / 400 条 / 队列硬上限 4000 + 优先主题保留）
- *  - 入站重叠订阅去重（20ms 内相同 topic+payload 视为同一条）
+ *  - 入站消息批量推送到渲染进程（33ms / 批量阈值 / 队列硬上限 + 优先主题保留）
  */
 
 import mqtt, { MqttClient, IClientOptions, IPublishPacket } from 'mqtt';
@@ -15,7 +14,6 @@ interface ConnectionCtx {
     client: MqttClient;
     disabledTopics: Set<string>;
     priorityTopic: string | null;
-    dedupe: Map<string, number>;
     closing: boolean;
 }
 
@@ -24,14 +22,6 @@ interface QueuePriority {
     topic: string;
 }
 
-/**
- * 去重窗口：同一 (topic, payload) 在窗口内视为重复并丢弃。
- * - 2 秒足够覆盖 QoS1/2 的协议重传（一般 3-5 秒；结合 dup 标志兜底）
- * - 以及重叠订阅导致的多路投递（一般同帧/同百毫秒）
- * - 超过 2 秒的相同 payload 视为业务真实重复，放行
- */
-const INBOUND_DEDUP_WINDOW_MS = 2000;
-const DEDUPE_MAX_ENTRIES = 1024;
 const IPC_FLUSH_MS = 33;
 const IPC_BATCH_HARD = 800;
 const IPC_QUEUE_HARD = 16000;
@@ -81,7 +71,6 @@ export class MqttService {
                     client,
                     disabledTopics: new Set(p.disabledTopics || []),
                     priorityTopic: null,
-                    dedupe: new Map(),
                     closing: false
                 };
                 this.conns.set(p.connectionId, ctx);
@@ -97,7 +86,6 @@ export class MqttService {
 
                 let initialConnect = true;
                 client.on('connect', () => {
-                    ctx.dedupe.clear();
                     this.sendState(p.connectionId, 'connected');
                     if (initialConnect) {
                         initialConnect = false;
@@ -136,34 +124,15 @@ export class MqttService {
                 });
 
             let msgCount = 0;
-            let dupCount = 0;
-            client.on('message', (topic, payload, packet?: IPublishPacket) => {
-                // 1) QoS1/2 协议级重传：broker 没收到 PUBACK 就会再发一次，dup=true
-                //    mqtt.js 已自动回 ACK，我们在应用层直接丢弃
-                if (packet && packet.dup) { dupCount++; return; }
-
+            client.on('message', (topic, payload, _packet?: IPublishPacket) => {
                 if (ctx.disabledTopics.has(topic)) return;
                 const text = payload.toString('utf8');
                 const now = Date.now();
 
-                // 2) 业务层去重：LRU Map，窗口 2s 内相同 (topic, payload) 丢弃
-                const key = `${topic}\n${text}`;
-                const last = ctx.dedupe.get(key);
-                if (last !== undefined && now - last < INBOUND_DEDUP_WINDOW_MS) {
-                    dupCount++;
-                    return;
-                }
-                ctx.dedupe.set(key, now);
-                if (ctx.dedupe.size > DEDUPE_MAX_ENTRIES) {
-                    // 淘汰最旧的
-                    const firstKey = ctx.dedupe.keys().next().value;
-                    if (firstKey !== undefined) ctx.dedupe.delete(firstKey);
-                }
-
                 enqueueMessage(p.connectionId, topic, text, now);
                 this.enqueueIpc({ connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq }, ctx);
                 if (++msgCount <= 3 || msgCount % 500 === 0) {
-                    console.log(`[mqtt][${p.connectionId}] msg #${msgCount} (dup filtered: ${dupCount}) ${topic} (${text.length}B)`);
+                    console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);
                 }
             });
             } catch (e) {
