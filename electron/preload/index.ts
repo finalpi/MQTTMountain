@@ -33,6 +33,8 @@ const api = {
     mqttDisableTopic: (p: { connectionId: string; topic: string }) => invoke('mqtt:disableTopic', p),
     mqttEnableTopic: (p: { connectionId: string; topic: string }) => invoke('mqtt:enableTopic', p),
     mqttSetPriorityTopic: (p: { connectionId: string; topic: string | null }) => invoke('mqtt:setPriorityTopic', p),
+    mqttSetActiveConnection: (p: { connectionId: string | null }) => invoke('mqtt:setActiveConnection', p),
+    mqttSetDisplayPaused: (p: { connectionId: string; paused: boolean }) => invoke('mqtt:setDisplayPaused', p),
     mqttReadRecent: (p: { connectionId: string; limit?: number }) =>
         invoke<HistoryMessage[]>('mqtt:readRecent', p),
     mqttClearLogs: (connectionId?: string | null) =>

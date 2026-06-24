@@ -145,6 +145,14 @@ export function initIpc(mqttService: MqttService): void {
         mqttService.setPriorityTopic(p.connectionId, p.topic);
         return { success: true };
     });
+    ipcMain.handle('mqtt:setActiveConnection', (_e, p: { connectionId: string | null }) => {
+        mqttService.setActiveConnection(p.connectionId);
+        return { success: true };
+    });
+    ipcMain.handle('mqtt:setDisplayPaused', (_e, p: { connectionId: string; paused: boolean }) => {
+        mqttService.setDisplayPaused(p.connectionId, p.paused);
+        return { success: true };
+    });
     ipcMain.handle('mqtt:readRecent', (_e, p: { connectionId: string; limit?: number }) => {
         try {
             return { success: true, data: readRecentByConnection(p.connectionId, p.limit ?? 5000) };

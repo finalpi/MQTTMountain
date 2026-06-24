@@ -3,6 +3,7 @@ import { useConnectionStore, type ConnState } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
 import { useParamMemory } from './useParamMemory';
 import type { MqttMessage } from '@shared/types';
+import type { DecodedResult } from '@shared/plugin';
 
 export function useMqttBridge() {
     const conn = useConnectionStore();
@@ -11,10 +12,57 @@ export function useMqttBridge() {
     let unsubMsg: (() => void) | null = null;
     let unsubState: (() => void) | null = null;
     let stopWatch: (() => void) | null = null;
+    let stopActiveWatch: (() => void) | null = null;
 
     const pending: MqttMessage[] = [];
     let rafId: number | null = null;
     let flushing = false;
+    let activeHydrateToken = 0;
+
+    async function hydrateActiveConnection(connectionId: string): Promise<void> {
+        const token = ++activeHydrateToken;
+        const recent = await window.api.mqttReadRecent({ connectionId, limit: 300 });
+        if (token !== activeHydrateToken || conn.selectedId !== connectionId) return;
+        if (!recent.success || !recent.data?.length) return;
+        msg.clearAll(connectionId);
+        await msg.hydrate(connectionId, recent.data);
+    }
+
+    function rememberDecodedParams(decodedBatch: (DecodedResult | null)[]): void {
+        for (let i = 0; i < decodedBatch.length; i++) {
+            const decoded = decodedBatch[i];
+            if (!decoded?.rememberParams) continue;
+            for (const [key, value] of Object.entries(decoded.rememberParams)) {
+                if (Array.isArray(value)) {
+                    for (let i = value.length - 1; i >= 0; i -= 1) {
+                        paramMem.remember(key, value[i]);
+                    }
+                } else if (value != null) {
+                    paramMem.remember(key, String(value));
+                }
+            }
+        }
+    }
+
+    async function decodeVisibleTopicBatch(connId: string, list: MqttMessage[]): Promise<(DecodedResult | null)[] | undefined> {
+        const selectedTopic = msg.buckets.get(connId)?.selectedTopic;
+        if (!selectedTopic) return undefined;
+        const visibleItems: { index: number; topic: string; payload: string }[] = [];
+        for (let i = 0; i < list.length; i++) {
+            const item = list[i];
+            if (item.topic === selectedTopic) visibleItems.push({ index: i, topic: item.topic, payload: item.payload });
+        }
+        if (visibleItems.length === 0) return undefined;
+        const result = await window.api.pluginDecodeBatch(
+            visibleItems.map((item) => ({ topic: item.topic, payload: item.payload }))
+        );
+        if (!result.success || !result.data) return undefined;
+        const decodedBatch = new Array<DecodedResult | null>(list.length).fill(null);
+        for (let i = 0; i < visibleItems.length; i++) {
+            decodedBatch[visibleItems[i].index] = result.data[i] ?? null;
+        }
+        return decodedBatch;
+    }
 
     async function flush(): Promise<void> {
         if (flushing || pending.length === 0) return;
@@ -34,32 +82,15 @@ export function useMqttBridge() {
             }
 
             for (const [connId, list] of byConn) {
-                let decodedBatch: Awaited<ReturnType<typeof window.api.pluginDecodeBatch>>['data'] | undefined;
+                if (connId !== conn.selectedId) continue;
+                let decodedBatch: (DecodedResult | null)[] | undefined;
                 try {
-                    const result = await window.api.pluginDecodeBatch(
-                        list.map((item) => ({ topic: item.topic, payload: item.payload }))
-                    );
-                    if (result.success && result.data) decodedBatch = result.data;
+                    decodedBatch = await decodeVisibleTopicBatch(connId, list);
                 } catch (error) {
                     if (import.meta.env.DEV) console.warn('[plugin decode batch]', error);
                 }
 
-                if (decodedBatch) {
-                    for (let i = 0; i < decodedBatch.length; i++) {
-                        const decoded = decodedBatch[i];
-                        if (!decoded?.rememberParams) continue;
-                        for (const [key, value] of Object.entries(decoded.rememberParams)) {
-                            if (Array.isArray(value)) {
-                                for (let i = value.length - 1; i >= 0; i -= 1) {
-                                    paramMem.remember(key, value[i]);
-                                }
-                            } else if (value != null) {
-                                paramMem.remember(key, String(value));
-                            }
-                        }
-                    }
-                }
-
+                if (decodedBatch) rememberDecodedParams(decodedBatch);
                 msg.ingest(connId, list, decodedBatch);
             }
         } finally {
@@ -105,6 +136,22 @@ export function useMqttBridge() {
                 window.api.mqttSetPriorityTopic({ connectionId: cid, topic });
             }
         );
+
+        stopActiveWatch = watch(
+            () => {
+                const cid = conn.selectedId;
+                const bucket = cid ? msg.buckets.get(cid) : null;
+                return [cid, bucket?.paused ?? false] as const;
+            },
+            ([cid, paused]) => {
+                activeHydrateToken++;
+                pending.length = 0;
+                window.api.mqttSetActiveConnection({ connectionId: cid });
+                if (cid) window.api.mqttSetDisplayPaused({ connectionId: cid, paused });
+                if (cid && !paused) void hydrateActiveConnection(cid);
+            },
+            { immediate: true }
+        );
     }
 
     function stop(): void {
@@ -114,6 +161,10 @@ export function useMqttBridge() {
         unsubState = null;
         stopWatch?.();
         stopWatch = null;
+        stopActiveWatch?.();
+        stopActiveWatch = null;
+        window.api.mqttSetActiveConnection({ connectionId: null });
+        activeHydrateToken++;
         if (rafId != null) cancelAnimationFrame(rafId);
         rafId = null;
         pending.length = 0;

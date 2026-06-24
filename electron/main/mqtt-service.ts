@@ -19,7 +19,7 @@ interface ConnectionCtx {
 
 interface QueuePriority {
     connectionId: string;
-    topic: string;
+    topic: string | null;
 }
 
 const IPC_FLUSH_MS = 33;
@@ -31,6 +31,8 @@ export class MqttService {
     private ipcQueue: MqttMessage[] = [];
     private ipcTimer: NodeJS.Timeout | null = null;
     private seq = 0;
+    private activeConnectionId: string | null = null;
+    private displayPausedConnections = new Set<string>();
     private getWin: () => BrowserWindow | null;
 
     constructor(getWin: () => BrowserWindow | null) {
@@ -130,7 +132,9 @@ export class MqttService {
                 const now = Date.now();
 
                 enqueueMessage(p.connectionId, topic, text, now);
-                this.enqueueIpc({ connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq }, ctx);
+                if (this.shouldSendToRenderer(p.connectionId)) {
+                    this.enqueueIpc({ connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq }, ctx);
+                }
                 if (++msgCount <= 3 || msgCount % 500 === 0) {
                     console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);
                 }
@@ -149,6 +153,7 @@ export class MqttService {
             try { ctx.client.end(true); } catch {}
             this.conns.delete(connectionId);
         }
+        this.displayPausedConnections.delete(connectionId);
         return { success: true };
     }
 
@@ -203,6 +208,30 @@ export class MqttService {
         if (c) c.priorityTopic = topic;
     }
 
+    setActiveConnection(connectionId: string | null): void {
+        this.activeConnectionId = connectionId || null;
+        this.trimInactiveQueuedMessages();
+    }
+
+    setDisplayPaused(connectionId: string, paused: boolean): void {
+        if (!connectionId) return;
+        if (paused) this.displayPausedConnections.add(connectionId);
+        else this.displayPausedConnections.delete(connectionId);
+        this.trimInactiveQueuedMessages();
+    }
+
+    private shouldSendToRenderer(connectionId: string): boolean {
+        return !!this.activeConnectionId
+            && connectionId === this.activeConnectionId
+            && !this.displayPausedConnections.has(connectionId);
+    }
+
+    private trimInactiveQueuedMessages(): void {
+        this.ipcQueue = this.activeConnectionId
+            ? this.ipcQueue.filter((item) => this.shouldSendToRenderer(item.connectionId))
+            : [];
+    }
+
     // ---------- IPC batching ----------
     private enqueueIpc(msg: MqttMessage, ctx: ConnectionCtx): void {
         this.ipcQueue.push(msg);
@@ -221,7 +250,9 @@ export class MqttService {
         if (priority) {
             for (let i = 0; i < this.ipcQueue.length && removed < excess; i++) {
                 const item = this.ipcQueue[i];
-                if (item.connectionId !== priority.connectionId || item.topic !== priority.topic) {
+                const matchesPriority = item.connectionId === priority.connectionId
+                    && (priority.topic == null || item.topic === priority.topic);
+                if (!matchesPriority) {
                     mark[i] = 1;
                     removed++;
                 }
