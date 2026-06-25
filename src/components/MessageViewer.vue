@@ -53,12 +53,21 @@ watch(filterConditions, (v) => {
     if (filterTimer != null) clearTimeout(filterTimer);
     filterTimer = window.setTimeout(() => {
         activeFilterConditions.value = v.map((item) => ({ term: item.term, join: item.join }));
+        filterMatchCache.clear();
+        highlightCache.clear();
     }, 120);
 }, { deep: true });
 onUnmounted(() => { if (filterTimer != null) clearTimeout(filterTimer); });
 
 const highlightTerms = computed(() => activeFilterConditions.value.map((item) => item.term));
+const normalizedFilterConditions = computed(() => activeFilterConditions.value
+    .map((item) => ({ join: item.join, term: normalize(item.term.trim()) }))
+    .filter((item) => item.term));
+const hasActiveFilter = computed(() => normalizedFilterConditions.value.length > 0);
 const activeFilterKey = computed(() => JSON.stringify(activeHistoryConditions()));
+const filterMatchCache = new Map<string, { key: string; value: boolean }>();
+const highlightCache = new Map<string, { key: string; value: string }>();
+const HIGHLIGHT_CACHE_LIMIT = 1000;
 
 function activeHistoryConditions(): HistoryKeywordCondition[] {
     return activeFilterConditions.value
@@ -80,10 +89,11 @@ function removeFilterCondition(index: number): void {
 }
 
 function matchesFilterConditions(src: string): boolean {
-    const active = activeFilterConditions.value
-        .map((item) => ({ join: item.join, term: normalize(item.term.trim()) }))
-        .filter((item) => item.term);
+    const active = normalizedFilterConditions.value;
     if (active.length === 0) return true;
+    const key = activeFilterKey.value;
+    const cached = filterMatchCache.get(src);
+    if (cached?.key === key) return cached.value;
     const hay = normalize(src);
     let result = hay.includes(active[0].term);
     for (let i = 1; i < active.length; i++) {
@@ -93,20 +103,34 @@ function matchesFilterConditions(src: string): boolean {
         else if (item.join === 'not') result = result && !hit;
         else result = result && hit;
     }
+    filterMatchCache.set(src, { key, value: result });
     return result;
 }
+
+function highlightCached(src: string): string {
+    const key = activeFilterKey.value;
+    const cached = highlightCache.get(src);
+    if (cached?.key === key) return cached.value;
+    const value = highlight(src, highlightTerms.value);
+    if (highlightCache.size > HIGHLIGHT_CACHE_LIMIT) highlightCache.clear();
+    highlightCache.set(src, { key, value });
+    return value;
+}
+
+watch(activeFilterKey, () => {
+    filterMatchCache.clear();
+    highlightCache.clear();
+});
 
 /** 时间线：按新到旧 */
 const timelineList = computed<MsgRow[]>(() => {
     const b = bucket.value;
     void b.timelineVersion;
-    const arr = b.timeline.snapshot();
-    if (!activeFilterConditions.value.some((item) => item.term.trim())) return arr.slice().reverse();
+    if (!hasActiveFilter.value) return b.timeline.reverseSnapshot();
     const out: MsgRow[] = [];
-    for (let i = arr.length - 1; i >= 0; i--) {
-        const r = arr[i];
+    b.timeline.forEachReverse((r) => {
         if (matchesFilterConditions(r.topic + r.payload)) out.push(r);
-    }
+    });
     return out;
 });
 
@@ -118,7 +142,7 @@ const liveTopicList = computed<TopicView[]>(() => {
     void b.topicsVersion;
     const all: TopicView[] = [];
     for (const v of b.topics.values()) {
-        if (activeFilterConditions.value.some((item) => item.term.trim())) {
+        if (hasActiveFilter.value) {
             let hit = matchesFilterConditions(v.topic);
             if (!hit) {
                 v.buf.forEachReverse((m) => {
@@ -201,13 +225,11 @@ function realtimeSelectedTopicRows(): MsgRow[] {
     void b.topicsVersion;
     const v = selectedTopicView.value;
     if (!v) return [];
-    const arr = v.buf.snapshot();
-    if (!activeFilterConditions.value.some((item) => item.term.trim())) return arr.slice().reverse();
+    if (!hasActiveFilter.value) return v.buf.reverseSnapshot();
     const out: MsgRow[] = [];
-    for (let i = arr.length - 1; i >= 0; i--) {
-        const r = arr[i];
+    v.buf.forEachReverse((r) => {
         if (matchesFilterConditions(r.topic + r.payload)) out.push(r);
-    }
+    });
     return out;
 }
 
@@ -599,10 +621,10 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                     >
                         <div class="msg-head">
                             <span class="time">{{ formatTime(m.time) }}</span>
-                            <span class="topic" v-html="highlight(m.topic, highlightTerms)"></span>
+                            <span class="topic" v-html="highlightCached(m.topic)"></span>
                             <span class="msg-hint">右键格式化</span>
                         </div>
-                        <pre class="msg-body" v-html="highlight(m.payload, highlightTerms)"></pre>
+                        <pre class="msg-body" v-html="highlightCached(m.payload)"></pre>
                     </div>
                 </template>
             </DynamicVirtualList>
@@ -636,7 +658,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                 @contextmenu.prevent="openContext($event, t.topic)"
                             >
                                 <div class="t-row">
-                                    <div class="t-name" v-html="highlight(t.topic, highlightTerms)"></div>
+                                    <div class="t-name" v-html="highlightCached(t.topic)"></div>
                                     <span v-if="t.pinned" class="pin-badge" title="已置顶">置顶</span>
                                 </div>
                                 <div class="t-meta">
@@ -675,7 +697,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                     <span class="time">{{ formatTime(m.time) }}</span>
                                     <span class="msg-hint">右键格式化</span>
                                 </div>
-                                <pre class="msg-body" v-html="highlight(m.payload, highlightTerms)"></pre>
+                                <pre class="msg-body" v-html="highlightCached(m.payload)"></pre>
                             </div>
                         </template>
                         <template #after>

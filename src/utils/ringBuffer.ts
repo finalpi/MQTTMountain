@@ -71,6 +71,12 @@ export class RingBuffer<T> {
         return out;
     }
 
+    reverseSnapshot(): T[] {
+        const out = new Array<T>(this.size);
+        for (let i = this.size - 1, k = 0; i >= 0; i--, k++) out[k] = this.buf[(this.head + i) % this.cap] as T;
+        return out;
+    }
+
     /** 从新到旧遍历，回调返回 false 终止 */
     forEachReverse(cb: (v: T, idx: number) => void | boolean): void {
         for (let i = this.size - 1; i >= 0; i--) {
