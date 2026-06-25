@@ -4,6 +4,8 @@ import { useMessageStore, type TopicView, type MsgRow } from '@/stores/messages'
 import { useConnectionStore } from '@/stores/connection';
 import { useToast } from '@/composables/useToast';
 import { useFormatViewer } from '@/composables/useFormatViewer';
+import { useUiPrefs } from '@/composables/useUiPrefs';
+import DynamicVirtualList from '@/components/DynamicVirtualList.vue';
 import { highlight, normalize, type SearchLogic } from '@/utils/filter';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
@@ -13,6 +15,7 @@ const msg = useMessageStore();
 const conn = useConnectionStore();
 const toast = useToast();
 const formatViewer = useFormatViewer();
+const { prefs } = useUiPrefs();
 
 /** 当前 selected 的连接对应的 bucket（每个连接独立） */
 const bucket = computed(() => msg.bucketFor(conn.selectedId));
@@ -168,6 +171,10 @@ function messageDedupeKey(row: Pick<MsgRow, 'topic' | 'time' | 'payload'>): stri
 
 function messageRenderKey(row: MsgRow): string {
     return `${row.seq}:${row.topic}:${row.time}:${row.payload.length}`;
+}
+
+function timelineMessageKey(row: MsgRow): number {
+    return row.seq;
 }
 
 function realtimeSelectedTopicRows(): MsgRow[] {
@@ -350,13 +357,55 @@ function togglePinTop(topic: string): void {
 }
 
 // 滚动容器引用与「跟随新消息」
-const timelineScrollEl = ref<HTMLElement | null>(null);
-const topicScrollEl = ref<HTMLElement | null>(null);
+interface DynamicListHandle {
+    getScrollElement: () => HTMLElement | null;
+    scrollToTop: (smooth?: boolean) => void;
+    resetMeasurements: (scrollTopAfterReset?: boolean) => void;
+}
+
+const timelineVirtualRef = ref<DynamicListHandle | null>(null);
+const topicVirtualRef = ref<DynamicListHandle | null>(null);
 const autoFollow = ref(true);
 const showJumpBtn = ref(false);
 
+const timelineResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value }));
+const topicListResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value, sort: topicSort.value }));
+const topicResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, topic: bucket.value.selectedTopic, filter: activeFilterKey.value }));
+const messageLayoutKey = computed(() => `${prefs.fontSize}:${viewMode.value}`);
+
+function currentVirtual(): DynamicListHandle | null {
+    return viewMode.value === 'timeline' ? timelineVirtualRef.value : topicVirtualRef.value;
+}
+
 function currentScroll(): HTMLElement | null {
-    return viewMode.value === 'timeline' ? timelineScrollEl.value : topicScrollEl.value;
+    return currentVirtual()?.getScrollElement() ?? null;
+}
+
+function estimateMessageSize(row: MsgRow, includeTopic: boolean): number {
+    const font = prefs.fontSize;
+    const payloadCharsPerLine = 110;
+    const topicCharsPerLine = 80;
+    const payloadLines = Math.max(1, row.payload.split('\n').reduce((sum, part) => sum + Math.max(1, Math.ceil(part.length / payloadCharsPerLine)), 0));
+    const topicLines = includeTopic ? Math.max(1, Math.ceil(row.topic.length / topicCharsPerLine)) : 0;
+    return 28 + topicLines * Math.max(14, font * 1.4) + payloadLines * Math.max(16, font * 1.5);
+}
+
+function estimateTimelineMessageSize(row: MsgRow): number {
+    return estimateMessageSize(row, true);
+}
+
+function estimateTopicMessageSize(row: MsgRow): number {
+    return estimateMessageSize(row, false);
+}
+
+function topicViewKey(row: TopicView): string {
+    return row.topic;
+}
+
+function estimateTopicListItemSize(row: TopicView): number {
+    const topicCharsPerLine = 32;
+    const topicLines = Math.max(1, Math.ceil(row.topic.length / topicCharsPerLine));
+    return 34 + topicLines * Math.max(15, prefs.fontSize * 1.45);
 }
 
 function onUserScroll(): void {
@@ -376,9 +425,7 @@ function onUserScroll(): void {
 }
 
 function scrollToTop(smooth = true): void {
-    const el = currentScroll();
-    if (!el) return;
-    el.scrollTo({ top: 0, behavior: smooth ? 'smooth' : 'auto' });
+    currentVirtual()?.scrollToTop(smooth);
     autoFollow.value = true;
     showJumpBtn.value = false;
 }
@@ -388,7 +435,7 @@ watch(
     async () => {
         resetSelectedTopicHistory();
         await nextTick();
-        if (topicScrollEl.value) topicScrollEl.value.scrollTop = 0;
+        topicVirtualRef.value?.resetMeasurements(true);
     }
 );
 
@@ -398,8 +445,7 @@ watch(
     async () => {
         if (!autoFollow.value) return;
         await nextTick();
-        const el = currentScroll();
-        if (el) el.scrollTop = 0;
+        currentVirtual()?.scrollToTop(false);
     }
 );
 
@@ -466,13 +512,22 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 >📌 {{ autoFollow ? '跟随中' : '已暂停' }}</button>
             </div>
 
-            <div v-if="viewMode === 'timeline'" class="scroll-area bordered" ref="timelineScrollEl" @scroll.passive="onUserScroll">
-                <div v-if="timelineList.length === 0" class="empty">暂无消息</div>
-                <div v-else class="msg-list">
+            <DynamicVirtualList
+                v-if="viewMode === 'timeline'"
+                ref="timelineVirtualRef"
+                class="scroll-area bordered"
+                :items="timelineList"
+                :item-key="timelineMessageKey"
+                :estimate-size="estimateTimelineMessageSize"
+                :stick-to-start="autoFollow"
+                :reset-key="timelineResetKey"
+                :layout-key="messageLayoutKey"
+                empty="暂无消息"
+                @scroll="onUserScroll"
+            >
+                <template #default="{ item: m }">
                     <div
-                        v-for="m in timelineList"
-                        :key="m.seq"
-                        class="msg-card cv-auto"
+                        class="msg-card"
                         @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                     >
                         <div class="msg-head">
@@ -482,8 +537,8 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                         </div>
                         <pre class="msg-body" v-html="highlight(m.payload, highlightTerms)"></pre>
                     </div>
-                </div>
-            </div>
+                </template>
+            </DynamicVirtualList>
 
             <div v-else class="split">
                 <div class="topic-list">
@@ -497,12 +552,17 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                             <option value="count">消息量</option>
                         </select>
                     </div>
-                    <div class="scroll-area">
-                        <div v-if="topicList.length === 0" class="empty">暂无消息</div>
-                        <div v-else class="t-list">
+                    <DynamicVirtualList
+                        class="scroll-area topic-virtual-list"
+                        :items="topicList"
+                        :item-key="topicViewKey"
+                        :estimate-size="estimateTopicListItemSize"
+                        :reset-key="topicListResetKey"
+                        :layout-key="messageLayoutKey"
+                        empty="暂无消息"
+                    >
+                        <template #default="{ item: t }">
                             <div
-                                v-for="t in topicList"
-                                :key="t.topic"
                                 class="t-item"
                                 :class="{ active: bucket.selectedTopic === t.topic, disabled: t.disabled, pinned: t.pinned }"
                                 @click="selectTopic(t.topic)"
@@ -517,8 +577,8 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                     <span class="ago">{{ shortTime(t.lastTime) }}</span>
                                 </div>
                             </div>
-                        </div>
-                    </div>
+                        </template>
+                    </DynamicVirtualList>
                 </div>
                 <div class="topic-detail">
                     <div class="t-head">
@@ -526,13 +586,22 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                         <span v-else class="empty">请从左侧选择主题</span>
                         <span v-if="selectedTopicView" class="history-status">{{ selectedTopicMessages.length }} 条 · {{ selectedTopicHistoryStatus }}</span>
                     </div>
-                    <div v-if="selectedTopicView" class="scroll-area" ref="topicScrollEl" @scroll.passive="onUserScroll">
-                        <div v-if="selectedTopicMessages.length === 0" class="empty">该主题暂无消息</div>
-                        <div v-else class="msg-list">
+                    <DynamicVirtualList
+                        v-if="selectedTopicView"
+                        ref="topicVirtualRef"
+                        class="scroll-area"
+                        :items="selectedTopicMessages"
+                        :item-key="messageRenderKey"
+                        :estimate-size="estimateTopicMessageSize"
+                        :stick-to-start="autoFollow"
+                        :reset-key="topicResetKey"
+                        :layout-key="messageLayoutKey"
+                        empty="该主题暂无消息"
+                        @scroll="onUserScroll"
+                    >
+                        <template #default="{ item: m }">
                             <div
-                                v-for="m in selectedTopicMessages"
-                                :key="messageRenderKey(m)"
-                                class="msg-card cv-auto"
+                                class="msg-card"
                                 @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                             >
                                 <div class="msg-head">
@@ -541,13 +610,15 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                                 </div>
                                 <pre class="msg-body" v-html="highlight(m.payload, highlightTerms)"></pre>
                             </div>
-                        </div>
-                        <div v-if="showSelectedTopicHistoryAction" class="history-footer">
-                            <button class="history-load-btn" :disabled="selectedTopicHistoryLoading" @click="loadMoreSelectedTopicHistory">
-                                {{ selectedTopicHistoryActionText }}
-                            </button>
-                        </div>
-                    </div>
+                        </template>
+                        <template #after>
+                            <div v-if="showSelectedTopicHistoryAction" class="history-footer">
+                                <button class="history-load-btn" :disabled="selectedTopicHistoryLoading" @click="loadMoreSelectedTopicHistory">
+                                    {{ selectedTopicHistoryActionText }}
+                                </button>
+                            </div>
+                        </template>
+                    </DynamicVirtualList>
                 </div>
             </div>
 
@@ -906,11 +977,8 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
         border-color: var(--accent);
     }
 }
-.t-list {
-    padding: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
+.topic-virtual-list {
+    background: transparent;
 }
 
 .t-item {
@@ -991,12 +1059,6 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     }
 }
 
-.msg-list {
-    padding: 6px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
 
 .history-footer {
     padding: 8px 6px 12px;
@@ -1026,11 +1088,6 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     }
 }
 
-/* 让浏览器自动跳过离屏卡片的布局/渲染，近似虚拟化 */
-.cv-auto {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 80px;
-}
 
 .msg-card {
     padding: 8px 10px;

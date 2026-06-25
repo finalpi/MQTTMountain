@@ -122,10 +122,11 @@ export const useMessageStore = defineStore('messages', () => {
         return v;
     }
 
-    function ingest(connectionId: string, batch: MqttMessage[], decodedBatch?: (DecodedResult | null)[]): void {
-        if (!connectionId || batch.length === 0) return;
+    function ingest(connectionId: string, batch: MqttMessage[], decodedBatch?: (DecodedResult | null)[]): MsgRow[] {
+        if (!connectionId || batch.length === 0) return [];
         const b = bucketFor(connectionId);
-        if (b.paused) return; // 该连接单独暂停显示
+        if (b.paused) return []; // 该连接单独暂停显示
+        const rows: MsgRow[] = [];
         for (let i = 0; i < batch.length; i++) {
             const m = batch[i];
             const row: MsgRow = {
@@ -135,6 +136,7 @@ export const useMessageStore = defineStore('messages', () => {
                 seq: nextSeq(),
                 decoded: decodedBatch?.[i] ?? null
             };
+            rows.push(row);
             b.timeline.push(row);
             const existing = b.topics.get(m.topic);
             if (existing) {
@@ -159,6 +161,23 @@ export const useMessageStore = defineStore('messages', () => {
             }
         }
         b.receiveCount += batch.length;
+        b.timelineVersion++;
+        b.topicsVersion++;
+        return rows;
+    }
+
+    function applyDecodedRows(connectionId: string, rows: MsgRow[], decodedBatch: (DecodedResult | null)[]): void {
+        if (!connectionId || rows.length === 0 || decodedBatch.length === 0) return;
+        const b = buckets.get(connectionId);
+        if (!b) return;
+        let changed = false;
+        for (let i = 0; i < rows.length; i++) {
+            const decoded = decodedBatch[i] ?? null;
+            if (!decoded) continue;
+            rows[i].decoded = decoded;
+            changed = true;
+        }
+        if (!changed) return;
         b.timelineVersion++;
         b.topicsVersion++;
     }
@@ -318,6 +337,7 @@ export const useMessageStore = defineStore('messages', () => {
         hasBucket,
         setLimits,
         ingest,
+        applyDecodedRows,
         hydrate,
         clearAll,
         clearTopic,
