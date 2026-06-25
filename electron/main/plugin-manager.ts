@@ -85,6 +85,24 @@ function dedupeById<T extends { id: string }>(items: T[] | undefined): T[] {
     return [...map.values()];
 }
 
+function topicMatchesPattern(topic: string, pattern: string): boolean {
+    const topicParts = topic.split('/');
+    const patternParts = pattern.split('/');
+    for (let i = 0; i < patternParts.length; i++) {
+        const part = patternParts[i];
+        if (part === '#') return i === patternParts.length - 1;
+        if (i >= topicParts.length) return false;
+        if (part !== '+' && part !== topicParts[i]) return false;
+    }
+    return topicParts.length === patternParts.length;
+}
+
+function pluginAcceptsTopic(manifest: PluginManifest, topic: string): boolean {
+    const patterns = manifest.topicPatterns;
+    if (!patterns?.length) return true;
+    return patterns.some((pattern) => topicMatchesPattern(topic, pattern));
+}
+
 class PluginManager {
     private plugins = new Map<string, LoadedPlugin>();
     private ready = false;
@@ -270,6 +288,7 @@ class PluginManager {
     async decode(topic: string, payload: string): Promise<DecodedResult | null> {
         for (const p of this.plugins.values()) {
             if (!p.enabled || !p.loaded || !p.runtime?.decode) continue;
+            if (!pluginAcceptsTopic(p.manifest, topic)) continue;
             try {
                 const r = await p.runtime.decode(topic, payload);
                 if (r) return r;

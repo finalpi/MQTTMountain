@@ -19,7 +19,7 @@ export interface PluginManifest {
     main?: string;
     /** 宿主版本约束，如 { mqttmountain: ">=1.0.0" } */
     engines?: { mqttmountain?: string };
-    /** 声明本插件关心的主题通配（仅用于 UI 提示、不做强制） */
+    /** 声明本插件关心的主题通配；宿主会据此跳过无关消息解析 */
     topicPatterns?: string[];
     /** 声明式 sender 列表（无需 runtime.js 也能使用） */
     senders?: SenderDefinition[];

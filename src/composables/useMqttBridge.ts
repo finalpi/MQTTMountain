@@ -1,6 +1,7 @@
 import { watch } from 'vue';
 import { useConnectionStore, type ConnState } from '@/stores/connection';
 import { useMessageStore, type MsgRow } from '@/stores/messages';
+import { usePluginStore } from '@/stores/plugins';
 import { useParamMemory } from './useParamMemory';
 import type { MqttMessage } from '@shared/types';
 import type { DecodedResult } from '@shared/plugin';
@@ -8,6 +9,7 @@ import type { DecodedResult } from '@shared/plugin';
 export function useMqttBridge() {
     const conn = useConnectionStore();
     const msg = useMessageStore();
+    const plugins = usePluginStore();
     const paramMem = useParamMemory();
     let unsubMsg: (() => void) | null = null;
     let unsubState: (() => void) | null = null;
@@ -23,9 +25,13 @@ export function useMqttBridge() {
     let decodeTimer: number | null = null;
     let decodeGeneration = 0;
     let activeHydrateToken = 0;
+    let renderCostEma = 0;
     const RENDER_BATCH_LIMIT = 1000;
     const RENDER_INPUT_BATCH_LIMIT = 300;
+    const RENDER_BACKLOG_BATCH_LIMIT = 1600;
     const RENDER_INPUT_DELAY_MS = 50;
+    const RENDER_SLOW_DELAY_MS = 50;
+    const RENDER_BACKLOG_DELAY_MS = 80;
     const RENDER_PENDING_LIMIT = 12000;
     const DECODE_BATCH_LIMIT = 300;
     const DECODE_INPUT_BATCH_LIMIT = 50;
@@ -41,6 +47,41 @@ export function useMqttBridge() {
 
     function yieldToInput(): Promise<void> {
         return new Promise((resolve) => window.setTimeout(resolve, isTextInputActive() ? 16 : 0));
+    }
+
+    function topicMatchesPattern(topic: string, pattern: string): boolean {
+        const topicParts = topic.split('/');
+        const patternParts = pattern.split('/');
+        for (let i = 0; i < patternParts.length; i++) {
+            const part = patternParts[i];
+            if (part === '#') return i === patternParts.length - 1;
+            if (i >= topicParts.length) return false;
+            if (part !== '+' && part !== topicParts[i]) return false;
+        }
+        return topicParts.length === patternParts.length;
+    }
+
+    function hasDecoderForTopic(topic: string): boolean {
+        for (const plugin of plugins.enabledPlugins) {
+            if (!plugin.hasDecoder) continue;
+            const patterns = plugin.manifest.topicPatterns;
+            if (!patterns?.length) return true;
+            if (patterns.some((pattern) => topicMatchesPattern(topic, pattern))) return true;
+        }
+        return false;
+    }
+
+    function adaptiveRenderDelay(): number {
+        if (isTextInputActive()) return RENDER_INPUT_DELAY_MS;
+        if (pending.length > RENDER_BATCH_LIMIT * 4) return RENDER_BACKLOG_DELAY_MS;
+        if (renderCostEma > 12) return RENDER_SLOW_DELAY_MS;
+        return 0;
+    }
+
+    function adaptiveRenderLimit(): number {
+        if (isTextInputActive()) return RENDER_INPUT_BATCH_LIMIT;
+        if (pending.length > RENDER_BATCH_LIMIT * 4) return RENDER_BACKLOG_BATCH_LIMIT;
+        return RENDER_BATCH_LIMIT;
     }
 
     async function hydrateActiveConnection(connectionId: string): Promise<void> {
@@ -71,6 +112,7 @@ export function useMqttBridge() {
     function enqueueDecodeRows(connectionId: string, rows: MsgRow[]): void {
         for (let i = 0; i < rows.length; i++) {
             const row = rows[i];
+            if (!hasDecoderForTopic(row.topic)) continue;
             decodePending.push({ connectionId, topic: row.topic, row });
         }
         if (decodePending.length > DECODE_QUEUE_LIMIT) {
@@ -123,10 +165,11 @@ export function useMqttBridge() {
 
     async function flush(): Promise<void> {
         if (flushing || pending.length === 0) return;
+        const startedAt = performance.now();
         flushing = true;
         try {
             const byConn = new Map<string, MqttMessage[]>();
-            const renderLimit = isTextInputActive() ? RENDER_INPUT_BATCH_LIMIT : RENDER_BATCH_LIMIT;
+            const renderLimit = adaptiveRenderLimit();
             const batch = pending.splice(0, Math.min(pending.length, renderLimit));
             for (let i = 0; i < batch.length; i++) {
                 const item = batch[i];
@@ -145,6 +188,8 @@ export function useMqttBridge() {
                 enqueueDecodeRows(connId, rows);
             }
         } finally {
+            const cost = performance.now() - startedAt;
+            renderCostEma = renderCostEma === 0 ? cost : renderCostEma * 0.8 + cost * 0.2;
             flushing = false;
             if (pending.length > 0) schedule();
         }
@@ -152,14 +197,15 @@ export function useMqttBridge() {
 
     function schedule(): void {
         if (rafId != null || renderTimer != null) return;
-        if (isTextInputActive()) {
+        const delay = adaptiveRenderDelay();
+        if (delay > 0) {
             renderTimer = window.setTimeout(() => {
                 renderTimer = null;
                 rafId = requestAnimationFrame(async () => {
                     rafId = null;
                     await flush();
                 });
-            }, RENDER_INPUT_DELAY_MS);
+            }, delay);
             return;
         }
         rafId = requestAnimationFrame(async () => {
