@@ -17,6 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
 import {
@@ -648,34 +649,8 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
         return;
     }
     const cutoff = Date.now() - days * 86_400_000;
-    const { Worker } = require('node:worker_threads');
-    const code = `
-        const fs = require('fs');
-        const path = require('path');
-        const { workerData, parentPort } = require('worker_threads');
-        let removed = 0;
-        try {
-            const { logRoot, cutoff } = workerData;
-            if (fs.existsSync(logRoot)) {
-                const dirs = fs.readdirSync(logRoot, { withFileTypes: true }).filter((d) => d.isDirectory());
-                for (const d of dirs) {
-                    const sub = path.join(logRoot, d.name);
-                    const files = fs.readdirSync(sub).filter((f) => /^\\d{4}-\\d{2}-\\d{2}\\.db(?:-wal|-shm)?$/.test(f));
-                    for (const f of files) {
-                        const match = /^(\\d{4}-\\d{2}-\\d{2})\\.db(?:-wal|-shm)?$/.exec(f);
-                        if (!match) continue;
-                        const [y, m, dd] = match[1].split('-').map(Number);
-                        const dayEnd = new Date(y, m - 1, dd, 23, 59, 59, 999).getTime();
-                        if (dayEnd < cutoff) {
-                            try { fs.unlinkSync(path.join(sub, f)); removed++; } catch {}
-                        }
-                    }
-                }
-            }
-            parentPort.postMessage({ removed });
-        } catch (e) { parentPort.postMessage({ removed, error: e.message }); }
-    `;
-    const w = new Worker(code, { eval: true, workerData: { logRoot: LOG_ROOT, cutoff } });
+    const workerPath = path.join(__dirname, 'auto-delete-worker.js');
+    const w = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT, cutoff } });
     let finished = false;
     const finish = () => {
         if (finished) return;

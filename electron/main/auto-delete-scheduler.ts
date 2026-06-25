@@ -1,4 +1,5 @@
 import type { BrowserWindow } from 'electron';
+import { scheduleHeavyJob } from './heavy-job-scheduler';
 import { readSettings } from './settings';
 import { runAutoDeleteAsync } from './storage';
 
@@ -41,7 +42,10 @@ function runOnce(): void {
     if (autoDeleteDays <= 0 || running) return;
 
     running = true;
-    runAutoDeleteAsync(autoDeleteDays, notifyAutoDeleteDone, () => {
+    const job = scheduleHeavyJob({ kind: 'exclusive', label: 'auto-delete', priority: -20 }, () => new Promise<void>((resolve) => {
+        runAutoDeleteAsync(autoDeleteDays, notifyAutoDeleteDone, resolve);
+    }));
+    void job.promise.finally(() => {
         running = false;
     });
 }

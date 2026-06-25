@@ -1,6 +1,7 @@
 import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { initIpc } from './ipc';
+import { scheduleHeavyJob } from './heavy-job-scheduler';
 import { clearLogsWithoutConnections, initStorage, shutdownStorage } from './storage';
 import { initSettings, getCurrentLogDir, readConnections } from './settings';
 import { MqttService } from './mqtt-service';
@@ -89,7 +90,10 @@ app.on('second-instance', () => {
 app.whenReady().then(async () => {
     initSettings();
     initStorage(getCurrentLogDir());
-    clearLogsWithoutConnections(readConnections().connections.map((c) => c.id));
+    await scheduleHeavyJob(
+        { kind: 'exclusive', label: 'startup-clear-stale-logs', priority: 35 },
+        () => clearLogsWithoutConnections(readConnections().connections.map((c) => c.id))
+    ).promise;
     await pluginManager.init().catch((e) => console.error('[plugin] init:', e));
     mqttService = new MqttService(() => win);
     initIpc(mqttService);

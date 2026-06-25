@@ -28,7 +28,8 @@ export default defineConfig(({ command }) => {
                                     index: path.resolve(__dirname, 'electron/main/index.ts'),
                                     'history-export-worker': path.resolve(__dirname, 'electron/main/history-export-worker.ts'),
                                     'history-query-worker': path.resolve(__dirname, 'electron/main/history-query-worker.ts'),
-                                    'history-index-worker': path.resolve(__dirname, 'electron/main/history-index-worker.ts')
+                                    'history-index-worker': path.resolve(__dirname, 'electron/main/history-index-worker.ts'),
+                                    'auto-delete-worker': path.resolve(__dirname, 'electron/main/auto-delete-worker.ts')
                                 },
                                 external: ['electron', 'better-sqlite3', 'mqtt']
                             }

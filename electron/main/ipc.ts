@@ -36,6 +36,7 @@ import { checkForUpdates, openReleasesPage } from './update-service';
 import { exportHistoryToFile } from './history-export';
 import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
 import { cancelHistoryQueryStream, queryHistoryAsync, startHistoryQueryStream } from './history-query';
+import { scheduleHeavyJob } from './heavy-job-scheduler';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -162,9 +163,9 @@ export function initIpc(mqttService: MqttService): void {
             return { success: false, message: (e as Error).message };
         }
     });
-    ipcMain.handle('mqtt:clearLogs', (_e, connectionId?: string | null) => {
+    ipcMain.handle('mqtt:clearLogs', async (_e, connectionId?: string | null) => {
         try {
-            const r = clearLogs(connectionId ?? null);
+            const r = await scheduleHeavyJob({ kind: 'exclusive', label: 'clear-logs', priority: 40 }, () => clearLogs(connectionId ?? null)).promise;
             return { success: true, data: r };
         } catch (e) {
             return { success: false, message: (e as Error).message };
@@ -242,7 +243,7 @@ export function initIpc(mqttService: MqttService): void {
 
     // config
     ipcMain.handle('config:read', () => ({ success: true, data: readConnections() }));
-    ipcMain.handle('config:write', (_e, data: ConnectionsFile) => {
+    ipcMain.handle('config:write', async (_e, data: ConnectionsFile) => {
         try {
             const prev = readConnections();
             writeConnections(data);
@@ -250,7 +251,10 @@ export function initIpc(mqttService: MqttService): void {
             const nextIds = new Set((data.connections ?? []).map((c) => c.id));
             const hasRemovedConnection = [...prevIds].some((id) => !nextIds.has(id));
             const cleanup = hasRemovedConnection
-                ? clearLogsWithoutConnections((data.connections ?? []).map((c) => c.id))
+                ? await scheduleHeavyJob(
+                    { kind: 'exclusive', label: 'clear-stale-logs', priority: 35 },
+                    () => clearLogsWithoutConnections((data.connections ?? []).map((c) => c.id))
+                ).promise
                 : { deletedFiles: 0, deletedDirs: 0 };
             return { success: true, data: cleanup };
         } catch (e) {
@@ -276,16 +280,24 @@ export function initIpc(mqttService: MqttService): void {
             return { success: false, message: (e as Error).message };
         }
     });
-    ipcMain.handle('settings:migrateLogDirData', (_e, p: { sourceDir: string; targetDir: string }) => {
+    ipcMain.handle('settings:migrateLogDirData', async (_e, p: { sourceDir: string; targetDir: string }) => {
         try {
-            return { success: true, data: migrateLogDirData(p.sourceDir, p.targetDir) };
+            const data = await scheduleHeavyJob(
+                { kind: 'exclusive', label: 'migrate-log-dir', priority: 40 },
+                () => migrateLogDirData(p.sourceDir, p.targetDir)
+            ).promise;
+            return { success: true, data };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
     });
-    ipcMain.handle('settings:deleteLogDirData', (_e, p: { sourceDir: string }) => {
+    ipcMain.handle('settings:deleteLogDirData', async (_e, p: { sourceDir: string }) => {
         try {
-            return { success: true, data: deleteLogDirData(p.sourceDir) };
+            const data = await scheduleHeavyJob(
+                { kind: 'exclusive', label: 'delete-log-dir', priority: 40 },
+                () => deleteLogDirData(p.sourceDir)
+            ).promise;
+            return { success: true, data };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
