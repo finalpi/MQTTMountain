@@ -1,42 +1,31 @@
 /**
  * MQTT 服务：
  *  - 单进程内支持多连接（按 connectionId 复用 / 互不影响）
- *  - 入站消息批量推送到渲染进程（33ms / 批量阈值 / 队列硬上限 + 优先主题保留）
+ *  - 入站消息批量推送到渲染进程（有界队列 / 分批 flush / 优先主题保留）
  */
 
 import mqtt, { MqttClient, IClientOptions, IPublishPacket } from 'mqtt';
 import type { BrowserWindow } from 'electron';
 import type { ApiResult, ConnectPayload, MqttMessage, PublishPayload } from '../../shared/types';
+import { MqttIpcQueue } from './mqtt-ipc-queue';
 import { enqueueMessage } from './storage';
 
 interface ConnectionCtx {
     id: string;
     client: MqttClient;
     disabledTopics: Set<string>;
-    priorityTopic: string | null;
     closing: boolean;
 }
 
-interface QueuePriority {
-    connectionId: string;
-    topic: string | null;
-}
-
-const IPC_FLUSH_MS = 33;
-const IPC_BATCH_HARD = 800;
-const IPC_QUEUE_HARD = 16000;
-
 export class MqttService {
     private conns = new Map<string, ConnectionCtx>();
-    private ipcQueue: MqttMessage[] = [];
-    private ipcTimer: NodeJS.Timeout | null = null;
+    private ipcQueue: MqttIpcQueue;
     private seq = 0;
-    private activeConnectionId: string | null = null;
-    private displayPausedConnections = new Set<string>();
     private getWin: () => BrowserWindow | null;
 
     constructor(getWin: () => BrowserWindow | null) {
         this.getWin = getWin;
+        this.ipcQueue = new MqttIpcQueue(getWin);
     }
 
     /**
@@ -72,7 +61,6 @@ export class MqttService {
                     id: p.connectionId,
                     client,
                     disabledTopics: new Set(p.disabledTopics || []),
-                    priorityTopic: null,
                     closing: false
                 };
                 this.conns.set(p.connectionId, ctx);
@@ -82,6 +70,7 @@ export class MqttService {
                     if (!settled) {
                         try { client.end(true); } catch {}
                         this.conns.delete(p.connectionId);
+                        this.ipcQueue.dropConnection(p.connectionId);
                         settle({ success: false, message: '连接超时' });
                     }
                 }, 8000);
@@ -106,6 +95,7 @@ export class MqttService {
                         clearTimeout(hardTimeout);
                         try { client.end(true); } catch {}
                         this.conns.delete(p.connectionId);
+                        this.ipcQueue.dropConnection(p.connectionId);
                         settle({ success: false, message: '连接被关闭' });
                         return;
                     }
@@ -121,24 +111,24 @@ export class MqttService {
                         clearTimeout(hardTimeout);
                         try { client.end(true); } catch {}
                         this.conns.delete(p.connectionId);
+                        this.ipcQueue.dropConnection(p.connectionId);
                         settle({ success: false, message: err.message });
                     }
                 });
 
-            let msgCount = 0;
-            client.on('message', (topic, payload, _packet?: IPublishPacket) => {
-                if (ctx.disabledTopics.has(topic)) return;
-                const text = payload.toString('utf8');
-                const now = Date.now();
+                let msgCount = 0;
+                client.on('message', (topic, payload, _packet?: IPublishPacket) => {
+                    if (ctx.disabledTopics.has(topic)) return;
+                    const text = payload.toString('utf8');
+                    const now = Date.now();
 
-                enqueueMessage(p.connectionId, topic, text, now);
-                if (this.shouldSendToRenderer(p.connectionId)) {
-                    this.enqueueIpc({ connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq }, ctx);
-                }
-                if (++msgCount <= 3 || msgCount % 500 === 0) {
-                    console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);
-                }
-            });
+                    enqueueMessage(p.connectionId, topic, text, now);
+                    const msg: MqttMessage = { connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq };
+                    this.ipcQueue.enqueue(msg);
+                    if (++msgCount <= 3 || msgCount % 500 === 0) {
+                        console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);
+                    }
+                });
             } catch (e) {
                 settle({ success: false, message: (e as Error).message });
             }
@@ -153,14 +143,14 @@ export class MqttService {
             try { ctx.client.end(true); } catch {}
             this.conns.delete(connectionId);
         }
-        this.displayPausedConnections.delete(connectionId);
+        this.ipcQueue.dropConnection(connectionId);
         return { success: true };
     }
 
     subscribe(connectionId: string, topic: string, qos: 0 | 1 | 2): Promise<ApiResult> {
         const ctx = this.conns.get(connectionId);
         if (!ctx || !ctx.client.connected) return Promise.resolve({ success: false, message: '未连接' });
-        const normalized = topic.trim().replace(/\uFF0B/g, '+');
+        const normalized = topic.trim().replace(/＋/g, '+');
         return new Promise((resolve) => {
             ctx.client.subscribe(normalized, { qos }, (err, granted) => {
                 if (err) {
@@ -177,7 +167,7 @@ export class MqttService {
     unsubscribe(connectionId: string, topic: string): Promise<ApiResult> {
         const ctx = this.conns.get(connectionId);
         if (!ctx || !ctx.client.connected) return Promise.resolve({ success: false, message: '未连接' });
-        const normalized = topic.trim().replace(/\uFF0B/g, '+');
+        const normalized = topic.trim().replace(/＋/g, '+');
         return new Promise((resolve) => {
             ctx.client.unsubscribe(normalized, (err) => {
                 if (err) resolve({ success: false, message: err.message });
@@ -204,89 +194,15 @@ export class MqttService {
         this.conns.get(connectionId)?.disabledTopics.delete(topic);
     }
     setPriorityTopic(connectionId: string, topic: string | null): void {
-        const c = this.conns.get(connectionId);
-        if (c) c.priorityTopic = topic;
+        this.ipcQueue.setPriorityTopic(connectionId, topic);
     }
 
     setActiveConnection(connectionId: string | null): void {
-        this.activeConnectionId = connectionId || null;
-        this.trimInactiveQueuedMessages();
+        this.ipcQueue.setActiveConnection(connectionId || null);
     }
 
     setDisplayPaused(connectionId: string, paused: boolean): void {
-        if (!connectionId) return;
-        if (paused) this.displayPausedConnections.add(connectionId);
-        else this.displayPausedConnections.delete(connectionId);
-        this.trimInactiveQueuedMessages();
-    }
-
-    private shouldSendToRenderer(connectionId: string): boolean {
-        return !!this.activeConnectionId
-            && connectionId === this.activeConnectionId
-            && !this.displayPausedConnections.has(connectionId);
-    }
-
-    private trimInactiveQueuedMessages(): void {
-        this.ipcQueue = this.activeConnectionId
-            ? this.ipcQueue.filter((item) => this.shouldSendToRenderer(item.connectionId))
-            : [];
-    }
-
-    // ---------- IPC batching ----------
-    private enqueueIpc(msg: MqttMessage, ctx: ConnectionCtx): void {
-        this.ipcQueue.push(msg);
-        if (this.ipcQueue.length > IPC_QUEUE_HARD) {
-            this.trimQueue(ctx.priorityTopic ? { connectionId: ctx.id, topic: ctx.priorityTopic } : null);
-        }
-        if (this.ipcQueue.length >= IPC_BATCH_HARD) this.flushIpc();
-        else this.scheduleFlush();
-    }
-
-    private trimQueue(priority: QueuePriority | null): void {
-        const excess = this.ipcQueue.length - IPC_QUEUE_HARD;
-        if (excess <= 0) return;
-        const mark = new Uint8Array(this.ipcQueue.length);
-        let removed = 0;
-        if (priority) {
-            for (let i = 0; i < this.ipcQueue.length && removed < excess; i++) {
-                const item = this.ipcQueue[i];
-                const matchesPriority = item.connectionId === priority.connectionId
-                    && (priority.topic == null || item.topic === priority.topic);
-                if (!matchesPriority) {
-                    mark[i] = 1;
-                    removed++;
-                }
-            }
-        }
-        if (removed < excess) {
-            for (let i = 0; i < this.ipcQueue.length && removed < excess; i++) {
-                if (!mark[i]) { mark[i] = 1; removed++; }
-            }
-        }
-        const kept = new Array<MqttMessage>(this.ipcQueue.length - removed);
-        let k = 0;
-        for (let i = 0; i < this.ipcQueue.length; i++) if (!mark[i]) kept[k++] = this.ipcQueue[i];
-        this.ipcQueue = kept;
-        const priorityLabel = priority ? `${priority.connectionId}:${priority.topic}` : 'none';
-        console.warn(`[mqtt] IPC 队列积压超限，已降采样丢弃 ${removed} 条（priority=${priorityLabel}）`);
-    }
-
-    private scheduleFlush(): void {
-        if (this.ipcTimer) return;
-        this.ipcTimer = setTimeout(() => { this.ipcTimer = null; this.flushIpc(); }, IPC_FLUSH_MS);
-    }
-
-    private flushIpc(): void {
-        if (this.ipcTimer) { clearTimeout(this.ipcTimer); this.ipcTimer = null; }
-        if (this.ipcQueue.length === 0) return;
-        const win = this.getWin();
-        if (!win || win.isDestroyed()) { this.ipcQueue.length = 0; return; }
-        const batch = this.ipcQueue.splice(0, this.ipcQueue.length);
-        try {
-            win.webContents.send('mqtt:messages', batch);
-        } catch (e) {
-            console.error('[mqtt] send batch:', e);
-        }
+        this.ipcQueue.setDisplayPaused(connectionId, paused);
     }
 
     private sendState(connectionId: string, state: string, message?: string): void {
@@ -296,11 +212,12 @@ export class MqttService {
     }
 
     flush(): void {
-        this.flushIpc();
+        this.ipcQueue.flush();
     }
 
     shutdown(): void {
-        this.flushIpc();
+        this.ipcQueue.flush();
         for (const id of [...this.conns.keys()]) this.disconnect(id);
+        this.ipcQueue.shutdown();
     }
 }
