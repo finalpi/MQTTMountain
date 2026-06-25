@@ -13,6 +13,10 @@ import type {
     HistoryIndexResult,
     HistoryIndexStatus,
     HistoryQueryOptions,
+    HistoryQueryChunk,
+    HistoryQueryDone,
+    HistoryQueryStreamCancelRequest,
+    HistoryQueryStreamStartRequest,
     HistoryMessage,
     MqttMessage,
     PublishPayload,
@@ -41,6 +45,8 @@ const api = {
         invoke<{ deletedFiles: number }>('mqtt:clearLogs', connectionId),
 
     historyQuery: (opts: HistoryQueryOptions) => invoke<HistoryMessage[]>('history:query', opts),
+    historyQueryStreamStart: (req: HistoryQueryStreamStartRequest) => invoke<{ requestId: string }>('history:queryStreamStart', req),
+    historyQueryStreamCancel: (req: HistoryQueryStreamCancelRequest) => invoke<{ requestId: string }>('history:queryStreamCancel', req),
     historyExport: (req: HistoryExportRequest) => invoke<HistoryExportResult>('history:export', req),
     historyIndexStatus: (req?: HistoryIndexRequest) => invoke<HistoryIndexStatus>('history:indexStatus', req),
     historyBuildIndex: (req?: HistoryIndexRequest) => invoke<HistoryIndexResult>('history:buildIndex', req),
@@ -124,6 +130,21 @@ const api = {
         const listener = (_e: IpcRendererEvent, p: HistoryIndexProgress) => cb(p);
         ipcRenderer.on('history:indexProgress', listener);
         return () => ipcRenderer.removeListener('history:indexProgress', listener);
+    },
+    onHistoryQueryChunk: (cb: (p: HistoryQueryChunk) => void) => {
+        const listener = (_e: IpcRendererEvent, p: HistoryQueryChunk) => cb(p);
+        ipcRenderer.on('history:queryChunk', listener);
+        return () => ipcRenderer.removeListener('history:queryChunk', listener);
+    },
+    onHistoryQueryDone: (cb: (p: HistoryQueryDone) => void) => {
+        const listener = (_e: IpcRendererEvent, p: HistoryQueryDone) => cb(p);
+        ipcRenderer.on('history:queryDone', listener);
+        return () => ipcRenderer.removeListener('history:queryDone', listener);
+    },
+    onHistoryQueryError: (cb: (p: { requestId: string; message: string }) => void) => {
+        const listener = (_e: IpcRendererEvent, p: { requestId: string; message: string }) => cb(p);
+        ipcRenderer.on('history:queryError', listener);
+        return () => ipcRenderer.removeListener('history:queryError', listener);
     }
 };
 

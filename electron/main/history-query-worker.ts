@@ -1,126 +1,69 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
-import type { HistoryKeywordJoin, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
-
-const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
-const HISTORY_INDEX_SCHEMA_VERSION = '2';
+import type { HistoryMessage, HistoryQueryOptions } from '../../shared/types';
+import { decodeBucket, readPayloadSlice } from './history-bucket-codec';
+import {
+    collectDayFiles,
+    matchesSearchText,
+    matchesText,
+    normalizeConditions,
+    parseKeywordTerms,
+    type NormalizedCondition
+} from './history-query-common';
+import { getHistoryIndexSchemaVersion, getIndexMeta, HISTORY_INDEX_SCHEMA_VERSION } from './history-index-schema';
 
 interface QueryWorkerData {
     opts: HistoryQueryOptions;
     logRoot: string;
+    stream?: boolean;
+    requestId?: string;
+    chunkSize?: number;
 }
 
-const { opts, logRoot } = workerData as QueryWorkerData;
-
-function sanitizeConnectionId(id: string): string {
-    if (!id) return '_none';
-    const s = String(id).replace(/[^a-zA-Z0-9._-]/g, '_');
-    return s.length > 120 ? s.slice(0, 120) : s || '_empty';
+interface QueryOutput {
+    length: number;
+    push(row: HistoryMessage): void;
 }
 
-function dateStartTsFromKey(dk: string): number {
-    const [y, mo, da] = dk.split('-').map(Number);
-    return new Date(y, mo - 1, da, 0, 0, 0, 0).getTime();
+class ArrayQueryOutput implements QueryOutput {
+    readonly rows: HistoryMessage[] = [];
+    get length(): number { return this.rows.length; }
+    push(row: HistoryMessage): void { this.rows.push(row); }
 }
 
-function dateEndTsFromKey(dk: string): number {
-    return dateStartTsFromKey(dk) + 86_400_000 - 1;
-}
+class StreamQueryOutput implements QueryOutput {
+    private readonly rows: HistoryMessage[] = [];
+    length = 0;
 
-function normalizeKeyword(k: string): string {
-    return String(k).replace(/\s+/gu, '').toLowerCase();
-}
+    constructor(private readonly requestId: string, private readonly chunkSize: number) {}
 
-function parseKeywordTerms(input: string | string[]): string[] {
-    const seen = new Set<string>();
-    const out: string[] = [];
-    const items = Array.isArray(input) ? input : [input];
-    for (const part of items) {
-        const term = normalizeKeyword(part);
-        if (!term || seen.has(term)) continue;
-        seen.add(term);
-        out.push(term);
+    push(row: HistoryMessage): void {
+        this.rows.push(row);
+        this.length++;
+        if (this.rows.length >= this.chunkSize) this.flush();
     }
-    return out;
-}
 
-function decodeBucket(blob: Buffer, bucketSec: number, topic: string): HistoryMessage[] {
-    const out: HistoryMessage[] = [];
-    if (!blob || blob.length < 4) return out;
-    const base = bucketSec * 1000;
-    const n = blob.readUInt32LE(0);
-    let p = 4;
-    for (let i = 0; i < n && p + 6 <= blob.length; i++) {
-        const off = blob.readUInt16LE(p); p += 2;
-        const len = blob.readUInt32LE(p); p += 4;
-        if (p + len > blob.length) break;
-        const payload = blob.slice(p, p + len).toString('utf8');
-        p += len;
-        out.push({ connectionId: '', topic, payload, time: base + off });
+    flush(): void {
+        if (!this.rows.length) return;
+        parentPort?.postMessage({ type: 'chunk', requestId: this.requestId, rows: this.rows.splice(0) });
     }
-    return out;
 }
 
-interface NormalizedCondition {
-    join: HistoryKeywordJoin;
-    term: string;
-}
+const { opts, logRoot, stream, requestId, chunkSize } = workerData as QueryWorkerData;
 
-function normalizeConditions(conditions?: HistoryQueryOptions['conditions']): NormalizedCondition[] {
-    return (conditions ?? [])
-        .map((item) => ({ join: item.join, term: normalizeKeyword(item.term) }))
-        .filter((item) => item.term);
-}
-
-function matchesConditions(hay: string, conditions: NormalizedCondition[]): boolean {
-    if (conditions.length === 0) return true;
-    let result = hay.includes(conditions[0].term);
-    for (let i = 1; i < conditions.length; i++) {
-        const item = conditions[i];
-        const hit = hay.includes(item.term);
-        if (item.join === 'or') result = result || hit;
-        else if (item.join === 'not') result = result && !hit;
-        else result = result && hit;
-    }
-    return result;
-}
-
-function matchesSearchText(hay: string, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): boolean {
-    if (conditions.length === 0 && terms.length === 0) return true;
-    if (conditions.length) return matchesConditions(hay, conditions);
-    return keywordLogic === 'or'
-        ? terms.some((term) => hay.includes(term))
-        : terms.every((term) => hay.includes(term));
-}
-
-function matchesText(topic: string, payload: string, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): boolean {
-    return matchesSearchText(`${normalizeKeyword(topic)}${normalizeKeyword(payload)}`, conditions, terms, keywordLogic);
-}
-
-function getIndexMeta(db: Database.Database, key: string): string | null {
+function getUsableIndexVersion(db: Database.Database): string | null {
     try {
-        const row = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get(key) as { value: string } | undefined;
-        return row?.value ?? null;
+        const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'history_messages'").get();
+        if (!row || getIndexMeta(db, 'index_complete') !== '1') return null;
+        return getHistoryIndexSchemaVersion(db);
     } catch {
         return null;
     }
 }
 
-function hasUsableIndex(db: Database.Database): boolean {
-    try {
-        const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'history_messages'").get();
-        return Boolean(row)
-            && getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION
-            && getIndexMeta(db, 'index_complete') === '1';
-    } catch {
-        return false;
-    }
-}
-
 function queryIndexedFile(
     db: Database.Database,
+    schemaVersion: string,
     fe: { san: string },
     st: number,
     et: number,
@@ -132,7 +75,7 @@ function queryIndexedFile(
     limit: number,
     offset: number,
     skippedRef: { value: number },
-    out: HistoryMessage[]
+    out: QueryOutput
 ): void {
     const chunkSize = 1000;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
@@ -141,7 +84,9 @@ function queryIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+        let sql = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+            ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
+            : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
         const params: Array<number | string> = [st, et];
         if (topicFilter) {
             sql += ' AND topic = ?';
@@ -159,7 +104,7 @@ function queryIndexedFile(
             ? ' ORDER BY time_ms DESC, topic DESC, msg_index DESC LIMIT ?'
             : ' ORDER BY time_ms ASC, topic ASC, msg_index ASC LIMIT ?';
         params.push(chunkSize);
-        const rows = db.prepare(sql).all(...params) as { bucket_ts: number; time_ms: number; topic: string; msg_index: number; search_text: string }[];
+        const rows = db.prepare(sql).all(...params) as { bucket_ts: number; time_ms: number; topic: string; msg_index: number; search_text: string; payload_offset?: number; payload_len?: number }[];
         if (rows.length === 0) break;
         for (const row of rows) {
             if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
@@ -168,15 +113,22 @@ function queryIndexedFile(
                 continue;
             }
             const cacheKey = `${row.bucket_ts}|${row.topic}`;
-            let decoded = bucketCache.get(cacheKey);
-            if (!decoded) {
-                const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
-                decoded = bucket ? decodeBucket(bucket.blob, row.bucket_ts, row.topic) : [];
-                bucketCache.set(cacheKey, decoded);
+            const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
+            if (!bucket) continue;
+            let payload: string | null = null;
+            if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+                payload = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
             }
-            const item = decoded[row.msg_index];
-            if (!item) continue;
-            out.push({ connectionId: fe.san, topic: row.topic, payload: item.payload, time: row.time_ms });
+            if (payload == null) {
+                let decoded = bucketCache.get(cacheKey);
+                if (!decoded) {
+                    decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic);
+                    bucketCache.set(cacheKey, decoded);
+                }
+                payload = decoded[row.msg_index]?.payload ?? null;
+            }
+            if (payload == null) continue;
+            out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
             if (out.length >= limit) break;
         }
         const tail = rows[rows.length - 1];
@@ -187,7 +139,7 @@ function queryIndexedFile(
     }
 }
 
-function queryHistory(): HistoryMessage[] {
+function queryHistory(out: QueryOutput): void {
     const st = opts.startTime != null && opts.startTime > 0 ? opts.startTime : -8640000000000000;
     const et = opts.endTime != null && opts.endTime > 0 ? opts.endTime : 8640000000000000;
     const limit = Math.min(500_000, Math.max(1, opts.limit ?? 500));
@@ -198,38 +150,20 @@ function queryHistory(): HistoryMessage[] {
     const keywordLogic = opts.keywordLogic === 'or' ? 'or' : 'and';
     const topicFilter = opts.topic && opts.topic.trim() ? opts.topic.trim() : null;
 
-    if (!fs.existsSync(logRoot)) return [];
-
-    const sanFilter = opts.connectionId ? sanitizeConnectionId(opts.connectionId) : null;
-    const files: { path: string; dk: string; san: string }[] = [];
-    const dirs = fs.readdirSync(logRoot, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
-
-    for (const d of dirs) {
-        const dir = path.join(logRoot, d.name);
-        const dayFiles = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
-        for (const df of dayFiles) {
-            const dk = df.replace('.db', '');
-            if (dateEndTsFromKey(dk) < st || dateStartTsFromKey(dk) > et) continue;
-            files.push({ path: path.join(dir, df), dk, san: d.name });
-        }
-    }
-    files.sort((a, b) => order === 'desc'
-        ? (a.dk < b.dk ? 1 : a.dk > b.dk ? -1 : 0)
-        : (a.dk < b.dk ? -1 : a.dk > b.dk ? 1 : 0));
+    const files = collectDayFiles(logRoot, { connectionId: opts.connectionId, startTime: st, endTime: et, order });
 
     const secMin = Math.floor(Math.max(st, -8640000000) / 1000);
     const secMax = Math.ceil(Math.min(et, 8640000000000) / 1000);
     const bucketChunkSize = 256;
-    const out: HistoryMessage[] = [];
     const skippedRef = { value: 0 };
 
     for (const fe of files) {
         if (out.length >= limit) break;
         const db = new Database(fe.path, { readonly: true });
         try {
-            if (hasUsableIndex(db)) {
-                queryIndexedFile(db, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
+            const indexSchemaVersion = getUsableIndexVersion(db);
+            if (indexSchemaVersion) {
+                queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                 continue;
             }
             let lastBucketTs: number | null = null;
@@ -286,11 +220,20 @@ function queryHistory(): HistoryMessage[] {
         }
     }
 
-    return out;
 }
 
 try {
-    parentPort?.postMessage({ type: 'done', data: queryHistory() });
+    if (stream) {
+        if (!requestId) throw new Error('缺少流式查询 requestId');
+        const streamOut = new StreamQueryOutput(requestId, Math.min(5000, Math.max(100, chunkSize ?? 1000)));
+        queryHistory(streamOut);
+        streamOut.flush();
+        parentPort?.postMessage({ type: 'done', requestId, total: streamOut.length, truncated: streamOut.length >= Math.min(500_000, Math.max(1, opts.limit ?? 500)) });
+    } else {
+        const arrayOut = new ArrayQueryOutput();
+        queryHistory(arrayOut);
+        parentPort?.postMessage({ type: 'done', data: arrayOut.rows });
+    }
 } catch (error) {
-    parentPort?.postMessage({ type: 'error', error: (error as Error).message || '查询失败' });
+    parentPort?.postMessage({ type: 'error', requestId, error: (error as Error).message || '查询失败' });
 }

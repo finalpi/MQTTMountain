@@ -10,8 +10,9 @@ import type {
     HistoryKeywordCondition,
     HistoryMessage
 } from '../../shared/types';
+import { decodeBucket } from './history-bucket-codec';
+import { collectDayFiles as collectHistoryDayFiles, normalizeKeyword } from './history-query-common';
 
-const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const port = parentPort;
 
 interface ExportWorkerData {
@@ -21,42 +22,6 @@ interface ExportWorkerData {
 }
 
 const { req, targetPath, logRoot } = workerData as ExportWorkerData;
-
-function normalizeKeyword(s: string): string {
-    return String(s || '').replace(/\s+/gu, '').toLowerCase();
-}
-
-function sanitizeConnectionId(id: string): string {
-    if (!id) return '_none';
-    const s = String(id).replace(/[^a-zA-Z0-9._-]/g, '_');
-    return s.length > 120 ? s.slice(0, 120) : s || '_empty';
-}
-
-function dayStartTsFromKey(dk: string): number {
-    const [y, mo, da] = dk.split('-').map(Number);
-    return new Date(y, mo - 1, da, 0, 0, 0, 0).getTime();
-}
-
-function dayEndTsFromKey(dk: string): number {
-    return dayStartTsFromKey(dk) + 86_400_000 - 1;
-}
-
-function decodeBucket(blob: Buffer, bucketSec: number, topic: string): HistoryMessage[] {
-    const out: HistoryMessage[] = [];
-    if (!blob || blob.length < 4) return out;
-    const base = bucketSec * 1000;
-    const n = blob.readUInt32LE(0);
-    let p = 4;
-    for (let i = 0; i < n && p + 6 <= blob.length; i++) {
-        const off = blob.readUInt16LE(p); p += 2;
-        const len = blob.readUInt32LE(p); p += 4;
-        if (p + len > blob.length) break;
-        const payload = blob.slice(p, p + len).toString('utf8');
-        p += len;
-        out.push({ connectionId: '', topic, payload, time: base + off });
-    }
-    return out;
-}
 
 function matchesConditions(row: HistoryMessage, conditions: HistoryKeywordCondition[]): boolean {
     const active = conditions
@@ -97,24 +62,12 @@ function sendError(error: unknown, processed: number, written: number, total = 0
 }
 
 function collectDayFiles(): { path: string; san: string; dk: string }[] {
-    if (!fs.existsSync(logRoot)) return [];
-    const st = req.query.startTime != null && req.query.startTime > 0 ? req.query.startTime : -8640000000000000;
-    const et = req.query.endTime != null && req.query.endTime > 0 ? req.query.endTime : 8640000000000000;
-    const sanFilter = req.query.connectionId ? sanitizeConnectionId(req.query.connectionId) : null;
-    const dirs = fs.readdirSync(logRoot, { withFileTypes: true }).filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
-    const files: { path: string; san: string; dk: string }[] = [];
-
-    for (const dirEntry of dirs) {
-        const dir = path.join(logRoot, dirEntry.name);
-        const dayFiles = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
-        for (const file of dayFiles) {
-            const dk = file.replace('.db', '');
-            if (dayEndTsFromKey(dk) < st || dayStartTsFromKey(dk) > et) continue;
-            files.push({ path: path.join(dir, file), san: dirEntry.name, dk });
-        }
-    }
-    files.sort((a, b) => (a.dk < b.dk ? 1 : a.dk > b.dk ? -1 : 0));
-    return files;
+    return collectHistoryDayFiles(logRoot, {
+        connectionId: req.query.connectionId,
+        startTime: req.query.startTime,
+        endTime: req.query.endTime,
+        order: 'desc'
+    });
 }
 
 function estimateTotal(files: { path: string }[]): number {

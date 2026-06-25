@@ -11,7 +11,8 @@ import type {
     HistoryIndexProgress,
     HistoryIndexStatus,
     HistoryKeywordCondition,
-    HistoryMessage
+    HistoryMessage,
+    HistoryQueryDone
 } from '@shared/types';
 import { datetimeLocalToTs, formatTime, shortTime, tsToDatetimeLocal } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
@@ -70,6 +71,12 @@ const detailVisibleCount = ref(120);
 const topicVisibleCount = ref(200);
 const DETAIL_BATCH = 120;
 const TOPIC_BATCH = 200;
+const HISTORY_STREAM_CHUNK_SIZE = 1000;
+
+let historyStreamSeq = 0;
+let activeHistoryStreamId: string | null = null;
+let pendingHistoryRows: HistoryMessage[] = [];
+let pendingHistoryFlush = 0;
 
 const replayQos = ref<0 | 1 | 2>(0);
 const replayRetain = ref(false);
@@ -185,6 +192,35 @@ function activeKeywordConditions(): HistoryKeywordCondition[] {
         .filter((item) => item.term);
 }
 
+function nextHistoryStreamId(): string {
+    historyStreamSeq++;
+    return `history-${Date.now()}-${historyStreamSeq}`;
+}
+
+function flushPendingHistoryRows(): void {
+    pendingHistoryFlush = 0;
+    if (!pendingHistoryRows.length) return;
+    rows.value.push(...pendingHistoryRows.splice(0));
+}
+
+function queueHistoryRows(chunkRows: HistoryMessage[]): void {
+    if (!chunkRows.length) return;
+    pendingHistoryRows.push(...chunkRows);
+    if (pendingHistoryFlush) return;
+    pendingHistoryFlush = window.setTimeout(flushPendingHistoryRows, 16);
+}
+
+async function cancelActiveHistoryStream(): Promise<void> {
+    const requestId = activeHistoryStreamId;
+    activeHistoryStreamId = null;
+    pendingHistoryRows = [];
+    if (pendingHistoryFlush) {
+        window.clearTimeout(pendingHistoryFlush);
+        pendingHistoryFlush = 0;
+    }
+    if (requestId) await window.api.historyQueryStreamCancel({ requestId });
+}
+
 async function loadHistoryPage(offset: number): Promise<HistoryMessage[] | null> {
     const r = await window.api.historyQuery({
         ...buildHistoryQueryOptions(queryLimit.value + 1, offset),
@@ -199,19 +235,33 @@ async function loadHistoryPage(offset: number): Promise<HistoryMessage[] | null>
 }
 
 async function query(): Promise<void> {
+    await cancelActiveHistoryStream();
+    const requestId = nextHistoryStreamId();
+    activeHistoryStreamId = requestId;
     hasMoreHistory.value = false;
     loading.value = true;
+    rows.value = [];
+    dataSource.value = 'history';
+    selectedTopic.value = null;
+    topicVisibleCount.value = TOPIC_BATCH;
     try {
-        const page = await loadHistoryPage(0);
-        if (!page) return;
-        rows.value = page;
-        dataSource.value = 'history';
-        selectedTopic.value = rows.value.length > 0 ? rows.value[0].topic : null;
-        topicVisibleCount.value = TOPIC_BATCH;
-        if (rows.value.length === 0) toast.info('无匹配结果');
-        else toast.success(hasMoreHistory.value ? `已加载 ${rows.value.length} 条，向下滚动继续加载` : `找到 ${rows.value.length} 条`);
-    } finally {
+        const r = await window.api.historyQueryStreamStart({
+            requestId,
+            opts: {
+                ...buildHistoryQueryOptions(queryLimit.value + 1, 0),
+                conditions: activeKeywordConditions()
+            },
+            chunkSize: HISTORY_STREAM_CHUNK_SIZE
+        });
+        if (!r.success) {
+            activeHistoryStreamId = null;
+            loading.value = false;
+            toast.error('查询失败：' + (r.message || ''));
+        }
+    } catch (error) {
+        activeHistoryStreamId = null;
         loading.value = false;
+        toast.error('查询失败：' + ((error as Error).message || ''));
     }
 }
 
@@ -491,6 +541,7 @@ function loadMoreTopics(): void {
 }
 
 async function loadMoreHistory(): Promise<void> {
+    if (activeHistoryStreamId) return;
     if (dataSource.value !== 'history' || loading.value || loadingMore.value || !hasMoreHistory.value) return;
     loadingMore.value = true;
     try {
@@ -570,6 +621,7 @@ async function onImportChange(event: Event): Promise<void> {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     if (!file) return;
+    await cancelActiveHistoryStream();
     try {
         importedRows.value = await parseReplayFile(file);
         importedName.value = file.name;
@@ -628,9 +680,44 @@ const offHistoryExportProgress = window.api.onHistoryExportProgress((progress) =
     }
 });
 
+const offHistoryQueryChunk = window.api.onHistoryQueryChunk((chunk) => {
+    if (chunk.requestId !== activeHistoryStreamId) return;
+    queueHistoryRows(chunk.rows);
+});
+
+function finishHistoryStream(done: HistoryQueryDone): void {
+    if (done.requestId !== activeHistoryStreamId) return;
+    flushPendingHistoryRows();
+    activeHistoryStreamId = null;
+    loading.value = false;
+    hasMoreHistory.value = rows.value.length > queryLimit.value;
+    if (hasMoreHistory.value) rows.value = rows.value.slice(0, queryLimit.value);
+    selectedTopic.value = rows.value.length > 0 ? rows.value[0].topic : null;
+    if (rows.value.length === 0) toast.info('无匹配结果');
+    else toast.success(hasMoreHistory.value ? `已加载 ${rows.value.length} 条，向下滚动继续加载` : `找到 ${rows.value.length} 条`);
+}
+
+const offHistoryQueryDone = window.api.onHistoryQueryDone(finishHistoryStream);
+
+const offHistoryQueryError = window.api.onHistoryQueryError((error) => {
+    if (error.requestId !== activeHistoryStreamId) return;
+    activeHistoryStreamId = null;
+    pendingHistoryRows = [];
+    if (pendingHistoryFlush) {
+        window.clearTimeout(pendingHistoryFlush);
+        pendingHistoryFlush = 0;
+    }
+    loading.value = false;
+    toast.error('查询失败：' + error.message);
+});
+
 onBeforeUnmount(() => {
     offHistoryIndexProgress();
     offHistoryExportProgress();
+    offHistoryQueryChunk();
+    offHistoryQueryDone();
+    offHistoryQueryError();
+    void cancelActiveHistoryStream();
 });
 
 watch(

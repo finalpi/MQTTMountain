@@ -2,10 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
-import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult, HistoryMessage } from '../../shared/types';
+import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
+import { iterateBucketEntries } from './history-bucket-codec';
+import { DATE_KEY_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
+import { ensureHistoryIndexSchema, getIndexMeta, setIndexMeta } from './history-index-schema';
 
-const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
-const HISTORY_INDEX_SCHEMA_VERSION = '2';
 const port = parentPort;
 
 interface IndexWorkerData {
@@ -14,82 +15,6 @@ interface IndexWorkerData {
 }
 
 const { req, logRoot } = workerData as IndexWorkerData;
-
-function sanitizeConnectionId(id: string): string {
-    if (!id) return '_none';
-    const s = String(id).replace(/[^a-zA-Z0-9._-]/g, '_');
-    return s.length > 120 ? s.slice(0, 120) : s || '_empty';
-}
-
-function normalizeKeyword(k: string): string {
-    return String(k).replace(/\s+/gu, '').toLowerCase();
-}
-
-function normalizeSearchText(topic: string, payload: string): string {
-    return `${normalizeKeyword(topic)}${normalizeKeyword(payload)}`;
-}
-
-function decodeBucket(blob: Buffer, bucketSec: number, topic: string): HistoryMessage[] {
-    const out: HistoryMessage[] = [];
-    if (!blob || blob.length < 4) return out;
-    const base = bucketSec * 1000;
-    const n = blob.readUInt32LE(0);
-    let p = 4;
-    for (let i = 0; i < n && p + 6 <= blob.length; i++) {
-        const off = blob.readUInt16LE(p); p += 2;
-        const len = blob.readUInt32LE(p); p += 4;
-        if (p + len > blob.length) break;
-        const payload = blob.slice(p, p + len).toString('utf8');
-        p += len;
-        out.push({ connectionId: '', topic, payload, time: base + off });
-    }
-    return out;
-}
-
-function setIndexMeta(db: Database.Database, key: string, value: string | number): void {
-    db.prepare(
-        `INSERT INTO history_index_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value`
-    ).run(key, String(value));
-}
-
-function getIndexMeta(db: Database.Database, key: string): string | null {
-    try {
-        const row = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get(key) as { value: string } | undefined;
-        return row?.value ?? null;
-    } catch {
-        return null;
-    }
-}
-
-function ensureHistoryIndexSchema(db: Database.Database): void {
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS history_index_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        ) WITHOUT ROWID;
-    `);
-    const version = getIndexMeta(db, 'schema_version');
-    const hasPayloadColumn = db.prepare('PRAGMA table_info(history_messages)').all()
-        .some((col) => (col as { name?: string }).name === 'payload');
-    if (version !== HISTORY_INDEX_SCHEMA_VERSION || hasPayloadColumn) {
-        db.exec('DROP TABLE IF EXISTS history_messages;');
-    }
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS history_messages (
-            bucket_ts INTEGER NOT NULL,
-            topic TEXT NOT NULL,
-            msg_index INTEGER NOT NULL,
-            time_ms INTEGER NOT NULL,
-            search_text TEXT NOT NULL,
-            PRIMARY KEY (bucket_ts, topic, msg_index)
-        ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time ON history_messages(time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time ON history_messages(topic, time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic ON history_messages(time_ms, topic);
-    `);
-    setIndexMeta(db, 'schema_version', HISTORY_INDEX_SCHEMA_VERSION);
-}
 
 function detectFts5(db: Database.Database): boolean {
     try {
@@ -135,64 +60,73 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
         db.pragma('temp_store = MEMORY');
-        ensureHistoryIndexSchema(db);
+        ensureHistoryIndexSchema(db, { rebuild: true });
         fts5Enabled = detectFts5(db);
         setIndexMeta(db, 'fts5_enabled', fts5Enabled ? '1' : '0');
-        setIndexMeta(db, 'index_complete', '0');
-        db.exec('DELETE FROM history_messages;');
 
-        const totalRow = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(count), 0) AS messages FROM buckets').get() as { count: number; messages: number };
-        const totalBuckets = totalRow.count;
-        const insertStmt = db.prepare(
-            `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
-             VALUES (?, ?, ?, ?, ?)`
-        );
-        const selectStmt = db.prepare(
-            `SELECT bucket_ts, topic, blob FROM buckets
-             WHERE bucket_ts > ? OR (bucket_ts = ? AND topic > ?)
-             ORDER BY bucket_ts ASC, topic ASC
-             LIMIT ?`
-        );
-        const writeRows = db.transaction((rows: { bucket_ts: number; topic: string; blob: Buffer }[]) => {
-            for (const row of rows) {
-                const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
-                for (let i = 0; i < decoded.length; i++) {
-                    const item = decoded[i];
-                    insertStmt.run(row.bucket_ts, row.topic, i, item.time, normalizeSearchText(row.topic, item.payload));
+        for (let attempt = 0; attempt < 2; attempt++) {
+            processedBuckets = 0;
+            processedMessages = 0;
+            setIndexMeta(db, 'index_complete', '0');
+            setIndexMeta(db, 'index_dirty_at', '0');
+            db.exec('DELETE FROM history_messages;');
+
+            const totalRow = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(count), 0) AS messages FROM buckets').get() as { count: number; messages: number };
+            const totalBuckets = totalRow.count;
+            const insertStmt = db.prepare(
+                `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            );
+            const selectStmt = db.prepare(
+                `SELECT bucket_ts, topic, blob FROM buckets
+                 WHERE bucket_ts > ? OR (bucket_ts = ? AND topic > ?)
+                 ORDER BY bucket_ts ASC, topic ASC
+                 LIMIT ?`
+            );
+            const writeRows = db.transaction((rows: { bucket_ts: number; topic: string; blob: Buffer }[]) => {
+                for (const row of rows) {
+                    const entries = iterateBucketEntries(row.blob, row.bucket_ts);
+                    for (const entry of entries) {
+                        insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, normalizeSearchText(row.topic, entry.payload), entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+                    }
+                    processedBuckets++;
+                    processedMessages += entries.length;
                 }
-                processedBuckets++;
-                processedMessages += decoded.length;
+            });
+            let lastReport = 0;
+            let lastBucketTs = -8640000000;
+            let lastTopic = '';
+            while (processedBuckets < totalBuckets) {
+                const rows = selectStmt.all(lastBucketTs, lastBucketTs, lastTopic, 256) as { bucket_ts: number; topic: string; blob: Buffer }[];
+                if (rows.length === 0) break;
+                writeRows(rows);
+                const tail = rows[rows.length - 1];
+                lastBucketTs = tail.bucket_ts;
+                lastTopic = tail.topic;
+                const now = Date.now();
+                if (now - lastReport > 300) {
+                    lastReport = now;
+                    sendProgress({
+                        ...progress,
+                        filePath: file.path,
+                        processedBuckets: progress.processedBuckets + processedBuckets,
+                        processedMessages: progress.processedMessages + processedMessages,
+                        totalBuckets,
+                        percent: calcPercent(progress.processedFiles, progress.totalFiles),
+                        fts5Enabled,
+                        message: `正在建立索引：${path.basename(file.path)}`
+                    });
+                }
             }
-        });
-        let lastReport = 0;
-        let lastBucketTs = -8640000000;
-        let lastTopic = '';
-        while (processedBuckets < totalBuckets) {
-            const rows = selectStmt.all(lastBucketTs, lastBucketTs, lastTopic, 256) as { bucket_ts: number; topic: string; blob: Buffer }[];
-            if (rows.length === 0) break;
-            writeRows(rows);
-            const tail = rows[rows.length - 1];
-            lastBucketTs = tail.bucket_ts;
-            lastTopic = tail.topic;
-            const now = Date.now();
-            if (now - lastReport > 300) {
-                lastReport = now;
-                sendProgress({
-                    ...progress,
-                    filePath: file.path,
-                    processedBuckets: progress.processedBuckets + processedBuckets,
-                    processedMessages: progress.processedMessages + processedMessages,
-                    totalBuckets,
-                    percent: calcPercent(progress.processedFiles, progress.totalFiles),
-                    fts5Enabled,
-                    message: `正在建立索引：${path.basename(file.path)}`
-                });
+            setIndexMeta(db, 'indexed_bucket_count', processedBuckets);
+            setIndexMeta(db, 'indexed_message_count', processedMessages);
+            setIndexMeta(db, 'last_indexed_at', Date.now());
+            if (getIndexMeta(db, 'index_dirty_at') === '0') {
+                setIndexMeta(db, 'index_complete', '1');
+                return { buckets: processedBuckets, messages: processedMessages, fts5Enabled };
             }
         }
-        setIndexMeta(db, 'indexed_bucket_count', processedBuckets);
-        setIndexMeta(db, 'indexed_message_count', processedMessages);
-        setIndexMeta(db, 'last_indexed_at', Date.now());
-        setIndexMeta(db, 'index_complete', '1');
+
         return { buckets: processedBuckets, messages: processedMessages, fts5Enabled };
     } finally {
         db.close();

@@ -178,8 +178,6 @@ export const useMessageStore = defineStore('messages', () => {
             changed = true;
         }
         if (!changed) return;
-        b.timelineVersion++;
-        b.topicsVersion++;
     }
 
     function clearAll(connectionId: string): void {

@@ -11,7 +11,8 @@ const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_LIMIT = 5000;
 const INDEX_QUERY_CHUNK_SIZE = 1000;
 const BUCKET_QUERY_CHUNK_SIZE = 256;
-const HISTORY_INDEX_SCHEMA_VERSION = '2';
+const HISTORY_INDEX_SCHEMA_VERSION = '3';
+const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '2';
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
@@ -127,6 +128,13 @@ function dayStartTsFromKey(dayKey) {
 
 function dayEndTsFromKey(dayKey) {
   return dayStartTsFromKey(dayKey) + 86_400_000 - 1;
+}
+
+function readPayloadSlice(blob, payloadOffset, payloadLen) {
+  if (!Buffer.isBuffer(blob)) return null;
+  if (!Number.isSafeInteger(payloadOffset) || !Number.isSafeInteger(payloadLen)) return null;
+  if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > blob.length) return null;
+  return blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
 }
 
 function decodeBucket(blob, bucketSec, topic, connectionId) {
@@ -562,10 +570,15 @@ function getIndexMeta(db, key) {
   return row ? String(row.value ?? '') : null;
 }
 
-function hasUsableIndex(db) {
-  if (!tableExists(db, 'history_messages')) return false;
-  return getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION
-    && getIndexMeta(db, 'index_complete') === '1';
+function getHistoryIndexSchemaVersion(db) {
+  const version = getIndexMeta(db, 'schema_version');
+  return version === HISTORY_INDEX_SCHEMA_VERSION || version === LEGACY_HISTORY_INDEX_SCHEMA_VERSION ? version : null;
+}
+
+function getUsableIndexVersion(db) {
+  if (!tableExists(db, 'history_messages')) return null;
+  if (getIndexMeta(db, 'index_complete') !== '1') return null;
+  return getHistoryIndexSchemaVersion(db);
 }
 
 function buildQueryState(options) {
@@ -601,8 +614,10 @@ function acceptHistoryMessage(state, message, searchText) {
   return state.out.length >= state.limit;
 }
 
-function queryIndexedFile(db, connectionId, state) {
-  let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+function queryIndexedFile(db, connectionId, state, schemaVersion) {
+  let sql = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+    ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
+    : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
   const params = [state.startTime, state.endTime];
   const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
   const bucketCache = new Map();
@@ -626,18 +641,25 @@ function queryIndexedFile(db, connectionId, state) {
         continue;
       }
       const cacheKey = `${row.bucket_ts}|${row.topic}`;
-      let decoded = bucketCache.get(cacheKey);
-      if (!decoded) {
-        const bucket = bucketStmt.get(row.bucket_ts, row.topic);
-        decoded = bucket ? decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId) : [];
-        bucketCache.set(cacheKey, decoded);
+      const bucket = bucketStmt.get(row.bucket_ts, row.topic);
+      if (!bucket) continue;
+      let payload = null;
+      if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+        payload = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
       }
-      const item = decoded[row.msg_index];
-      if (!item) continue;
+      if (payload == null) {
+        let decoded = bucketCache.get(cacheKey);
+        if (!decoded) {
+          decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId);
+          bucketCache.set(cacheKey, decoded);
+        }
+        payload = decoded[row.msg_index]?.payload ?? null;
+      }
+      if (payload == null) continue;
       state.out.push({
         connectionId,
         topic: row.topic,
-        payload: item.payload,
+        payload,
         time: row.time_ms
       });
       if (state.out.length >= state.limit) return;
@@ -700,7 +722,8 @@ function queryHistory(logDir, options) {
       if (state.out.length >= state.limit) break;
       const db = new Database(filePath, { readonly: true, fileMustExist: true });
       try {
-        if (hasUsableIndex(db)) queryIndexedFile(db, connectionId, state);
+        const indexSchemaVersion = getUsableIndexVersion(db);
+        if (indexSchemaVersion) queryIndexedFile(db, connectionId, state, indexSchemaVersion);
         else queryBucketFile(db, connectionId, state);
       } finally {
         db.close();
@@ -727,7 +750,7 @@ function readHistoryIndexStatus(logDir, options) {
       const db = new Database(filePath, { readonly: true, fileMustExist: true });
       try {
         const complete = getIndexMeta(db, 'index_complete') === '1'
-          && getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION;
+          && Boolean(getHistoryIndexSchemaVersion(db));
         const messageCount = Number(getIndexMeta(db, 'indexed_message_count') || 0);
         if (complete) status.indexedFiles += 1;
         else status.incompleteFiles += 1;

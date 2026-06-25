@@ -5,34 +5,69 @@
  *   table buckets:
  *     bucket_ts   INTEGER   -- 秒级时间戳 (second precision)
  *     topic       TEXT
- *     blob        BLOB      -- 长度前缀拼接：[u32 count][u32 len1][bytes1][u32 len2][bytes2]...
- *     count       INTEGER
- *     bytes       INTEGER
+ *     blob        BLOB      -- [u32 count][u16 offset_ms][u32 len][payload_utf8]...
+ *     count       INTEGER   -- blob 内消息条数，与 header count 保持一致
+ *     bytes       INTEGER   -- blob 字节数
  *     PRIMARY KEY(bucket_ts, topic)
  *
- * 写入策略：主进程把单条消息入内存合并器 pendingBuckets，按 (ts_sec, topic) 聚合；
- *   每 STORAGE_FLUSH_MS 或 pending 总 payload 超过 STORAGE_FLUSH_BYTES 后，序列化成 Buffer 并 UPSERT 到对应 day.db。
- *   如果同一 (ts_sec, topic) 已存在，采用 append：读取旧 blob、拼接、写回，一次事务完成。
+ * 写入策略：主进程把单条消息入内存合并器 pending，按 (ts_sec, topic) 聚合；
+ *   每 STORAGE_FLUSH_MS 或 pending 总 payload 超过 STORAGE_FLUSH_BYTES 后写入对应 day.db。
+ *   如果同一 (ts_sec, topic) 已存在，保留旧 blob，只追加新条目的编码尾部并修补 header count。
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import type { HistoryIndexStatus, HistoryKeywordJoin, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
+import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
+import {
+    appendEntriesToBucketBlob,
+    decodeBucket,
+    encodeBucket,
+    iterateBucketEntries,
+    validateBucketBlob,
+    type BucketEntry,
+    type BucketItem,
+    type ExistingBucketRow
+} from './history-bucket-codec';
+import {
+    DATE_KEY_FILE_RE,
+    dateKeyFromTs,
+    dayEndTsFromKey,
+    dayStartTsFromKey,
+    matchesText,
+    normalizeConditions,
+    normalizeSearchText,
+    parseKeywordTerms,
+    sanitizeConnectionId
+} from './history-query-common';
+import {
+    ensureHistoryIndexSchema,
+    getHistoryIndexSchemaVersion,
+    getIndexMeta,
+    HISTORY_INDEX_SCHEMA_VERSION,
+    LEGACY_HISTORY_INDEX_SCHEMA_VERSION,
+    setIndexMeta
+} from './history-index-schema';
 
-const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_OPEN_LOG_DBS = 24;
-const HISTORY_INDEX_SCHEMA_VERSION = '2';
 
 let LOG_ROOT = '';
-const logDbCache = new Map<string, { db: Database.Database; getStmt: Database.Statement; upsertStmt: Database.Statement }>();
+
+interface LogDbPack {
+    db: Database.Database;
+    getStmt: Database.Statement;
+    upsertStmt: Database.Statement;
+    insertIndexStmt: Database.Statement;
+    countIndexStmt: Database.Statement;
+    insertBackupStmt: Database.Statement;
+}
+
+const logDbCache = new Map<string, LogDbPack>();
 
 /** 单条消息条目（尚未合批） */
-interface PendingEntry {
+interface PendingEntry extends BucketItem {
     connectionId: string;
     topic: string;
-    payload: string;
-    tsMs: number;
 }
 
 const pending: PendingEntry[] = [];
@@ -49,28 +84,6 @@ export function initStorage(logRoot: string): void {
 
 export function getLogRoot(): string {
     return LOG_ROOT;
-}
-
-function sanitizeConnectionId(id: string): string {
-    if (!id) return '_none';
-    const s = String(id).replace(/[^a-zA-Z0-9._-]/g, '_');
-    return s.length > 120 ? s.slice(0, 120) : s || '_empty';
-}
-
-function dateKeyFromTs(tsMs: number): string {
-    const d = new Date(tsMs);
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-}
-
-function dayStartTsFromKey(dk: string): number {
-    const [y, mo, da] = dk.split('-').map(Number);
-    return new Date(y, mo - 1, da, 0, 0, 0, 0).getTime();
-}
-function dayEndTsFromKey(dk: string): number {
-    return dayStartTsFromKey(dk) + 86_400_000 - 1;
 }
 
 function touchCacheKey(key: string): void {
@@ -91,79 +104,73 @@ function evictLogDbIfNeeded(): void {
     }
 }
 
-function ensureHistoryIndexSchema(db: Database.Database): void {
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS history_index_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        ) WITHOUT ROWID;
-    `);
-    const version = getIndexMeta(db, 'schema_version');
-    const hasPayloadColumn = db.prepare("PRAGMA table_info(history_messages)").all()
-        .some((col) => (col as { name?: string }).name === 'payload');
-    const resetIndex = version !== HISTORY_INDEX_SCHEMA_VERSION || hasPayloadColumn;
-    if (resetIndex) {
-        db.exec('DROP TABLE IF EXISTS history_messages;');
-    }
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS history_messages (
-            bucket_ts INTEGER NOT NULL,
-            topic TEXT NOT NULL,
-            msg_index INTEGER NOT NULL,
-            time_ms INTEGER NOT NULL,
-            search_text TEXT NOT NULL,
-            PRIMARY KEY (bucket_ts, topic, msg_index)
-        ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time ON history_messages(time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time ON history_messages(topic, time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic ON history_messages(time_ms, topic);
-    `);
-    db.prepare(
-        `INSERT INTO history_index_meta (key, value) VALUES ('schema_version', ?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value`
-    ).run(HISTORY_INDEX_SCHEMA_VERSION);
-    const complete = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get('index_complete') as { value: string } | undefined;
-    if (resetIndex || !complete) {
-        const row = db.prepare('SELECT COUNT(*) AS count FROM buckets').get() as { count: number };
-        setIndexMeta(db, 'index_complete', row.count > 0 ? '0' : '1');
-        setIndexMeta(db, 'indexed_message_count', 0);
+function getCompleteHistoryIndexVersion(db: Database.Database): string | null {
+    const version = getHistoryIndexSchemaVersion(db);
+    return version && getIndexMeta(db, 'index_complete') === '1' ? version : null;
+}
+
+function incrementIndexMeta(db: Database.Database, key: string, delta: number): void {
+    if (delta <= 0) return;
+    const updated = db.prepare(
+        `UPDATE history_index_meta
+         SET value = CAST(value AS INTEGER) + ?
+         WHERE key = ?`
+    ).run(delta, key);
+    if (updated.changes === 0) setIndexMeta(db, key, delta);
+}
+
+function markIndexDirty(db: Database.Database): void {
+    setIndexMeta(db, 'index_complete', '0');
+    setIndexMeta(db, 'index_dirty_at', Date.now());
+}
+
+function refreshIndexedCounts(db: Database.Database): void {
+    const messageRow = db.prepare('SELECT COUNT(*) AS count FROM history_messages').get() as { count: number };
+    const bucketRow = db.prepare('SELECT COUNT(*) AS count FROM (SELECT 1 FROM history_messages GROUP BY bucket_ts, topic)').get() as { count: number };
+    setIndexMeta(db, 'indexed_message_count', messageRow.count);
+    setIndexMeta(db, 'indexed_bucket_count', bucketRow.count);
+}
+
+function appendBucketIndex(insertStmt: Database.Statement, schemaVersion: string, bucketSec: number, topic: string, entries: BucketEntry[]): void {
+    for (const entry of entries) {
+        if (schemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION) {
+            insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, normalizeSearchText(topic, entry.payload));
+        } else {
+            insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, normalizeSearchText(topic, entry.payload), entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+        }
     }
 }
 
-function setIndexMeta(db: Database.Database, key: string, value: string | number): void {
-    db.prepare(
-        `INSERT INTO history_index_meta (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value`
-    ).run(key, String(value));
-}
-
-function getIndexMeta(db: Database.Database, key: string): string | null {
-    try {
-        const row = db.prepare('SELECT value FROM history_index_meta WHERE key = ?').get(key) as { value: string } | undefined;
-        return row?.value ?? null;
-    } catch {
-        return null;
-    }
-}
-
-function normalizeSearchText(topic: string, payload: string): string {
-    return `${normalizeKeyword(topic)}${normalizeKeyword(payload)}`;
-}
-
-function replaceBucketIndex(db: Database.Database, bucketSec: number, topic: string, items: { payload: string; tsMs: number }[]): void {
+function replaceBucketIndex(db: Database.Database, schemaVersion: string, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     const deleteStmt = db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
-    const insertStmt = db.prepare(
-        `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
-         VALUES (?, ?, ?, ?, ?)`
+    const insertStmt = db.prepare(schemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION
+        ? `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
+           VALUES (?, ?, ?, ?, ?)`
+        : `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     deleteStmt.run(bucketSec, topic);
-    for (let i = 0; i < items.length; i++) {
-        const item = items[i];
-        insertStmt.run(bucketSec, topic, i, item.tsMs, normalizeSearchText(topic, item.payload));
-    }
+    appendBucketIndex(insertStmt, schemaVersion, bucketSec, topic, entries);
 }
 
-function getOrOpenLogDb(san: string, dk: string) {
+function backupBucketBlob(pack: LogDbPack, bucketSec: number, topic: string, existing: ExistingBucketRow, reason?: string): boolean {
+    let savedAt = Date.now();
+    for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+            pack.insertBackupStmt.run(bucketSec, topic, savedAt, reason || 'invalid bucket blob', existing.blob, existing.count, existing.bytes);
+            return true;
+        } catch (error) {
+            savedAt++;
+            if (attempt === 4) {
+                console.error('[storage] backup suspicious bucket failed', bucketSec, topic, error);
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     const key = `${san}|${dk}`;
     const cached = logDbCache.get(key);
     if (cached) {
@@ -185,8 +192,18 @@ function getOrOpenLogDb(san: string, dk: string) {
             PRIMARY KEY (bucket_ts, topic)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS idx_buckets_ts ON buckets(bucket_ts);
+        CREATE TABLE IF NOT EXISTS bucket_blob_backups (
+            bucket_ts INTEGER NOT NULL,
+            topic     TEXT NOT NULL,
+            saved_at  INTEGER NOT NULL,
+            reason    TEXT NOT NULL,
+            blob      BLOB NOT NULL,
+            count     INTEGER NOT NULL,
+            bytes     INTEGER NOT NULL,
+            PRIMARY KEY (bucket_ts, topic, saved_at)
+        ) WITHOUT ROWID;
     `);
-    ensureHistoryIndexSchema(db);
+    ensureHistoryIndexSchema(db, { initializeCompletion: true });
     try {
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
@@ -198,45 +215,21 @@ function getOrOpenLogDb(san: string, dk: string) {
         `INSERT INTO buckets (bucket_ts, topic, blob, count, bytes) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(bucket_ts, topic) DO UPDATE SET blob=excluded.blob, count=excluded.count, bytes=excluded.bytes`
     );
-    const pack = { db, getStmt, upsertStmt };
+    const indexSchemaVersion = getHistoryIndexSchemaVersion(db) ?? HISTORY_INDEX_SCHEMA_VERSION;
+    const insertIndexStmt = db.prepare(indexSchemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION
+        ? `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
+           VALUES (?, ?, ?, ?, ?)`
+        : `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const countIndexStmt = db.prepare('SELECT COUNT(*) AS count FROM history_messages WHERE bucket_ts = ? AND topic = ?');
+    const insertBackupStmt = db.prepare(
+        `INSERT INTO bucket_blob_backups (bucket_ts, topic, saved_at, reason, blob, count, bytes)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    const pack: LogDbPack = { db, getStmt, upsertStmt, insertIndexStmt, countIndexStmt, insertBackupStmt };
     logDbCache.set(key, pack);
     return pack;
-}
-
-// ---------------- encode / decode ----------------
-/** 编码：[u32 count][u32 firstTsOffsetMs relative to bucketSec*1000][u32 len1][bytes1][i32 tsOffset2][u32 len2][bytes2]... */
-function encodeBucket(items: { payload: string; tsMs: number }[], bucketSec: number): Buffer {
-    const base = bucketSec * 1000;
-    const buffers: Buffer[] = [];
-    const head = Buffer.alloc(4);
-    head.writeUInt32LE(items.length, 0);
-    buffers.push(head);
-    for (const it of items) {
-        const off = Math.max(0, Math.min(65535, it.tsMs - base));
-        const data = Buffer.from(it.payload, 'utf8');
-        const meta = Buffer.alloc(6);
-        meta.writeUInt16LE(off, 0);
-        meta.writeUInt32LE(data.length, 2);
-        buffers.push(meta, data);
-    }
-    return Buffer.concat(buffers);
-}
-
-function decodeBucket(blob: Buffer, bucketSec: number, topic: string): HistoryMessage[] {
-    const out: HistoryMessage[] = [];
-    if (!blob || blob.length < 4) return out;
-    const base = bucketSec * 1000;
-    const n = blob.readUInt32LE(0);
-    let p = 4;
-    for (let i = 0; i < n && p + 6 <= blob.length; i++) {
-        const off = blob.readUInt16LE(p); p += 2;
-        const len = blob.readUInt32LE(p); p += 4;
-        if (p + len > blob.length) break;
-        const payload = blob.slice(p, p + len).toString('utf8');
-        p += len;
-        out.push({ connectionId: '', topic, payload, time: base + off });
-    }
-    return out;
 }
 
 // ---------------- flush ----------------
@@ -259,6 +252,17 @@ function scheduleFlush(): void {
     }, STORAGE_FLUSH_MS);
 }
 
+function requeueGroups(groups: Map<string, { connectionId: string; sec: number; topic: string; items: BucketItem[] }>): void {
+    const retry: PendingEntry[] = [];
+    for (const g of groups.values()) {
+        for (const item of g.items) {
+            retry.push({ connectionId: g.connectionId, topic: g.topic, payload: item.payload, tsMs: item.tsMs });
+            pendingBytes += item.payload.length + g.topic.length + 16;
+        }
+    }
+    if (retry.length > 0) pending.unshift(...retry);
+}
+
 /** 按 (san, dk, sec, topic) 聚合 pending，然后对每个 day.db 开一个事务批量 UPSERT */
 export function flushStorage(): void {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
@@ -267,7 +271,7 @@ export function flushStorage(): void {
     pendingBytes = 0;
 
     // 分组：dayKey -> (sec|topic -> items[])
-    const byDay = new Map<string, Map<string, { sec: number; topic: string; items: { payload: string; tsMs: number }[] }>>();
+    const byDay = new Map<string, Map<string, { connectionId: string; sec: number; topic: string; items: BucketItem[] }>>();
 
     for (let i = 0; i < batch.length; i++) {
         const e = batch[i];
@@ -279,7 +283,7 @@ export function flushStorage(): void {
         if (!m) { m = new Map(); byDay.set(dayKey, m); }
         const bk = `${sec}|${e.topic}`;
         let g = m.get(bk);
-        if (!g) { g = { sec, topic: e.topic, items: [] }; m.set(bk, g); }
+        if (!g) { g = { connectionId: e.connectionId, sec, topic: e.topic, items: [] }; m.set(bk, g); }
         g.items.push({ payload: e.payload, tsMs: e.tsMs });
     }
 
@@ -289,28 +293,95 @@ export function flushStorage(): void {
         const dk = dayKey.slice(pipe + 1);
         try {
             const pack = getOrOpenLogDb(san, dk);
+            const indexSchemaVersion = getCompleteHistoryIndexVersion(pack.db);
+            const wasIndexComplete = Boolean(indexSchemaVersion);
             let indexFailed = false;
+            let indexedMessageDelta = 0;
+            let indexedBucketDelta = 0;
             const txn = pack.db.transaction(() => {
                 for (const g of groups.values()) {
-                    const existing = pack.getStmt.get(g.sec, g.topic) as { blob: Buffer; count: number; bytes: number } | undefined;
-                    const items = existing
-                        ? [...decodeBucket(existing.blob, g.sec, g.topic).map((m) => ({ payload: m.payload, tsMs: m.time })), ...g.items]
-                        : g.items;
-                    const blob = encodeBucket(items, g.sec);
-                    pack.upsertStmt.run(g.sec, g.topic, blob, items.length, blob.length);
+                    const existing = pack.getStmt.get(g.sec, g.topic) as ExistingBucketRow | undefined;
+                    let startIndex = 0;
+                    let nextBlob: Buffer | null = null;
+                    let isNewBucket = false;
+                    let canAppendIndex = wasIndexComplete && !indexFailed;
+
+                    if (existing) {
+                        const validation = validateBucketBlob(existing.blob, existing.count, existing.bytes);
+                        if (validation.valid) {
+                            startIndex = validation.count;
+                            const next = appendEntriesToBucketBlob(existing.blob, validation.count, g.items, g.sec);
+                            nextBlob = next.blob;
+                            pack.upsertStmt.run(g.sec, g.topic, next.blob, next.count, next.bytes);
+                            if (canAppendIndex) {
+                                const indexRow = pack.countIndexStmt.get(g.sec, g.topic) as { count: number } | undefined;
+                                if ((indexRow?.count ?? 0) !== startIndex) {
+                                    canAppendIndex = false;
+                                    const entries = iterateBucketEntries(next.blob, g.sec);
+                                    try {
+                                        replaceBucketIndex(pack.db, indexSchemaVersion!, g.sec, g.topic, entries);
+                                        refreshIndexedCounts(pack.db);
+                                        indexedMessageDelta = 0;
+                                        indexedBucketDelta = 0;
+                                    } catch (error) {
+                                        indexFailed = true;
+                                        console.error('[storage] repair bucket index', dayKey, g.topic, error);
+                                    }
+                                }
+                            }
+                        } else {
+                            indexFailed = true;
+                            canAppendIndex = false;
+                            if (Buffer.isBuffer(existing.blob)) {
+                                backupBucketBlob(pack, g.sec, g.topic, existing, validation.reason);
+                            }
+                            if (validation.structureValid && Buffer.isBuffer(existing.blob)) {
+                                const next = appendEntriesToBucketBlob(existing.blob, validation.count, g.items, g.sec);
+                                nextBlob = next.blob;
+                                pack.upsertStmt.run(g.sec, g.topic, next.blob, next.count, next.bytes);
+                            } else {
+                                const oldItems = Buffer.isBuffer(existing.blob)
+                                    ? decodeBucket(existing.blob, g.sec, g.topic).map((m) => ({ payload: m.payload, tsMs: m.time }))
+                                    : [];
+                                const items = [...oldItems, ...g.items];
+                                const blob = encodeBucket(items, g.sec);
+                                nextBlob = blob;
+                                pack.upsertStmt.run(g.sec, g.topic, blob, items.length, blob.length);
+                            }
+                            console.warn('[storage] rewrite suspicious bucket', dayKey, g.topic, validation.reason);
+                        }
+                    } else {
+                        isNewBucket = true;
+                        const blob = encodeBucket(g.items, g.sec);
+                        nextBlob = blob;
+                        pack.upsertStmt.run(g.sec, g.topic, blob, g.items.length, blob.length);
+                    }
+
+                    if (!canAppendIndex || !nextBlob || !indexSchemaVersion) continue;
                     try {
-                        replaceBucketIndex(pack.db, g.sec, g.topic, items);
+                        const entries = iterateBucketEntries(nextBlob, g.sec).slice(startIndex);
+                        appendBucketIndex(pack.insertIndexStmt, indexSchemaVersion, g.sec, g.topic, entries);
+                        indexedMessageDelta += entries.length;
+                        if (isNewBucket) indexedBucketDelta++;
                     } catch (error) {
                         indexFailed = true;
-                        console.error('[storage] index bucket', dayKey, g.topic, error);
+                        console.error('[storage] append bucket index', dayKey, g.topic, error);
                     }
                 }
                 if (indexFailed) {
-                    setIndexMeta(pack.db, 'index_complete', '0');
+                    markIndexDirty(pack.db);
+                } else if (wasIndexComplete) {
+                    incrementIndexMeta(pack.db, 'indexed_message_count', indexedMessageDelta);
+                    incrementIndexMeta(pack.db, 'indexed_bucket_count', indexedBucketDelta);
+                    if (indexedMessageDelta > 0) setIndexMeta(pack.db, 'last_indexed_at', Date.now());
+                } else {
+                    markIndexDirty(pack.db);
                 }
             });
             txn();
         } catch (e) {
+            requeueGroups(groups);
+            scheduleFlush();
             console.error('[storage] flush day', dayKey, e);
         }
     }
@@ -374,56 +445,6 @@ export function readRecentByConnection(connectionId: string, limit = 5000): Hist
         }
     }
     return out;
-}
-
-function normalizeKeyword(k: string): string {
-    return String(k).replace(/\s+/gu, '').toLowerCase();
-}
-
-function parseKeywordTerms(input: string | string[]): string[] {
-    const seen = new Set<string>();
-    const out: string[] = [];
-    const items = Array.isArray(input) ? input : [input];
-    for (const part of items) {
-        const term = normalizeKeyword(part);
-        if (!term || seen.has(term)) continue;
-        seen.add(term);
-        out.push(term);
-    }
-    return out;
-}
-
-interface NormalizedCondition {
-    join: HistoryKeywordJoin;
-    term: string;
-}
-
-function normalizeConditions(conditions?: HistoryQueryOptions['conditions']): NormalizedCondition[] {
-    return (conditions ?? [])
-        .map((item) => ({ join: item.join, term: normalizeKeyword(item.term) }))
-        .filter((item) => item.term);
-}
-
-function matchesConditions(hay: string, conditions: NormalizedCondition[]): boolean {
-    if (conditions.length === 0) return true;
-    let result = hay.includes(conditions[0].term);
-    for (let i = 1; i < conditions.length; i++) {
-        const item = conditions[i];
-        const hit = hay.includes(item.term);
-        if (item.join === 'or') result = result || hit;
-        else if (item.join === 'not') result = result && !hit;
-        else result = result && hit;
-    }
-    return result;
-}
-
-function matchesText(topic: string, payload: string, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): boolean {
-    if (conditions.length === 0 && terms.length === 0) return true;
-    const hay = `${normalizeKeyword(topic)}${normalizeKeyword(payload)}`;
-    if (conditions.length) return matchesConditions(hay, conditions);
-    return keywordLogic === 'or'
-        ? terms.some((term) => hay.includes(term))
-        : terms.every((term) => hay.includes(term));
 }
 
 export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
@@ -545,8 +566,8 @@ export function getHistoryIndexStatus(connectionId?: string | null): HistoryInde
             const db = new Database(path.join(dir, file), { readonly: true });
             try {
                 const complete = getIndexMeta(db, 'index_complete') === '1';
-                const version = getIndexMeta(db, 'schema_version');
-                if (complete && version === HISTORY_INDEX_SCHEMA_VERSION) status.indexedFiles++;
+                const version = getHistoryIndexSchemaVersion(db);
+                if (complete && version) status.indexedFiles++;
                 else status.incompleteFiles++;
                 if (getIndexMeta(db, 'fts5_enabled') === '1') status.fts5Enabled = true;
                 const indexedCount = Number(getIndexMeta(db, 'indexed_message_count') || 0);

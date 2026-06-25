@@ -61,6 +61,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     let resizeObserver: ResizeObserver | null = null;
     let scrollRaf: number | null = null;
     let restoreRaf: number | null = null;
+    let scrollVersion = 0;
     let snapshotKeys: DynamicVirtualKey[] = [];
     let snapshotPrefix: number[] = [0];
 
@@ -170,10 +171,16 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     }
 
     function scheduleRestore(anchor: Anchor | null): void {
+        const versionAtSchedule = scrollVersion;
         if (restoreRaf != null) cancelAnimationFrame(restoreRaf);
         void nextTick(() => {
             restoreRaf = requestAnimationFrame(() => {
                 restoreRaf = null;
+                if (!opts.stickToStart.value && versionAtSchedule !== scrollVersion) {
+                    updateViewport();
+                    syncSnapshot();
+                    return;
+                }
                 restoreAnchor(anchor);
             });
         });
@@ -193,7 +200,9 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     function updateViewport(): void {
         const el = opts.containerRef.value;
         if (!el) return;
-        scrollTop.value = el.scrollTop;
+        const nextScrollTop = el.scrollTop;
+        if (Math.abs(nextScrollTop - scrollTop.value) >= 1) scrollVersion++;
+        scrollTop.value = nextScrollTop;
         viewportHeight.value = el.clientHeight;
         containerWidth.value = el.clientWidth;
     }

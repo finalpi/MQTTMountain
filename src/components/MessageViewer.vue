@@ -39,6 +39,8 @@ interface FilterCondition {
 }
 const filterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
 const activeFilterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
+const autoFollow = ref(true);
+const showJumpBtn = ref(false);
 const DETAIL_HISTORY_LIMIT = 200;
 const selectedTopicHistoryRows = ref<HistoryMessage[]>([]);
 const selectedTopicHistoryOffset = ref(0);
@@ -111,7 +113,7 @@ const timelineList = computed<MsgRow[]>(() => {
 type TopicSort = 'manual' | 'insert' | 'recent' | 'name' | 'count';
 const topicSort = ref<TopicSort>('manual');
 
-const topicList = computed<TopicView[]>(() => {
+const liveTopicList = computed<TopicView[]>(() => {
     const b = bucket.value;
     void b.topicsVersion;
     const all: TopicView[] = [];
@@ -133,19 +135,36 @@ const topicList = computed<TopicView[]>(() => {
     const orderIndex = new Map<string, number>();
     b.topicOrder.forEach((topic, index) => orderIndex.set(topic, index));
     const pinnedWeight = (item: TopicView): number => item.pinned ? 0 : 1;
+    const stableIndex = (item: TopicView): number => orderIndex.get(item.topic) ?? Number.MAX_SAFE_INTEGER;
     switch (topicSort.value) {
         case 'manual':
-            all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || (orderIndex.get(a.topic) ?? Number.MAX_SAFE_INTEGER) - (orderIndex.get(b.topic) ?? Number.MAX_SAFE_INTEGER));
+            all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || stableIndex(a) - stableIndex(b));
             break;
         case 'insert':
-            all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || (orderIndex.get(a.topic) ?? Number.MAX_SAFE_INTEGER) - (orderIndex.get(b.topic) ?? Number.MAX_SAFE_INTEGER));
+            all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || stableIndex(a) - stableIndex(b));
             break;
-        case 'recent': all.sort((a, b) => b.lastTime - a.lastTime); break;
+        case 'recent': all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || b.lastTime - a.lastTime || stableIndex(a) - stableIndex(b)); break;
         case 'name': all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || a.topic.localeCompare(b.topic)); break;
-        case 'count': all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || b.total - a.total); break;
+        case 'count': all.sort((a, b) => pinnedWeight(a) - pinnedWeight(b) || b.total - a.total || stableIndex(a) - stableIndex(b)); break;
         default: break;
     }
     return all;
+});
+
+const frozenTopicOrder = ref<string[]>([]);
+const topicList = computed<TopicView[]>(() => {
+    const live = liveTopicList.value;
+    if (autoFollow.value || frozenTopicOrder.value.length === 0) return live;
+    const byTopic = new Map(live.map((item) => [item.topic, item]));
+    const out: TopicView[] = [];
+    for (const topic of frozenTopicOrder.value) {
+        const item = byTopic.get(topic);
+        if (!item) continue;
+        out.push(item);
+        byTopic.delete(topic);
+    }
+    out.push(...byTopic.values());
+    return out;
 });
 
 const selectedTopicView = computed<TopicView | null>(() => {
@@ -192,7 +211,7 @@ function realtimeSelectedTopicRows(): MsgRow[] {
     return out;
 }
 
-const selectedTopicMessages = computed<MsgRow[]>(() => {
+const liveSelectedTopicMessages = computed<MsgRow[]>(() => {
     const rows = realtimeSelectedTopicRows();
     const seen = new Set(rows.map(messageDedupeKey));
     selectedTopicHistoryRows.value.forEach((row, index) => {
@@ -208,6 +227,23 @@ const selectedTopicMessages = computed<MsgRow[]>(() => {
         });
     });
     return rows;
+});
+
+const frozenSelectedMessageOrder = ref<string[]>([]);
+const selectedTopicMessages = computed<MsgRow[]>(() => {
+    const live = liveSelectedTopicMessages.value;
+    if (autoFollow.value || frozenSelectedMessageOrder.value.length === 0) return live;
+    const byKey = new Map(live.map((item, index) => [messageRenderKey(item), { item, index }]));
+    const out: MsgRow[] = [];
+    for (const key of frozenSelectedMessageOrder.value) {
+        const hit = byKey.get(key);
+        if (!hit) continue;
+        out.push(hit.item);
+        byKey.delete(key);
+    }
+    const rest = [...byKey.values()].sort((a, b) => a.index - b.index).map((hit) => hit.item);
+    out.push(...rest);
+    return out;
 });
 
 const selectedTopicHistoryStatus = computed(() => {
@@ -365,8 +401,6 @@ interface DynamicListHandle {
 
 const timelineVirtualRef = ref<DynamicListHandle | null>(null);
 const topicVirtualRef = ref<DynamicListHandle | null>(null);
-const autoFollow = ref(true);
-const showJumpBtn = ref(false);
 
 const timelineResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value }));
 const topicListResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value, sort: topicSort.value }));
@@ -408,16 +442,48 @@ function estimateTopicListItemSize(row: TopicView): number {
     return 34 + topicLines * Math.max(15, prefs.fontSize * 1.45);
 }
 
+function freezeTopicOrder(): void {
+    frozenTopicOrder.value = liveTopicList.value.map((item) => item.topic);
+}
+
+function freezeSelectedMessageOrder(): void {
+    frozenSelectedMessageOrder.value = liveSelectedTopicMessages.value.map(messageRenderKey);
+}
+
+function freezeVisibleOrder(): void {
+    freezeTopicOrder();
+    freezeSelectedMessageOrder();
+}
+
+function unfreezeTopicOrder(): void {
+    frozenTopicOrder.value = [];
+}
+
+function unfreezeSelectedMessageOrder(): void {
+    frozenSelectedMessageOrder.value = [];
+}
+
+function unfreezeVisibleOrder(): void {
+    unfreezeTopicOrder();
+    unfreezeSelectedMessageOrder();
+}
+
 function onUserScroll(): void {
     const el = currentScroll();
     if (!el) return;
     // 用户离开顶部 → 关闭跟随；回到顶部附近 → 恢复跟随
     if (el.scrollTop > 60) {
-        if (autoFollow.value) autoFollow.value = false;
+        if (autoFollow.value) {
+            freezeVisibleOrder();
+            autoFollow.value = false;
+        }
         showJumpBtn.value = true;
     } else {
         showJumpBtn.value = false;
-        autoFollow.value = true;
+        if (!autoFollow.value) {
+            autoFollow.value = true;
+            unfreezeVisibleOrder();
+        }
     }
     if (viewMode.value === 'topic' && el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
         void loadMoreSelectedTopicHistory();
@@ -428,6 +494,7 @@ function scrollToTop(smooth = true): void {
     currentVirtual()?.scrollToTop(smooth);
     autoFollow.value = true;
     showJumpBtn.value = false;
+    unfreezeVisibleOrder();
 }
 
 watch(
@@ -508,7 +575,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                     class="follow-btn"
                     :class="{ active: autoFollow }"
                     :title="autoFollow ? '新消息自动滚动到顶部（点击暂停）' : '恢复跟随新消息'"
-                    @click="autoFollow = !autoFollow; if (autoFollow) scrollToTop(false)"
+                    @click="autoFollow ? (freezeVisibleOrder(), autoFollow = false, showJumpBtn = true) : scrollToTop(false)"
                 >📌 {{ autoFollow ? '跟随中' : '已暂停' }}</button>
             </div>
 

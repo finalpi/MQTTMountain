@@ -98,6 +98,27 @@ export interface HistoryMessage {
     time: number;
 }
 
+export interface HistoryQueryStreamStartRequest {
+    requestId: string;
+    opts: HistoryQueryOptions;
+    chunkSize?: number;
+}
+
+export interface HistoryQueryStreamCancelRequest {
+    requestId: string;
+}
+
+export interface HistoryQueryChunk {
+    requestId: string;
+    rows: HistoryMessage[];
+}
+
+export interface HistoryQueryDone {
+    requestId: string;
+    total: number;
+    truncated: boolean;
+}
+
 export type HistoryKeywordJoin = 'and' | 'or' | 'not';
 
 export interface HistoryKeywordCondition {
@@ -193,6 +214,8 @@ export type IpcChannels = {
     'mqtt:readRecent': (p: { connectionId: string; limit?: number }) => ApiResult<HistoryMessage[]>;
     'mqtt:clearLogs': (connectionId?: string | null) => ApiResult<{ deletedFiles: number }>;
     'history:query': (opts: HistoryQueryOptions) => ApiResult<HistoryMessage[]>;
+    'history:queryStreamStart': (req: HistoryQueryStreamStartRequest) => ApiResult<{ requestId: string }>;
+    'history:queryStreamCancel': (req: HistoryQueryStreamCancelRequest) => ApiResult<{ requestId: string }>;
     'history:export': (req: HistoryExportRequest) => ApiResult<HistoryExportResult>;
     'history:indexStatus': (req?: HistoryIndexRequest) => ApiResult<HistoryIndexStatus>;
     'history:buildIndex': (req?: HistoryIndexRequest) => ApiResult<HistoryIndexResult>;
@@ -222,4 +245,7 @@ export type IpcEvents = {
     'window:focused': () => void;
     'history:exportProgress': (p: HistoryExportProgress) => void;
     'history:indexProgress': (p: HistoryIndexProgress) => void;
+    'history:queryChunk': (p: HistoryQueryChunk) => void;
+    'history:queryDone': (p: HistoryQueryDone) => void;
+    'history:queryError': (p: { requestId: string; message: string }) => void;
 };

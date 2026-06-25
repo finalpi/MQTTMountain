@@ -10,6 +10,8 @@ import type {
     LogDirDataResult,
     HistoryExportRequest,
     HistoryQueryOptions,
+    HistoryQueryStreamCancelRequest,
+    HistoryQueryStreamStartRequest,
     PublishPayload
 } from '../../shared/types';
 import {
@@ -33,7 +35,7 @@ import { rescheduleAutoDelete } from './auto-delete-scheduler';
 import { checkForUpdates, openReleasesPage } from './update-service';
 import { exportHistoryToFile } from './history-export';
 import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
-import { queryHistoryAsync } from './history-query';
+import { cancelHistoryQueryStream, queryHistoryAsync, startHistoryQueryStream } from './history-query';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -173,6 +175,24 @@ export function initIpc(mqttService: MqttService): void {
     ipcMain.handle('history:query', async (_e, opts: HistoryQueryOptions) => {
         try {
             return { success: true, data: await queryHistoryAsync(opts || {}) };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('history:queryStreamStart', (event, req: HistoryQueryStreamStartRequest) => {
+        try {
+            if (!req?.requestId) return { success: false, message: '缺少流式查询 requestId' };
+            startHistoryQueryStream(event.sender, req);
+            return { success: true, data: { requestId: req.requestId } };
+        } catch (e) {
+            return { success: false, message: (e as Error).message };
+        }
+    });
+    ipcMain.handle('history:queryStreamCancel', (_event, req: HistoryQueryStreamCancelRequest) => {
+        try {
+            if (!req?.requestId) return { success: false, message: '缺少流式查询 requestId' };
+            cancelHistoryQueryStream(req.requestId);
+            return { success: true, data: { requestId: req.requestId } };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
