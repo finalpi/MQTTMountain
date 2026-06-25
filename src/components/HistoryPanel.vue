@@ -1,6 +1,6 @@
 ﻿
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
 import { useConnectionStore } from '@/stores/connection';
 import { useToast } from '@/composables/useToast';
 import { useFormatViewer } from '@/composables/useFormatViewer';
@@ -117,6 +117,24 @@ interface TopicGroup {
     lastTime: number;
 }
 
+interface HistoryTopicCache {
+    version: number;
+    totalRows: number;
+    groups: Map<string, TopicGroup>;
+    sorted: TopicGroup[];
+    sortedVersion: number;
+    sortedKey: TopicSort | null;
+}
+
+const historyTopicCache = shallowRef<HistoryTopicCache>({
+    version: 0,
+    totalRows: 0,
+    groups: new Map(),
+    sorted: [],
+    sortedVersion: -1,
+    sortedKey: null
+});
+
 const canReplayToMqtt = computed(() => Boolean(conn.selectedId) && conn.selectedState === 'connected');
 const replaySourceRows = ref<HistoryMessage[]>([]);
 const importedHistoryRows = computed<HistoryMessage[]>(() => importedRows.value.map((row) => ({
@@ -140,30 +158,110 @@ const replayHint = computed(() => {
     return `将真实发布到当前连接：${conn.selected?.name || conn.selectedId}`;
 });
 
-const grouped = computed<TopicGroup[]>(() => {
-    const m = new Map<string, { items: HistoryMessage[]; lastTime: number }>();
-    for (const r of displayRows.value) {
+function sortTopicGroups(list: TopicGroup[], sort: TopicSort): TopicGroup[] {
+    switch (sort) {
+        case 'count': return list.sort((a, b) => b.items.length - a.items.length || a.topic.localeCompare(b.topic));
+        case 'recent': return list.sort((a, b) => b.lastTime - a.lastTime || a.topic.localeCompare(b.topic));
+        case 'name':
+        default: return list.sort((a, b) => a.topic.localeCompare(b.topic));
+    }
+}
+
+function buildTopicGroups(sourceRows: HistoryMessage[]): TopicGroup[] {
+    const m = new Map<string, TopicGroup>();
+    for (const r of sourceRows) {
         let g = m.get(r.topic);
         if (!g) {
-            g = { items: [], lastTime: 0 };
+            g = { topic: r.topic, items: [], lastTime: 0 };
             m.set(r.topic, g);
         }
         g.items.push(r);
         if (r.time > g.lastTime) g.lastTime = r.time;
     }
-    const list: TopicGroup[] = [];
-    for (const [topic, g] of m) list.push({ topic, items: g.items, lastTime: g.lastTime });
-    switch (topicSort.value) {
-        case 'count': list.sort((a, b) => b.items.length - a.items.length); break;
-        case 'recent': list.sort((a, b) => b.lastTime - a.lastTime); break;
-        case 'name':
-        default: list.sort((a, b) => a.topic.localeCompare(b.topic)); break;
+    return sortTopicGroups([...m.values()], topicSort.value);
+}
+
+function resetHistoryGroupCache(): void {
+    historyTopicCache.value = {
+        version: historyTopicCache.value.version + 1,
+        totalRows: 0,
+        groups: new Map(),
+        sorted: [],
+        sortedVersion: -1,
+        sortedKey: null
+    };
+}
+
+function rebuildHistoryGroupCache(): void {
+    const groups = new Map<string, TopicGroup>();
+    for (const row of rows.value) {
+        let group = groups.get(row.topic);
+        if (!group) {
+            group = { topic: row.topic, items: [], lastTime: 0 };
+            groups.set(row.topic, group);
+        }
+        group.items.push(row);
+        if (row.time > group.lastTime) group.lastTime = row.time;
     }
-    return list;
+    historyTopicCache.value = {
+        version: historyTopicCache.value.version + 1,
+        totalRows: rows.value.length,
+        groups,
+        sorted: [],
+        sortedVersion: -1,
+        sortedKey: null
+    };
+}
+
+function appendHistoryRows(newRows: HistoryMessage[]): void {
+    if (!newRows.length) return;
+    rows.value.push(...newRows);
+    const cache = historyTopicCache.value;
+    const groups = new Map(cache.groups);
+    for (const row of newRows) {
+        let group = groups.get(row.topic);
+        if (!group) {
+            group = { topic: row.topic, items: [], lastTime: 0 };
+            groups.set(row.topic, group);
+        }
+        group.items.push(row);
+        if (row.time > group.lastTime) group.lastTime = row.time;
+    }
+    historyTopicCache.value = {
+        version: cache.version + 1,
+        totalRows: cache.totalRows + newRows.length,
+        groups,
+        sorted: cache.sorted,
+        sortedVersion: -1,
+        sortedKey: cache.sortedKey
+    };
+}
+
+function historyGrouped(): TopicGroup[] {
+    let cache = historyTopicCache.value;
+    if (cache.totalRows !== rows.value.length) {
+        rebuildHistoryGroupCache();
+        cache = historyTopicCache.value;
+    }
+    if (cache.sortedVersion === cache.version && cache.sortedKey === topicSort.value) return cache.sorted;
+    const sorted = sortTopicGroups([...cache.groups.values()], topicSort.value);
+    historyTopicCache.value = { ...cache, sorted, sortedVersion: cache.version, sortedKey: topicSort.value };
+    return sorted;
+}
+
+const grouped = computed<TopicGroup[]>(() => {
+    if (dataSource.value === 'history' && !replay.state.running) return historyGrouped();
+    return buildTopicGroups(displayRows.value);
 });
 
 const detail = computed<HistoryMessage[]>(() => {
     if (!selectedTopic.value) return [];
+    if (dataSource.value === 'history' && !replay.state.running) {
+        const cache = historyTopicCache.value;
+        if (cache.totalRows === rows.value.length) return cache.groups.get(selectedTopic.value)?.items ?? [];
+        rebuildHistoryGroupCache();
+        return historyTopicCache.value.groups.get(selectedTopic.value)?.items ?? [];
+    }
     const matched = displayRows.value.filter((r) => r.topic === selectedTopic.value);
     return replay.state.running ? matched.slice().reverse() : matched;
 });
@@ -200,7 +298,7 @@ function nextHistoryStreamId(): string {
 function flushPendingHistoryRows(): void {
     pendingHistoryFlush = 0;
     if (!pendingHistoryRows.length) return;
-    rows.value.push(...pendingHistoryRows.splice(0));
+    appendHistoryRows(pendingHistoryRows.splice(0));
 }
 
 function queueHistoryRows(chunkRows: HistoryMessage[]): void {
@@ -241,6 +339,7 @@ async function query(): Promise<void> {
     hasMoreHistory.value = false;
     loading.value = true;
     rows.value = [];
+    resetHistoryGroupCache();
     dataSource.value = 'history';
     selectedTopic.value = null;
     topicVisibleCount.value = TOPIC_BATCH;
@@ -547,7 +646,7 @@ async function loadMoreHistory(): Promise<void> {
     try {
         const page = await loadHistoryPage(rows.value.length);
         if (!page) return;
-        rows.value.push(...page);
+        appendHistoryRows(page);
         if (!selectedTopic.value && rows.value.length) selectedTopic.value = rows.value[0].topic;
     } finally {
         loadingMore.value = false;
@@ -625,6 +724,7 @@ async function onImportChange(event: Event): Promise<void> {
     try {
         importedRows.value = await parseReplayFile(file);
         importedName.value = file.name;
+        resetHistoryGroupCache();
         dataSource.value = 'imported';
         hasMoreHistory.value = false;
         selectedTopic.value = importedHistoryRows.value[0]?.topic ?? null;
@@ -692,6 +792,7 @@ function finishHistoryStream(done: HistoryQueryDone): void {
     loading.value = false;
     hasMoreHistory.value = rows.value.length > queryLimit.value;
     if (hasMoreHistory.value) rows.value = rows.value.slice(0, queryLimit.value);
+    rebuildHistoryGroupCache();
     selectedTopic.value = rows.value.length > 0 ? rows.value[0].topic : null;
     if (rows.value.length === 0) toast.info('无匹配结果');
     else toast.success(hasMoreHistory.value ? `已加载 ${rows.value.length} 条，向下滚动继续加载` : `找到 ${rows.value.length} 条`);

@@ -50,7 +50,14 @@ export interface LogDirDataResult {
 }
 
 /** 批量从主进程推到渲染进程的单条消息 */
-export interface MqttMessage {
+export interface PayloadMetadata {
+    payloadSize?: number;
+    payloadEncoding?: 'utf8' | 'binary' | 'invalid-utf8';
+    payloadTruncated?: boolean;
+    payloadBase64?: string;
+}
+
+export interface MqttMessage extends PayloadMetadata {
     connectionId: string;
     topic: string;
     payload: string;
@@ -91,7 +98,7 @@ export interface HistoryQueryOptions {
     offset?: number;
 }
 
-export interface HistoryMessage {
+export interface HistoryMessage extends PayloadMetadata {
     connectionId: string;
     topic: string;
     payload: string;

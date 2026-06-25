@@ -8,6 +8,7 @@ import mqtt, { MqttClient, IClientOptions, IPublishPacket } from 'mqtt';
 import type { BrowserWindow } from 'electron';
 import type { ApiResult, ConnectPayload, MqttMessage, PublishPayload } from '../../shared/types';
 import { MqttIpcQueue } from './mqtt-ipc-queue';
+import { decodePayloadView } from './payload-codec';
 import { enqueueMessage } from './storage';
 
 interface ConnectionCtx {
@@ -119,11 +120,24 @@ export class MqttService {
                 let msgCount = 0;
                 client.on('message', (topic, payload, _packet?: IPublishPacket) => {
                     if (ctx.disabledTopics.has(topic)) return;
-                    const text = payload.toString('utf8');
+                    const payloadView = decodePayloadView(payload);
+                    const text = payloadView.text;
                     const now = Date.now();
 
-                    enqueueMessage(p.connectionId, topic, text, now);
-                    const msg: MqttMessage = { connectionId: p.connectionId, topic, payload: text, time: now, seq: ++this.seq };
+                    enqueueMessage(p.connectionId, topic, text, now, {
+                        payloadBytes: payload,
+                        payloadSize: payloadView.size,
+                        payloadEncoding: payloadView.encoding
+                    });
+                    const msg: MqttMessage = {
+                        connectionId: p.connectionId,
+                        topic,
+                        payload: text,
+                        payloadSize: payloadView.size,
+                        payloadEncoding: payloadView.encoding,
+                        time: now,
+                        seq: ++this.seq
+                    };
                     this.ipcQueue.enqueue(msg);
                     if (++msgCount <= 3 || msgCount % 500 === 0) {
                         console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);

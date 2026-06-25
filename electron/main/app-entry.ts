@@ -2,7 +2,7 @@ import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { initIpc } from './ipc';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
-import { clearLogsWithoutConnections, initStorage, shutdownStorage } from './storage';
+import { clearLogsWithoutConnectionsAsync, initStorage, shutdownStorageAsync } from './storage';
 import { initSettings, getCurrentLogDir, readConnections } from './settings';
 import { MqttService } from './mqtt-service';
 import { startAutoDeleteScheduler, stopAutoDeleteScheduler } from './auto-delete-scheduler';
@@ -92,7 +92,7 @@ app.whenReady().then(async () => {
     initStorage(getCurrentLogDir());
     await scheduleHeavyJob(
         { kind: 'exclusive', label: 'startup-clear-stale-logs', priority: 35 },
-        () => clearLogsWithoutConnections(readConnections().connections.map((c) => c.id))
+        () => clearLogsWithoutConnectionsAsync(readConnections().connections.map((c) => c.id))
     ).promise;
     await pluginManager.init().catch((e) => console.error('[plugin] init:', e));
     mqttService = new MqttService(() => win);
@@ -104,13 +104,13 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
     stopAutoDeleteScheduler();
     mqttService?.flush();
-    shutdownStorage();
+    void shutdownStorageAsync();
 });
 
 app.on('window-all-closed', () => {
     stopAutoDeleteScheduler();
     mqttService?.shutdown();
-    shutdownStorage();
+    void shutdownStorageAsync();
     pluginManager.shutdown();
     if (process.platform !== 'darwin') app.quit();
 });

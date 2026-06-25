@@ -1,7 +1,11 @@
 import type { HistoryMessage } from '../../shared/types';
+import { payloadBytes } from './payload-codec';
 
 export interface BucketItem {
     payload: string;
+    payloadBytes?: Buffer | Uint8Array;
+    payloadSize?: number;
+    payloadEncoding?: 'utf8' | 'binary' | 'invalid-utf8';
     tsMs: number;
 }
 
@@ -34,7 +38,7 @@ export function encodeBucketEntries(items: BucketItem[], bucketSec: number): Buf
     const buffers: Buffer[] = [];
     for (const it of items) {
         const off = Math.max(0, Math.min(65535, it.tsMs - base));
-        const data = Buffer.from(it.payload, 'utf8');
+        const data = it.payloadBytes ? payloadBytes(it.payloadBytes) : Buffer.from(it.payload, 'utf8');
         const meta = Buffer.alloc(6);
         meta.writeUInt16LE(off, 0);
         meta.writeUInt32LE(data.length, 2);
@@ -104,11 +108,15 @@ export function iterateBucketEntries(blob: Buffer, bucketSec: number): BucketEnt
     return out;
 }
 
-export function readPayloadSlice(blob: Buffer, payloadOffset: number, payloadLen: number): string | null {
+export function readPayloadBytesSlice(blob: Buffer, payloadOffset: number, payloadLen: number): Buffer | null {
     if (!Buffer.isBuffer(blob)) return null;
     if (!Number.isSafeInteger(payloadOffset) || !Number.isSafeInteger(payloadLen)) return null;
     if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > blob.length) return null;
-    return blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
+    return blob.subarray(payloadOffset, payloadOffset + payloadLen);
+}
+
+export function readPayloadSlice(blob: Buffer, payloadOffset: number, payloadLen: number): string | null {
+    return readPayloadBytesSlice(blob, payloadOffset, payloadLen)?.toString('utf8') ?? null;
 }
 
 export function decodeBucket(blob: Buffer, bucketSec: number, topic: string): HistoryMessage[] {

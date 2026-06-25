@@ -23,10 +23,13 @@ import {
     getDefaultLogDir
 } from './settings';
 import {
-    clearLogs,
-    clearLogsWithoutConnections,
-    closeAllLogDbs,
-    readRecentByConnection
+    clearLogsAsync,
+    clearLogsWithoutConnectionsAsync,
+    closeAllLogDbsAsync,
+    flushStorageAsync,
+    pauseStorageWrites,
+    readRecentByConnection,
+    resumeStorageWrites
 } from './storage';
 import { APP_START_TIME } from './constants';
 import { pluginManager } from './plugin-manager';
@@ -100,27 +103,37 @@ function assertDifferentLogDirs(sourceDir: string, targetDir?: string): void {
     }
 }
 
-function migrateLogDirData(sourceDir: string, targetDir: string): LogDirDataResult {
+async function migrateLogDirData(sourceDir: string, targetDir: string): Promise<LogDirDataResult> {
     assertCurrentLogDir(sourceDir);
     assertDifferentLogDirs(sourceDir, targetDir);
-    closeAllLogDbs();
-    const files = countLogDbFiles(sourceDir);
-    if (files > 0) {
-        fs.mkdirSync(targetDir, { recursive: true });
-        fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
-        fs.rmSync(sourceDir, { recursive: true, force: true });
+    pauseStorageWrites('migrate-log-dir');
+    try {
+        await closeAllLogDbsAsync();
+        const files = countLogDbFiles(sourceDir);
+        if (files > 0) {
+            fs.mkdirSync(targetDir, { recursive: true });
+            fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
+            fs.rmSync(sourceDir, { recursive: true, force: true });
+        }
+        return { files, sourceDir, targetDir };
+    } finally {
+        resumeStorageWrites('migrate-log-dir');
     }
-    return { files, sourceDir, targetDir };
 }
 
-function deleteLogDirData(sourceDir: string): LogDirDataResult {
+async function deleteLogDirData(sourceDir: string): Promise<LogDirDataResult> {
     assertCurrentLogDir(sourceDir);
-    closeAllLogDbs();
-    const files = countLogDbFiles(sourceDir);
-    if (files > 0 && fs.existsSync(sourceDir)) {
-        fs.rmSync(sourceDir, { recursive: true, force: true });
+    pauseStorageWrites('delete-log-dir');
+    try {
+        await closeAllLogDbsAsync();
+        const files = countLogDbFiles(sourceDir);
+        if (files > 0 && fs.existsSync(sourceDir)) {
+            fs.rmSync(sourceDir, { recursive: true, force: true });
+        }
+        return { files, sourceDir };
+    } finally {
+        resumeStorageWrites('delete-log-dir');
     }
-    return { files, sourceDir };
 }
 
 export function initIpc(mqttService: MqttService): void {
@@ -156,8 +169,9 @@ export function initIpc(mqttService: MqttService): void {
         mqttService.setDisplayPaused(p.connectionId, p.paused);
         return { success: true };
     });
-    ipcMain.handle('mqtt:readRecent', (_e, p: { connectionId: string; limit?: number }) => {
+    ipcMain.handle('mqtt:readRecent', async (_e, p: { connectionId: string; limit?: number }) => {
         try {
+            await flushStorageAsync();
             return { success: true, data: readRecentByConnection(p.connectionId, p.limit ?? 5000) };
         } catch (e) {
             return { success: false, message: (e as Error).message };
@@ -165,7 +179,7 @@ export function initIpc(mqttService: MqttService): void {
     });
     ipcMain.handle('mqtt:clearLogs', async (_e, connectionId?: string | null) => {
         try {
-            const r = await scheduleHeavyJob({ kind: 'exclusive', label: 'clear-logs', priority: 40 }, () => clearLogs(connectionId ?? null)).promise;
+            const r = await scheduleHeavyJob({ kind: 'exclusive', label: 'clear-logs', priority: 40 }, () => clearLogsAsync(connectionId ?? null)).promise;
             return { success: true, data: r };
         } catch (e) {
             return { success: false, message: (e as Error).message };
@@ -253,7 +267,7 @@ export function initIpc(mqttService: MqttService): void {
             const cleanup = hasRemovedConnection
                 ? await scheduleHeavyJob(
                     { kind: 'exclusive', label: 'clear-stale-logs', priority: 35 },
-                    () => clearLogsWithoutConnections((data.connections ?? []).map((c) => c.id))
+                    () => clearLogsWithoutConnectionsAsync((data.connections ?? []).map((c) => c.id))
                 ).promise
                 : { deletedFiles: 0, deletedDirs: 0 };
             return { success: true, data: cleanup };

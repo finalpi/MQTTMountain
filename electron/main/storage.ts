@@ -17,7 +17,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { Worker } from 'node:worker_threads';
+import { Worker, isMainThread } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
 import {
@@ -64,6 +64,9 @@ interface LogDbPack {
 }
 
 const logDbCache = new Map<string, LogDbPack>();
+let storageWorker: Worker | null = null;
+let storageWorkerSeq = 0;
+const storageWorkerRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
 
 /** 单条消息条目（尚未合批） */
 interface PendingEntry extends BucketItem {
@@ -74,17 +77,67 @@ interface PendingEntry extends BucketItem {
 const pending: PendingEntry[] = [];
 let pendingBytes = 0;
 let flushTimer: NodeJS.Timeout | null = null;
+let maintenancePauseDepth = 0;
 const STORAGE_FLUSH_MS = 250;
 const STORAGE_FLUSH_BYTES = 4 * 1024 * 1024;
 const STORAGE_HARD_ENTRIES = 20_000;
+const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
     LOG_ROOT = logRoot;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
+    if (USE_STORAGE_WORKER) ensureStorageWorker();
 }
 
 export function getLogRoot(): string {
     return LOG_ROOT;
+}
+
+function rejectStorageWorkerRequests(error: Error): void {
+    for (const request of storageWorkerRequests.values()) request.reject(error);
+    storageWorkerRequests.clear();
+}
+
+function ensureStorageWorker(): Worker | null {
+    if (!USE_STORAGE_WORKER) return null;
+    if (storageWorker) return storageWorker;
+    const workerPath = path.join(__dirname, 'storage-worker.js');
+    storageWorker = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT } });
+    storageWorker.on('message', (msg: { id?: number; ok?: boolean; result?: unknown; error?: string }) => {
+        if (msg.id == null) return;
+        const request = storageWorkerRequests.get(msg.id);
+        if (!request) return;
+        storageWorkerRequests.delete(msg.id);
+        if (msg.ok) request.resolve(msg.result);
+        else request.reject(new Error(msg.error || 'storage worker error'));
+    });
+    storageWorker.once('error', (error) => {
+        console.error('[storage] worker error:', error);
+        storageWorker = null;
+        rejectStorageWorkerRequests(error);
+    });
+    storageWorker.once('exit', (code) => {
+        if (code !== 0) console.error('[storage] worker exit:', code);
+        storageWorker = null;
+        rejectStorageWorkerRequests(new Error(`storage worker exited (${code})`));
+    });
+    return storageWorker;
+}
+
+function callStorageWorker(command: string, payload?: unknown): Promise<unknown> {
+    const worker = ensureStorageWorker();
+    if (!worker) return Promise.reject(new Error('storage worker is disabled'));
+    const id = ++storageWorkerSeq;
+    return new Promise((resolve, reject) => {
+        storageWorkerRequests.set(id, { resolve, reject });
+        worker.postMessage({ id, command, payload });
+    });
+}
+
+function postStorageWorker(command: string, payload?: unknown): void {
+    const worker = ensureStorageWorker();
+    if (!worker) return;
+    worker.postMessage({ command, payload });
 }
 
 function touchCacheKey(key: string): void {
@@ -233,23 +286,56 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     return pack;
 }
 
+// ---------------- lifecycle ----------------
+export function pauseStorageWrites(reason = 'maintenance'): void {
+    if (USE_STORAGE_WORKER) postStorageWorker('pause', { reason });
+    maintenancePauseDepth++;
+    if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+    }
+}
+
+export function resumeStorageWrites(reason = 'maintenance'): void {
+    if (maintenancePauseDepth > 0) maintenancePauseDepth--;
+    if (USE_STORAGE_WORKER) postStorageWorker('resume', { reason });
+    if (maintenancePauseDepth === 0 && pending.length > 0) scheduleFlush();
+}
+
+export function withStorageMaintenance<T>(fn: () => T): T {
+    pauseStorageWrites();
+    try {
+        flushStorageLocal();
+        return fn();
+    } finally {
+        resumeStorageWrites();
+    }
+}
+
 // ---------------- flush ----------------
-export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number): void {
+export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
     if (!connectionId) return;
-    pending.push({ connectionId, topic, payload, tsMs });
-    pendingBytes += payload.length + topic.length + 16;
+    const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
+    const entry = { connectionId, topic, payload, tsMs, ...meta, payloadSize };
+    if (USE_STORAGE_WORKER) {
+        postStorageWorker('enqueue', entry);
+        return;
+    }
+    pending.push(entry);
+    pendingBytes += payloadSize + topic.length + 16;
     if (pending.length >= STORAGE_HARD_ENTRIES || pendingBytes >= STORAGE_FLUSH_BYTES) {
-        flushStorage();
+        flushStorageLocal();
     } else {
         scheduleFlush();
     }
 }
 
 function scheduleFlush(): void {
+    if (maintenancePauseDepth > 0) return;
     if (flushTimer) return;
     flushTimer = setTimeout(() => {
         flushTimer = null;
-        flushStorage();
+        flushStorageLocal();
     }, STORAGE_FLUSH_MS);
 }
 
@@ -257,8 +343,8 @@ function requeueGroups(groups: Map<string, { connectionId: string; sec: number; 
     const retry: PendingEntry[] = [];
     for (const g of groups.values()) {
         for (const item of g.items) {
-            retry.push({ connectionId: g.connectionId, topic: g.topic, payload: item.payload, tsMs: item.tsMs });
-            pendingBytes += item.payload.length + g.topic.length + 16;
+            retry.push({ connectionId: g.connectionId, topic: g.topic, ...item });
+            pendingBytes += (item.payloadSize ?? item.payloadBytes?.byteLength ?? item.payload.length) + g.topic.length + 16;
         }
     }
     if (retry.length > 0) pending.unshift(...retry);
@@ -266,6 +352,22 @@ function requeueGroups(groups: Map<string, { connectionId: string; sec: number; 
 
 /** 按 (san, dk, sec, topic) 聚合 pending，然后对每个 day.db 开一个事务批量 UPSERT */
 export function flushStorage(): void {
+    if (USE_STORAGE_WORKER) {
+        console.warn('[storage] sync flush requested while storage worker is enabled; use flushStorageAsync for a durable barrier');
+        return;
+    }
+    flushStorageLocal();
+}
+
+export async function flushStorageAsync(): Promise<void> {
+    if (USE_STORAGE_WORKER) {
+        await callStorageWorker('flush');
+        return;
+    }
+    flushStorageLocal();
+}
+
+function flushStorageLocal(): void {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (pending.length === 0) return;
     const batch = pending.splice(0, pending.length);
@@ -399,7 +501,7 @@ function listDayFiles(san: string, descending: boolean): string[] {
 }
 
 export function readRecentByConnection(connectionId: string, limit = 5000): HistoryMessage[] {
-    flushStorage();
+    flushStorageLocal();
     if (!connectionId) return [];
     const san = sanitizeConnectionId(connectionId);
     const files = listDayFiles(san, true);
@@ -449,7 +551,7 @@ export function readRecentByConnection(connectionId: string, limit = 5000): Hist
 }
 
 export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
-    flushStorage();
+    flushStorageLocal();
     const st = opts.startTime != null && opts.startTime > 0 ? opts.startTime : -8640000000000000;
     const et = opts.endTime != null && opts.endTime > 0 ? opts.endTime : 8640000000000000;
     const limit = Math.min(500_000, Math.max(1, opts.limit ?? 500));
@@ -547,7 +649,7 @@ export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
 }
 
 export function getHistoryIndexStatus(connectionId?: string | null): HistoryIndexStatus {
-    flushStorage();
+    flushStorageLocal();
     const status: HistoryIndexStatus = {
         totalFiles: 0,
         indexedFiles: 0,
@@ -598,48 +700,118 @@ function countDayDbFiles(dir: string): number {
     return fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f) || /^\d{4}-\d{2}-\d{2}\.db(?:-wal|-shm)$/u.test(f)).length;
 }
 
+function closeOldLogDbs(cutoff: number): void {
+    for (const [key, pack] of [...logDbCache.entries()]) {
+        const pipe = key.lastIndexOf('|');
+        const dk = pipe >= 0 ? key.slice(pipe + 1) : '';
+        if (!dk) continue;
+        const dayEnd = dayEndTsFromKey(dk);
+        if (Number.isFinite(dayEnd) && dayEnd < cutoff) {
+            try { pack.db.close(); } catch {}
+            logDbCache.delete(key);
+        }
+    }
+}
+
 export function closeAllLogDbs(): void {
-    flushStorage();
+    flushStorageLocal();
     for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
     logDbCache.clear();
 }
 
-export function clearLogs(connectionId?: string | null): { deletedFiles: number } {
-    flushStorage();
-    let deleted = 0;
-    if (connectionId) {
-        const san = sanitizeConnectionId(connectionId);
-        closeLogDbsForSan(san);
-        const dir = path.join(LOG_ROOT, san);
-        if (fs.existsSync(dir)) {
-            deleted = countDayDbFiles(dir);
-            fs.rmSync(dir, { recursive: true, force: true });
-        }
-    } else {
-        closeAllLogDbs();
-        if (fs.existsSync(LOG_ROOT)) {
-            const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
-            for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
-            fs.rmSync(LOG_ROOT, { recursive: true, force: true });
-        }
-        fs.mkdirSync(LOG_ROOT, { recursive: true });
+export async function closeAllLogDbsAsync(): Promise<void> {
+    if (USE_STORAGE_WORKER) {
+        await callStorageWorker('closeAll');
+        return;
     }
-    return { deletedFiles: deleted };
+    closeAllLogDbs();
+}
+
+export function clearLogs(connectionId?: string | null): { deletedFiles: number } {
+    return withStorageMaintenance(() => {
+        let deleted = 0;
+        if (connectionId) {
+            const san = sanitizeConnectionId(connectionId);
+            closeLogDbsForSan(san);
+            const dir = path.join(LOG_ROOT, san);
+            if (fs.existsSync(dir)) {
+                deleted = countDayDbFiles(dir);
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        } else {
+            closeAllLogDbs();
+            if (fs.existsSync(LOG_ROOT)) {
+                const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+                for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
+                fs.rmSync(LOG_ROOT, { recursive: true, force: true });
+            }
+            fs.mkdirSync(LOG_ROOT, { recursive: true });
+        }
+        return { deletedFiles: deleted };
+    });
 }
 
 export function clearLogsWithoutConnections(connectionIds: string[]): { deletedFiles: number; deletedDirs: number } {
-    flushStorage();
-    const valid = new Set(connectionIds.filter(Boolean).map((id) => sanitizeConnectionId(id)));
-    let deletedDirs = 0;
-    if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
-    const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
-    for (const d of dirs) {
-        if (valid.has(d.name)) continue;
-        closeLogDbsForSan(d.name);
-        fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
-        deletedDirs++;
+    return withStorageMaintenance(() => {
+        const valid = new Set(connectionIds.filter(Boolean).map((id) => sanitizeConnectionId(id)));
+        let deletedDirs = 0;
+        if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
+        const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+        for (const d of dirs) {
+            if (valid.has(d.name)) continue;
+            closeLogDbsForSan(d.name);
+            fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
+            deletedDirs++;
+        }
+        return { deletedFiles: 0, deletedDirs };
+    });
+}
+
+export async function clearLogsAsync(connectionId?: string | null): Promise<{ deletedFiles: number }> {
+    if (!USE_STORAGE_WORKER) return clearLogs(connectionId);
+    pauseStorageWrites('clear-logs');
+    try {
+        await closeAllLogDbsAsync();
+        let deleted = 0;
+        if (connectionId) {
+            const san = sanitizeConnectionId(connectionId);
+            const dir = path.join(LOG_ROOT, san);
+            if (fs.existsSync(dir)) {
+                deleted = countDayDbFiles(dir);
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        } else {
+            if (fs.existsSync(LOG_ROOT)) {
+                const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+                for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
+                fs.rmSync(LOG_ROOT, { recursive: true, force: true });
+            }
+            fs.mkdirSync(LOG_ROOT, { recursive: true });
+        }
+        return { deletedFiles: deleted };
+    } finally {
+        resumeStorageWrites('clear-logs');
     }
-    return { deletedFiles: 0, deletedDirs };
+}
+
+export async function clearLogsWithoutConnectionsAsync(connectionIds: string[]): Promise<{ deletedFiles: number; deletedDirs: number }> {
+    if (!USE_STORAGE_WORKER) return clearLogsWithoutConnections(connectionIds);
+    pauseStorageWrites('clear-stale-logs');
+    try {
+        await closeAllLogDbsAsync();
+        const valid = new Set(connectionIds.filter(Boolean).map((id) => sanitizeConnectionId(id)));
+        let deletedDirs = 0;
+        if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
+        const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+        for (const d of dirs) {
+            if (valid.has(d.name)) continue;
+            fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
+            deletedDirs++;
+        }
+        return { deletedFiles: 0, deletedDirs };
+    } finally {
+        resumeStorageWrites('clear-stale-logs');
+    }
 }
 
 // ---------------- cleanup ----------------
@@ -649,12 +821,16 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
         return;
     }
     const cutoff = Date.now() - days * 86_400_000;
+    pauseStorageWrites('auto-delete');
+    flushStorageLocal();
+    closeOldLogDbs(cutoff);
     const workerPath = path.join(__dirname, 'auto-delete-worker.js');
     const w = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT, cutoff } });
     let finished = false;
     const finish = () => {
         if (finished) return;
         finished = true;
+        resumeStorageWrites('auto-delete');
         onFinish?.();
     };
     w.once('message', (msg: { removed: number; error?: string }) => {
@@ -670,5 +846,24 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
 }
 
 export function shutdownStorage(): void {
+    if (USE_STORAGE_WORKER) {
+        void shutdownStorageAsync();
+        return;
+    }
+    closeAllLogDbs();
+}
+
+export async function shutdownStorageAsync(): Promise<void> {
+    if (USE_STORAGE_WORKER && storageWorker) {
+        try {
+            await callStorageWorker('shutdown');
+        } finally {
+            const worker = storageWorker;
+            storageWorker = null;
+            await worker?.terminate().catch(() => undefined);
+            rejectStorageWorkerRequests(new Error('storage worker shutdown'));
+        }
+        return;
+    }
     closeAllLogDbs();
 }

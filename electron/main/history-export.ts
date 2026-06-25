@@ -7,7 +7,7 @@ import type {
     HistoryExportResult
 } from '../../shared/types';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
-import { flushStorage, getLogRoot } from './storage';
+import { flushStorageAsync, getLogRoot } from './storage';
 
 interface WorkerMessage {
     type: 'progress' | 'done' | 'error';
@@ -22,7 +22,7 @@ function sendProgress(sender: WebContents, progress: HistoryExportProgress): voi
 
 export async function exportHistoryToFile(sender: WebContents, req: HistoryExportRequest, targetPath: string): Promise<HistoryExportResult> {
     return await scheduleHeavyJob({ kind: 'exclusive', label: 'history-export', priority: 5 }, async () => {
-        flushStorage();
+        await flushStorageAsync();
 
         const workerPath = path.join(__dirname, 'history-export-worker.js');
         const worker = new Worker(workerPath, {

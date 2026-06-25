@@ -3,7 +3,7 @@ import { Worker } from 'node:worker_threads';
 import type { WebContents } from 'electron';
 import type { HistoryMessage, HistoryQueryOptions, HistoryQueryStreamStartRequest } from '../../shared/types';
 import { scheduleHeavyJob, type ScheduledHeavyJob } from './heavy-job-scheduler';
-import { flushStorage, getLogRoot } from './storage';
+import { flushStorageAsync, getLogRoot } from './storage';
 
 interface WorkerMessage {
     type: 'chunk' | 'done' | 'error';
@@ -41,7 +41,7 @@ function sendIfAlive(sender: WebContents, channel: string, payload: unknown): bo
 
 export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<HistoryMessage[]> {
     return await scheduleHeavyJob({ kind: 'query', label: 'history-query', priority: 20 }, async () => {
-        flushStorage();
+        await flushStorageAsync();
 
         const workerPath = path.join(__dirname, 'history-query-worker.js');
         const worker = new Worker(workerPath, {
@@ -82,16 +82,13 @@ export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<Hist
     }).promise;
 }
 
-function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStreamStartRequest): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-        const active = activeStreams.get(req.requestId);
-        if (!active || active.cancelled) {
-            resolve();
-            return;
-        }
+async function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStreamStartRequest): Promise<void> {
+    const active = activeStreams.get(req.requestId);
+    if (!active || active.cancelled) return;
 
-        flushStorage();
+    await flushStorageAsync();
 
+    return await new Promise<void>((resolve, reject) => {
         const workerPath = path.join(__dirname, 'history-query-worker.js');
         const worker = new Worker(workerPath, {
             workerData: {

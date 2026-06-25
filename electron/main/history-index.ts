@@ -3,7 +3,7 @@ import { Worker } from 'node:worker_threads';
 import type { WebContents } from 'electron';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
-import { flushStorage, getHistoryIndexStatus, getLogRoot } from './storage';
+import { closeAllLogDbsAsync, getHistoryIndexStatus, getLogRoot, pauseStorageWrites, resumeStorageWrites } from './storage';
 
 interface WorkerMessage {
     type: 'progress' | 'done' | 'error';
@@ -22,7 +22,8 @@ export function readHistoryIndexStatus(req: HistoryIndexRequest = {}) {
 
 export async function buildHistoryIndex(sender: WebContents, req: HistoryIndexRequest = {}): Promise<HistoryIndexResult> {
     return await scheduleHeavyJob({ kind: 'exclusive', label: 'history-index', priority: 10 }, async () => {
-        flushStorage();
+        pauseStorageWrites('history-index');
+        await closeAllLogDbsAsync();
 
         const workerPath = path.join(__dirname, 'history-index-worker.js');
         const worker = new Worker(workerPath, {
@@ -32,7 +33,8 @@ export async function buildHistoryIndex(sender: WebContents, req: HistoryIndexRe
             }
         });
 
-        return await new Promise<HistoryIndexResult>((resolve, reject) => {
+        try {
+            return await new Promise<HistoryIndexResult>((resolve, reject) => {
             let settled = false;
 
             worker.on('message', (msg: WorkerMessage) => {
@@ -72,8 +74,11 @@ export async function buildHistoryIndex(sender: WebContents, req: HistoryIndexRe
                     reject(new Error(`索引任务异常退出（${code}）`));
                 }
             });
-        }).finally(() => {
-            void worker.terminate().catch(() => {});
-        });
+            }).finally(() => {
+                void worker.terminate().catch(() => {});
+            });
+        } finally {
+            resumeStorageWrites('history-index');
+        }
     }).promise;
 }
