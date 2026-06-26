@@ -16,15 +16,6 @@ interface IndexWorkerData {
 
 const { req, logRoot } = workerData as IndexWorkerData;
 
-function detectFts5(db: Database.Database): boolean {
-    try {
-        db.exec('CREATE VIRTUAL TABLE temp.__fts_probe USING fts5(x); DROP TABLE temp.__fts_probe;');
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 function collectDayFiles(): { path: string; san: string; dk: string }[] {
     if (!fs.existsSync(logRoot)) return [];
     const sanFilter = req.connectionId ? sanitizeConnectionId(req.connectionId) : null;
@@ -60,16 +51,15 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
         db.pragma('temp_store = MEMORY');
-        ensureHistoryIndexSchema(db, { rebuild: true });
-        fts5Enabled = detectFts5(db);
-        setIndexMeta(db, 'fts5_enabled', fts5Enabled ? '1' : '0');
+        const ftsTokenizer = ensureHistoryIndexSchema(db, { rebuild: true });
+        fts5Enabled = ftsTokenizer !== 'none';
 
         for (let attempt = 0; attempt < 2; attempt++) {
             processedBuckets = 0;
             processedMessages = 0;
             setIndexMeta(db, 'index_complete', '0');
             setIndexMeta(db, 'index_dirty_at', '0');
-            db.exec('DELETE FROM history_messages;');
+            db.exec(fts5Enabled ? 'DELETE FROM history_messages; DELETE FROM history_messages_fts;' : 'DELETE FROM history_messages;');
 
             const totalRow = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(count), 0) AS messages FROM buckets').get() as { count: number; messages: number };
             const totalBuckets = totalRow.count;
@@ -77,6 +67,12 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                 `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
             );
+            const insertFtsStmt = fts5Enabled
+                ? db.prepare(
+                    `INSERT INTO history_messages_fts (search_text, bucket_ts, topic, msg_index, time_ms)
+                     VALUES (?, ?, ?, ?, ?)`
+                )
+                : null;
             const selectStmt = db.prepare(
                 `SELECT bucket_ts, topic, blob FROM buckets
                  WHERE bucket_ts > ? OR (bucket_ts = ? AND topic > ?)
@@ -87,7 +83,9 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                 for (const row of rows) {
                     const entries = iterateBucketEntries(row.blob, row.bucket_ts);
                     for (const entry of entries) {
-                        insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, normalizeSearchText(row.topic, entry.payload), entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+                        const searchText = normalizeSearchText(row.topic, entry.payload);
+                        insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+                        insertFtsStmt?.run(searchText, row.bucket_ts, row.topic, entry.msgIndex, entry.time);
                     }
                     processedBuckets++;
                     processedMessages += entries.length;

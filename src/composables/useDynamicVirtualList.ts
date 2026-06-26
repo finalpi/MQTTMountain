@@ -61,6 +61,8 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     let resizeObserver: ResizeObserver | null = null;
     let scrollRaf: number | null = null;
     let restoreRaf: number | null = null;
+    let userScrollInteractionTimer: ReturnType<typeof setTimeout> | null = null;
+    let userScrollInteraction = false;
     let scrollVersion = 0;
     let snapshotKeys: DynamicVirtualKey[] = [];
     let snapshotPrefix: number[] = [0];
@@ -88,6 +90,15 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
         const l = layout.value;
         snapshotKeys = l.rows.map((row) => row.key);
         snapshotPrefix = l.prefix.slice();
+    }
+
+    function markUserScrollInteraction(): void {
+        userScrollInteraction = true;
+        if (userScrollInteractionTimer != null) clearTimeout(userScrollInteractionTimer);
+        userScrollInteractionTimer = setTimeout(() => {
+            userScrollInteractionTimer = null;
+            userScrollInteraction = false;
+        }, 160);
     }
 
     function findIndexByOffset(prefix: number[], count: number, offset: number): number {
@@ -176,7 +187,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
         void nextTick(() => {
             restoreRaf = requestAnimationFrame(() => {
                 restoreRaf = null;
-                if (!opts.stickToStart.value && versionAtSchedule !== scrollVersion) {
+                if (!opts.stickToStart.value && (versionAtSchedule !== scrollVersion || userScrollInteraction)) {
                     updateViewport();
                     syncSnapshot();
                     return;
@@ -208,6 +219,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     }
 
     function onScroll(): void {
+        markUserScrollInteraction();
         if (scrollRaf != null) return;
         scrollRaf = requestAnimationFrame(() => {
             scrollRaf = null;
@@ -289,6 +301,11 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     function scrollToTop(smooth = true): void {
         const el = opts.containerRef.value;
         if (!el) return;
+        userScrollInteraction = false;
+        if (userScrollInteractionTimer != null) {
+            clearTimeout(userScrollInteractionTimer);
+            userScrollInteractionTimer = null;
+        }
         el.scrollTo({ top: 0, behavior: smooth ? 'smooth' : 'auto' });
         if (!smooth) updateViewport();
     }
@@ -296,6 +313,11 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     function scrollToOffset(offset: number): void {
         const el = opts.containerRef.value;
         if (!el) return;
+        userScrollInteraction = false;
+        if (userScrollInteractionTimer != null) {
+            clearTimeout(userScrollInteractionTimer);
+            userScrollInteractionTimer = null;
+        }
         el.scrollTop = Math.max(0, offset);
         updateViewport();
     }
@@ -318,6 +340,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     onBeforeUnmount(() => {
         if (scrollRaf != null) cancelAnimationFrame(scrollRaf);
         if (restoreRaf != null) cancelAnimationFrame(restoreRaf);
+        if (userScrollInteractionTimer != null) clearTimeout(userScrollInteractionTimer);
         resizeObserver?.disconnect();
     });
 

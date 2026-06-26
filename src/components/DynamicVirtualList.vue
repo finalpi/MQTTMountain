@@ -23,6 +23,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
     scroll: [metrics: { scrollTop: number; clientHeight: number; scrollHeight: number }];
+    userInteraction: [];
 }>();
 
 const containerRef = ref<HTMLElement | null>(null);
@@ -44,6 +45,7 @@ const virtual = useDynamicVirtualList({
 const verticalPadding = 6;
 let containerResizeObserver: ResizeObserver | null = null;
 let lastWidth = 0;
+let scrollEmitRaf: number | null = null;
 
 function emitScroll(): void {
     const el = containerRef.value;
@@ -55,9 +57,21 @@ function emitScroll(): void {
     });
 }
 
+function scheduleEmitScroll(): void {
+    if (scrollEmitRaf != null) return;
+    scrollEmitRaf = requestAnimationFrame(() => {
+        scrollEmitRaf = null;
+        emitScroll();
+    });
+}
+
 function onScroll(): void {
     virtual.onScroll();
-    emitScroll();
+    scheduleEmitScroll();
+}
+
+function onUserInteraction(): void {
+    emit('userInteraction');
 }
 
 function rowStyle(row: DynamicVirtualRow<T>): Record<string, string> {
@@ -129,6 +143,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
     containerResizeObserver?.disconnect();
+    if (scrollEmitRaf != null) cancelAnimationFrame(scrollEmitRaf);
 });
 
 function getScrollElement(): HTMLElement | null {
@@ -164,7 +179,14 @@ defineExpose({
 </script>
 
 <template>
-    <div ref="containerRef" class="dynamic-virtual-list" @scroll.passive="onScroll">
+    <div
+        ref="containerRef"
+        class="dynamic-virtual-list"
+        @scroll.passive="onScroll"
+        @wheel.passive="onUserInteraction"
+        @pointerdown="onUserInteraction"
+        @touchstart.passive="onUserInteraction"
+    >
         <div v-if="items.length === 0 && empty" class="empty">{{ empty }}</div>
         <div class="dynamic-virtual-spacer" :style="{ height: virtual.totalHeight.value + verticalPadding * 2 + 'px' }">
             <div
@@ -188,6 +210,7 @@ defineExpose({
     overflow-x: hidden;
     flex: 1;
     min-height: 0;
+    contain: strict;
 }
 
 .dynamic-virtual-spacer {

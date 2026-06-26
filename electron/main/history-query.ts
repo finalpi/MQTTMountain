@@ -23,6 +23,21 @@ interface ActiveStream {
 }
 
 const activeStreams = new Map<string, ActiveStream>();
+const QUERY_FLUSH_WAIT_MS = 300;
+
+async function flushStorageForQuery(): Promise<void> {
+    let timeoutId: NodeJS.Timeout | null = null;
+    try {
+        await Promise.race([
+            flushStorageAsync(),
+            new Promise<void>((resolve) => {
+                timeoutId = setTimeout(resolve, QUERY_FLUSH_WAIT_MS);
+            })
+        ]);
+    } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+    }
+}
 
 function stopStream(requestId: string): void {
     const active = activeStreams.get(requestId);
@@ -41,7 +56,7 @@ function sendIfAlive(sender: WebContents, channel: string, payload: unknown): bo
 
 export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<HistoryMessage[]> {
     return await scheduleHeavyJob({ kind: 'query', label: 'history-query', priority: 20 }, async () => {
-        await flushStorageAsync();
+        await flushStorageForQuery();
 
         const workerPath = path.join(__dirname, 'history-query-worker.js');
         const worker = new Worker(workerPath, {

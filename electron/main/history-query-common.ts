@@ -25,8 +25,17 @@ export function normalizeKeyword(value: string): string {
     return String(value || '').replace(/\s+/gu, '').toLowerCase();
 }
 
-export function normalizeSearchText(topic: string, payload: string): string {
+export function normalizePayloadSearchText(payload: string): string {
+    return normalizeKeyword(payload);
+}
+
+export function normalizeCombinedSearchText(topic: string, payload: string): string {
     return `${normalizeKeyword(topic)}${normalizeKeyword(payload)}`;
+}
+
+export function normalizeSearchText(topic: string, payload: string): string {
+    void topic;
+    return normalizePayloadSearchText(payload);
 }
 
 export function dayStartTsFromKey(dk: string): number {

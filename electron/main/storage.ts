@@ -43,14 +43,15 @@ import {
 } from './history-query-common';
 import {
     ensureHistoryIndexSchema,
+    getHistoryFtsTokenizer,
     getHistoryIndexSchemaVersion,
     getIndexMeta,
     HISTORY_INDEX_SCHEMA_VERSION,
-    LEGACY_HISTORY_INDEX_SCHEMA_VERSION,
     setIndexMeta
 } from './history-index-schema';
 
 const MAX_OPEN_LOG_DBS = 24;
+const DAY_DB_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/u;
 
 let LOG_ROOT = '';
 
@@ -59,6 +60,8 @@ interface LogDbPack {
     getStmt: Database.Statement;
     upsertStmt: Database.Statement;
     insertIndexStmt: Database.Statement;
+    insertFtsStmt: Database.Statement | null;
+    deleteFtsStmt: Database.Statement | null;
     countIndexStmt: Database.Statement;
     insertBackupStmt: Database.Statement;
 }
@@ -95,11 +98,62 @@ const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORK
 export function initStorage(logRoot: string): void {
     LOG_ROOT = logRoot;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
+    purgeNonCurrentHistoryIndexDbs();
     if (USE_STORAGE_WORKER) ensureStorageWorker();
 }
 
 export function getLogRoot(): string {
     return LOG_ROOT;
+}
+
+function deleteDayDbFiles(filePath: string): number {
+    let deleted = 0;
+    for (const suffix of ['', '-wal', '-shm']) {
+        const target = `${filePath}${suffix}`;
+        if (!fs.existsSync(target)) continue;
+        fs.rmSync(target, { force: true });
+        deleted++;
+    }
+    return deleted;
+}
+
+function tableExists(db: Database.Database, name: string): boolean {
+    const row = db.prepare('SELECT name FROM sqlite_master WHERE name = ?').get(name);
+    return Boolean(row);
+}
+
+function isCurrentHistoryIndexDb(filePath: string): boolean {
+    let db: Database.Database | null = null;
+    try {
+        db = new Database(filePath, { readonly: true });
+        if (getIndexMeta(db, 'schema_version') !== HISTORY_INDEX_SCHEMA_VERSION) return false;
+        const columns = new Set(db.prepare('PRAGMA table_info(history_messages)').all()
+            .map((col) => String((col as { name?: string }).name ?? '')));
+        const hasColumns = ['bucket_ts', 'topic', 'msg_index', 'time_ms', 'search_text', 'payload_offset', 'payload_len', 'entry_offset', 'entry_len']
+            .every((name) => columns.has(name));
+        if (!hasColumns) return false;
+        return getHistoryFtsTokenizer(db) === 'none' || tableExists(db, 'history_messages_fts');
+    } catch {
+        return false;
+    } finally {
+        try { db?.close(); } catch {}
+    }
+}
+
+function purgeNonCurrentHistoryIndexDbs(): void {
+    if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return;
+    let deleted = 0;
+    const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+    for (const d of dirs) {
+        const dir = path.join(LOG_ROOT, d.name);
+        const files = fs.readdirSync(dir).filter((file) => DAY_DB_FILE_RE.test(file));
+        for (const file of files) {
+            const filePath = path.join(dir, file);
+            if (isCurrentHistoryIndexDb(filePath)) continue;
+            deleted += deleteDayDbFiles(filePath);
+        }
+    }
+    if (deleted > 0) console.info(`[storage] purged ${deleted} old history db files; new history uses index schema v${HISTORY_INDEX_SCHEMA_VERSION}`);
 }
 
 function rejectStorageWorkerRequests(error: Error): void {
@@ -229,26 +283,19 @@ function refreshIndexedCounts(db: Database.Database): void {
     setIndexMeta(db, 'indexed_bucket_count', bucketRow.count);
 }
 
-function appendBucketIndex(insertStmt: Database.Statement, schemaVersion: string, bucketSec: number, topic: string, entries: BucketEntry[]): void {
+function appendBucketIndex(insertStmt: Database.Statement, insertFtsStmt: Database.Statement | null, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     for (const entry of entries) {
-        if (schemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION) {
-            insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, normalizeSearchText(topic, entry.payload));
-        } else {
-            insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, normalizeSearchText(topic, entry.payload), entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
-        }
+        const searchText = normalizeSearchText(topic, entry.payload);
+        insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+        insertFtsStmt?.run(searchText, bucketSec, topic, entry.msgIndex, entry.time);
     }
 }
 
-function replaceBucketIndex(db: Database.Database, schemaVersion: string, bucketSec: number, topic: string, entries: BucketEntry[]): void {
-    const deleteStmt = db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
-    const insertStmt = db.prepare(schemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION
-        ? `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
-           VALUES (?, ?, ?, ?, ?)`
-        : `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+function replaceBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, entries: BucketEntry[]): void {
+    const deleteStmt = pack.db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     deleteStmt.run(bucketSec, topic);
-    appendBucketIndex(insertStmt, schemaVersion, bucketSec, topic, entries);
+    pack.deleteFtsStmt?.run(bucketSec, topic);
+    appendBucketIndex(pack.insertIndexStmt, pack.insertFtsStmt, bucketSec, topic, entries);
 }
 
 function backupBucketBlob(pack: LogDbPack, bucketSec: number, topic: string, existing: ExistingBucketRow, reason?: string): boolean {
@@ -301,7 +348,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
             PRIMARY KEY (bucket_ts, topic, saved_at)
         ) WITHOUT ROWID;
     `);
-    ensureHistoryIndexSchema(db, { initializeCompletion: true });
+    const ftsTokenizer = ensureHistoryIndexSchema(db, { initializeCompletion: true });
     try {
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
@@ -313,19 +360,25 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         `INSERT INTO buckets (bucket_ts, topic, blob, count, bytes) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(bucket_ts, topic) DO UPDATE SET blob=excluded.blob, count=excluded.count, bytes=excluded.bytes`
     );
-    const indexSchemaVersion = getHistoryIndexSchemaVersion(db) ?? HISTORY_INDEX_SCHEMA_VERSION;
-    const insertIndexStmt = db.prepare(indexSchemaVersion === LEGACY_HISTORY_INDEX_SCHEMA_VERSION
-        ? `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text)
-           VALUES (?, ?, ?, ?, ?)`
-        : `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    const insertIndexStmt = db.prepare(
+        `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
+    const insertFtsStmt = ftsTokenizer === 'none'
+        ? null
+        : db.prepare(
+            `INSERT INTO history_messages_fts (search_text, bucket_ts, topic, msg_index, time_ms)
+             VALUES (?, ?, ?, ?, ?)`
+        );
+    const deleteFtsStmt = ftsTokenizer === 'none'
+        ? null
+        : db.prepare('DELETE FROM history_messages_fts WHERE bucket_ts = ? AND topic = ?');
     const countIndexStmt = db.prepare('SELECT COUNT(*) AS count FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     const insertBackupStmt = db.prepare(
         `INSERT INTO bucket_blob_backups (bucket_ts, topic, saved_at, reason, blob, count, bytes)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
-    const pack: LogDbPack = { db, getStmt, upsertStmt, insertIndexStmt, countIndexStmt, insertBackupStmt };
+    const pack: LogDbPack = { db, getStmt, upsertStmt, insertIndexStmt, insertFtsStmt, deleteFtsStmt, countIndexStmt, insertBackupStmt };
     logDbCache.set(key, pack);
     return pack;
 }
@@ -501,7 +554,7 @@ function flushStorageLocal(): void {
                                     canAppendIndex = false;
                                     const entries = iterateBucketEntries(next.blob, g.sec);
                                     try {
-                                        replaceBucketIndex(pack.db, indexSchemaVersion!, g.sec, g.topic, entries);
+                                        replaceBucketIndex(pack, g.sec, g.topic, entries);
                                         refreshIndexedCounts(pack.db);
                                         indexedMessageDelta = 0;
                                         indexedBucketDelta = 0;
@@ -542,7 +595,7 @@ function flushStorageLocal(): void {
                     if (!canAppendIndex || !nextBlob || !indexSchemaVersion) continue;
                     try {
                         const entries = iterateBucketEntries(nextBlob, g.sec).slice(startIndex);
-                        appendBucketIndex(pack.insertIndexStmt, indexSchemaVersion, g.sec, g.topic, entries);
+                        appendBucketIndex(pack.insertIndexStmt, pack.insertFtsStmt, g.sec, g.topic, entries);
                         indexedMessageDelta += entries.length;
                         if (isNewBucket) indexedBucketDelta++;
                     } catch (error) {

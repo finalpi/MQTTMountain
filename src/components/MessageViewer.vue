@@ -9,7 +9,7 @@ import DynamicVirtualList from '@/components/DynamicVirtualList.vue';
 import { highlight, normalize, type SearchLogic } from '@/utils/filter';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
-import type { HistoryKeywordCondition, HistoryMessage } from '@shared/types';
+import type { HistoryKeywordCondition, HistoryMessage, HistoryQueryDone } from '@shared/types';
 
 const msg = useMessageStore();
 const conn = useConnectionStore();
@@ -42,11 +42,17 @@ const activeFilterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }
 const autoFollow = ref(true);
 const showJumpBtn = ref(false);
 const DETAIL_HISTORY_LIMIT = 200;
+const DETAIL_HISTORY_TIMEOUT_MS = 12_000;
 const selectedTopicHistoryRows = ref<HistoryMessage[]>([]);
-const selectedTopicHistoryOffset = ref(0);
+const selectedTopicHistoryEndTime = ref<number | undefined>(undefined);
 const selectedTopicHistoryHasMore = ref(false);
 const selectedTopicHistoryLoading = ref(false);
 const selectedTopicHistoryLoadedOnce = ref(false);
+let selectedTopicHistoryRequestSeq = 0;
+let activeSelectedTopicHistoryStreamId: string | null = null;
+let selectedTopicHistoryStreamSeq = 0;
+const selectedTopicHistoryCache = new Map<string, { rows: HistoryMessage[]; hasMore: boolean }>();
+const SELECTED_TOPIC_HISTORY_CACHE_LIMIT = 80;
 
 let filterTimer: number | null = null;
 watch(filterConditions, (v) => {
@@ -55,7 +61,7 @@ watch(filterConditions, (v) => {
         activeFilterConditions.value = v.map((item) => ({ term: item.term, join: item.join }));
         filterMatchCache.clear();
         highlightCache.clear();
-    }, 120);
+    }, 260);
 }, { deep: true });
 onUnmounted(() => { if (filterTimer != null) clearTimeout(filterTimer); });
 
@@ -120,6 +126,7 @@ function highlightCached(src: string): string {
 watch(activeFilterKey, () => {
     filterMatchCache.clear();
     highlightCache.clear();
+    selectedTopicHistoryCache.clear();
 });
 
 /** 时间线：按新到旧 */
@@ -228,7 +235,7 @@ function realtimeSelectedTopicRows(): MsgRow[] {
     if (!hasActiveFilter.value) return v.buf.reverseSnapshot();
     const out: MsgRow[] = [];
     v.buf.forEachReverse((r) => {
-        if (matchesFilterConditions(r.topic + r.payload)) out.push(r);
+        if (selectedTopicRowMatchesFilter(v.topic, r.payload)) out.push(r);
     });
     return out;
 }
@@ -263,8 +270,11 @@ const selectedTopicMessages = computed<MsgRow[]>(() => {
         out.push(hit.item);
         byKey.delete(key);
     }
-    const rest = [...byKey.values()].sort((a, b) => a.index - b.index).map((hit) => hit.item);
-    out.push(...rest);
+    const loadedHistory = [...byKey.values()]
+        .filter((hit) => hit.item.seq < 0)
+        .sort((a, b) => a.index - b.index)
+        .map((hit) => hit.item);
+    out.push(...loadedHistory);
     return out;
 });
 
@@ -287,37 +297,168 @@ const selectedTopicHistoryActionText = computed(() => {
     return selectedTopicHistoryHasMore.value ? '加载更多历史' : '没有更多历史';
 });
 
+function selectedTopicRowMatchesFilter(topic: string, payload: string): boolean {
+    return matchesFilterConditions(topic + payload);
+}
+
+function selectedTopicEffectiveHistoryConditions(topic: string): HistoryKeywordCondition[] {
+    const active = normalizedFilterConditions.value;
+    const raw = activeHistoryConditions();
+    if (active.length === 0) return [];
+
+    const topicHay = normalize(topic);
+    let prefixResult = topicHay.includes(active[0].term);
+    const out: HistoryKeywordCondition[] = [];
+    if (!prefixResult) out.push(raw[0]);
+
+    for (let i = 1; i < active.length; i++) {
+        const item = active[i];
+        const rawItem = raw[i];
+        const topicHit = topicHay.includes(item.term);
+        if (item.join === 'or') {
+            if (prefixResult) return [];
+            if (!topicHit) out.push(rawItem);
+            prefixResult = prefixResult || topicHit;
+        } else if (item.join === 'not') {
+            if (topicHit) return [{ term: '__mqttmountain_no_match__', join: 'and' }];
+            out.push(rawItem);
+        } else {
+            if (!topicHit) out.push(rawItem);
+            prefixResult = prefixResult && topicHit;
+        }
+    }
+    return out.filter(Boolean);
+}
+
 function selectedTopicHistoryRequestKey(): string {
-    return JSON.stringify({ connectionId: conn.selectedId, topic: bucket.value.selectedTopic, conditions: activeHistoryConditions() });
+    const topic = bucket.value.selectedTopic;
+    return JSON.stringify({
+        connectionId: conn.selectedId,
+        topic,
+        conditions: topic ? selectedTopicEffectiveHistoryConditions(topic) : activeHistoryConditions()
+    });
+}
+
+function selectedTopicHistoryCacheKey(endTime: number | undefined): string {
+    return JSON.stringify({ key: selectedTopicHistoryRequestKey(), endTime, limit: DETAIL_HISTORY_LIMIT });
+}
+
+function cacheSelectedTopicHistoryPage(key: string, value: { rows: HistoryMessage[]; hasMore: boolean }): void {
+    selectedTopicHistoryCache.delete(key);
+    selectedTopicHistoryCache.set(key, { rows: value.rows.slice(), hasMore: value.hasMore });
+    while (selectedTopicHistoryCache.size > SELECTED_TOPIC_HISTORY_CACHE_LIMIT) {
+        const first = selectedTopicHistoryCache.keys().next().value;
+        if (first == null) break;
+        selectedTopicHistoryCache.delete(first);
+    }
+}
+
+function getCachedSelectedTopicHistoryPage(key: string): { rows: HistoryMessage[]; hasMore: boolean } | null {
+    const cached = selectedTopicHistoryCache.get(key);
+    if (!cached) return null;
+    selectedTopicHistoryCache.delete(key);
+    selectedTopicHistoryCache.set(key, cached);
+    return { rows: cached.rows.slice(), hasMore: cached.hasMore };
+}
+
+function nextSelectedTopicHistoryStreamId(): string {
+    selectedTopicHistoryStreamSeq++;
+    return `detail-history-${Date.now()}-${selectedTopicHistoryStreamSeq}`;
 }
 
 function resetSelectedTopicHistory(): void {
+    selectedTopicHistoryRequestSeq++;
+    void cancelActiveSelectedTopicHistoryStream();
     selectedTopicHistoryRows.value = [];
-    selectedTopicHistoryOffset.value = 0;
+    selectedTopicHistoryEndTime.value = undefined;
     selectedTopicHistoryHasMore.value = false;
     selectedTopicHistoryLoading.value = false;
     selectedTopicHistoryLoadedOnce.value = false;
 }
 
-async function loadSelectedTopicHistoryPage(offset: number): Promise<HistoryMessage[] | null> {
+function initialSelectedTopicHistoryEndTime(): number | undefined {
+    const realtimeRows = realtimeSelectedTopicRows();
+    const oldest = realtimeRows.length ? realtimeRows[realtimeRows.length - 1]?.time : undefined;
+    return oldest != null ? oldest - 1 : undefined;
+}
+
+async function cancelActiveSelectedTopicHistoryStream(): Promise<void> {
+    const requestId = activeSelectedTopicHistoryStreamId;
+    activeSelectedTopicHistoryStreamId = null;
+    if (requestId) await window.api.historyQueryStreamCancel({ requestId });
+}
+
+async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promise<{ rows: HistoryMessage[]; hasMore: boolean } | null> {
     const connectionId = conn.selectedId;
     const topic = selectedTopicView.value?.topic;
     if (!connectionId || !topic) return null;
-    const r = await window.api.historyQuery({
-        connectionId,
-        topic,
-        conditions: activeHistoryConditions(),
-        order: 'desc',
-        limit: DETAIL_HISTORY_LIMIT + 1,
-        offset
+    const conditions = selectedTopicEffectiveHistoryConditions(topic);
+    const cacheKey = selectedTopicHistoryCacheKey(endTime);
+    const cached = getCachedSelectedTopicHistoryPage(cacheKey);
+    if (cached) return cached;
+
+    await cancelActiveSelectedTopicHistoryStream();
+    const requestId = nextSelectedTopicHistoryStreamId();
+    activeSelectedTopicHistoryStreamId = requestId;
+    const rows: HistoryMessage[] = [];
+
+    return await new Promise((resolve) => {
+        let settled = false;
+        let timeoutId: number | null = null;
+        const cleanup = () => {
+            if (timeoutId != null) window.clearTimeout(timeoutId);
+            offChunk();
+            offDone();
+            offError();
+            if (activeSelectedTopicHistoryStreamId === requestId) activeSelectedTopicHistoryStreamId = null;
+        };
+        const finish = (result: { rows: HistoryMessage[]; hasMore: boolean } | null) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+                if (result) cacheSelectedTopicHistoryPage(cacheKey, result);
+            resolve(result);
+        };
+        const offChunk = window.api.onHistoryQueryChunk((chunk) => {
+            if (chunk.requestId !== requestId) return;
+            rows.push(...chunk.rows);
+        });
+        const offDone = window.api.onHistoryQueryDone((done: HistoryQueryDone) => {
+            if (done.requestId !== requestId) return;
+            finish({ rows: rows.slice(0, DETAIL_HISTORY_LIMIT), hasMore: rows.length > DETAIL_HISTORY_LIMIT });
+        });
+        const offError = window.api.onHistoryQueryError((error) => {
+            if (error.requestId !== requestId) return;
+            toast.error('加载历史失败：' + error.message);
+            finish(null);
+        });
+        timeoutId = window.setTimeout(() => {
+            void window.api.historyQueryStreamCancel({ requestId });
+            finish(null);
+        }, DETAIL_HISTORY_TIMEOUT_MS);
+
+        window.api.historyQueryStreamStart({
+            requestId,
+            opts: {
+                connectionId,
+                topic,
+                conditions,
+                endTime,
+                order: 'desc',
+                limit: DETAIL_HISTORY_LIMIT + 1,
+                offset: 0
+            },
+            chunkSize: DETAIL_HISTORY_LIMIT + 1
+        }).then((r) => {
+            if (!r.success) {
+                toast.error('加载历史失败：' + (r.message || ''));
+                finish(null);
+            }
+        }).catch((error) => {
+            toast.error('加载历史失败：' + ((error as Error).message || ''));
+            finish(null);
+        });
     });
-    if (!r.success || !r.data) {
-        toast.error('加载历史失败：' + (r.message || ''));
-        return null;
-    }
-    if (selectedTopicHistoryRequestKey() !== JSON.stringify({ connectionId, topic, conditions: activeHistoryConditions() })) return null;
-    selectedTopicHistoryHasMore.value = r.data.length > DETAIL_HISTORY_LIMIT;
-    return r.data.slice(0, DETAIL_HISTORY_LIMIT);
 }
 
 async function loadMoreSelectedTopicHistory(): Promise<void> {
@@ -325,16 +466,32 @@ async function loadMoreSelectedTopicHistory(): Promise<void> {
     if (selectedTopicHistoryLoadedOnce.value && !selectedTopicHistoryHasMore.value) return;
     if (!conn.selectedId || !selectedTopicView.value) return;
     const requestKey = selectedTopicHistoryRequestKey();
+    const requestSeq = ++selectedTopicHistoryRequestSeq;
+    const endTime = selectedTopicHistoryLoadedOnce.value
+        ? selectedTopicHistoryEndTime.value
+        : initialSelectedTopicHistoryEndTime();
     selectedTopicHistoryLoading.value = true;
+    let timeoutId: number | null = null;
+    const timeout = new Promise<null>((resolve) => {
+        timeoutId = window.setTimeout(() => resolve(null), DETAIL_HISTORY_TIMEOUT_MS);
+    });
     try {
-        const page = await loadSelectedTopicHistoryPage(selectedTopicHistoryOffset.value);
-        if (!page) return;
-        if (requestKey !== selectedTopicHistoryRequestKey()) return;
-        selectedTopicHistoryRows.value.push(...page);
-        selectedTopicHistoryOffset.value += page.length;
+        const result = await Promise.race([loadSelectedTopicHistoryPage(endTime), timeout]);
+        if (timeoutId != null) window.clearTimeout(timeoutId);
+        if (requestSeq !== selectedTopicHistoryRequestSeq || requestKey !== selectedTopicHistoryRequestKey()) return;
+        if (!result) {
+            await cancelActiveSelectedTopicHistoryStream();
+            selectedTopicHistoryHasMore.value = true;
+            toast.warning('历史查询较慢，已先解除加载状态，可稍后再试');
+            return;
+        }
+        selectedTopicHistoryHasMore.value = result.hasMore;
+        selectedTopicHistoryRows.value.push(...result.rows);
+        selectedTopicHistoryEndTime.value = result.rows.length ? Math.min(...result.rows.map((row) => row.time)) - 1 : endTime;
         selectedTopicHistoryLoadedOnce.value = true;
     } finally {
-        if (requestKey === selectedTopicHistoryRequestKey()) selectedTopicHistoryLoading.value = false;
+        if (timeoutId != null) window.clearTimeout(timeoutId);
+        if (requestSeq === selectedTopicHistoryRequestSeq) selectedTopicHistoryLoading.value = false;
     }
 }
 
@@ -490,6 +647,13 @@ function unfreezeVisibleOrder(): void {
     unfreezeSelectedMessageOrder();
 }
 
+function onUserScrollIntent(): void {
+    if (!autoFollow.value) return;
+    freezeVisibleOrder();
+    autoFollow.value = false;
+    showJumpBtn.value = true;
+}
+
 function onUserScroll(): void {
     const el = currentScroll();
     if (!el) return;
@@ -522,6 +686,7 @@ function scrollToTop(smooth = true): void {
 watch(
     () => [conn.selectedId, bucket.value.selectedTopic, activeFilterKey.value] as const,
     async () => {
+        if (conn.selectedId == null || bucket.value.selectedTopic == null) selectedTopicHistoryCache.clear();
         resetSelectedTopicHistory();
         await nextTick();
         topicVirtualRef.value?.resetMeasurements(true);
@@ -546,7 +711,10 @@ function closeContext(): void {
     contextMenu.value.visible = false;
 }
 window.addEventListener('click', closeContext);
-onUnmounted(() => window.removeEventListener('click', closeContext));
+onUnmounted(() => {
+    window.removeEventListener('click', closeContext);
+    void cancelActiveSelectedTopicHistoryStream();
+});
 </script>
 
 <template>
@@ -613,6 +781,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                 :layout-key="messageLayoutKey"
                 empty="暂无消息"
                 @scroll="onUserScroll"
+                @user-interaction="onUserScrollIntent"
             >
                 <template #default="{ item: m }">
                     <div
@@ -687,10 +856,11 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
                         :layout-key="messageLayoutKey"
                         empty="该主题暂无消息"
                         @scroll="onUserScroll"
+                        @user-interaction="onUserScrollIntent"
                     >
                         <template #default="{ item: m }">
                             <div
-                                class="msg-card"
+                                class="msg-card cv-auto"
                                 @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                             >
                                 <div class="msg-head">
@@ -1140,6 +1310,7 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     overflow-y: auto;
     overflow-x: hidden;
     position: relative;
+    contain: strict;
 
     &.bordered {
         background: var(--panel-body-bg);
@@ -1148,6 +1319,10 @@ onUnmounted(() => window.removeEventListener('click', closeContext));
     }
 }
 
+.cv-auto {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 80px;
+}
 
 .history-footer {
     padding: 8px 6px 12px;
