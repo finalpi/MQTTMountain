@@ -66,6 +66,9 @@ interface LogDbPack {
 const logDbCache = new Map<string, LogDbPack>();
 let storageWorker: Worker | null = null;
 let storageWorkerSeq = 0;
+let storageWorkerFailure: Error | null = null;
+let storageWorkerFailureLogged = false;
+let storageWorkerShuttingDown = false;
 const storageWorkerRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
 
 /** 单条消息条目（尚未合批） */
@@ -78,9 +81,15 @@ const pending: PendingEntry[] = [];
 let pendingBytes = 0;
 let flushTimer: NodeJS.Timeout | null = null;
 let maintenancePauseDepth = 0;
+const storageWorkerBatch: PendingEntry[] = [];
+let storageWorkerBatchBytes = 0;
+let storageWorkerBatchTimer: NodeJS.Timeout | null = null;
 const STORAGE_FLUSH_MS = 250;
 const STORAGE_FLUSH_BYTES = 4 * 1024 * 1024;
 const STORAGE_HARD_ENTRIES = 20_000;
+const STORAGE_WORKER_BATCH_MS = 15;
+const STORAGE_WORKER_BATCH_BYTES = 512 * 1024;
+const STORAGE_WORKER_BATCH_ENTRIES = 1000;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
@@ -98,8 +107,25 @@ function rejectStorageWorkerRequests(error: Error): void {
     storageWorkerRequests.clear();
 }
 
+function clearStorageWorkerBatchTimer(): void {
+    if (!storageWorkerBatchTimer) return;
+    clearTimeout(storageWorkerBatchTimer);
+    storageWorkerBatchTimer = null;
+}
+
+function failStorageWorker(error: Error): void {
+    if (!storageWorkerFailure) storageWorkerFailure = error;
+    clearStorageWorkerBatchTimer();
+    if (!storageWorkerFailureLogged) {
+        storageWorkerFailureLogged = true;
+        console.error('[storage] worker failed; history writes are disabled until app restart:', error);
+    }
+    rejectStorageWorkerRequests(error);
+}
+
 function ensureStorageWorker(): Worker | null {
     if (!USE_STORAGE_WORKER) return null;
+    if (storageWorkerFailure) return null;
     if (storageWorker) return storageWorker;
     const workerPath = path.join(__dirname, 'storage-worker.js');
     storageWorker = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT } });
@@ -112,32 +138,50 @@ function ensureStorageWorker(): Worker | null {
         else request.reject(new Error(msg.error || 'storage worker error'));
     });
     storageWorker.once('error', (error) => {
-        console.error('[storage] worker error:', error);
         storageWorker = null;
-        rejectStorageWorkerRequests(error);
+        if (!storageWorkerShuttingDown) failStorageWorker(error);
+        else rejectStorageWorkerRequests(error);
     });
     storageWorker.once('exit', (code) => {
-        if (code !== 0) console.error('[storage] worker exit:', code);
         storageWorker = null;
-        rejectStorageWorkerRequests(new Error(`storage worker exited (${code})`));
+        const error = new Error(`storage worker exited (${code})`);
+        if (!storageWorkerShuttingDown) failStorageWorker(error);
+        else rejectStorageWorkerRequests(error);
     });
     return storageWorker;
 }
 
+function storageWorkerUnavailableError(): Error {
+    return storageWorkerFailure ?? new Error('storage worker is disabled');
+}
+
 function callStorageWorker(command: string, payload?: unknown): Promise<unknown> {
     const worker = ensureStorageWorker();
-    if (!worker) return Promise.reject(new Error('storage worker is disabled'));
+    if (!worker) return Promise.reject(storageWorkerUnavailableError());
     const id = ++storageWorkerSeq;
     return new Promise((resolve, reject) => {
         storageWorkerRequests.set(id, { resolve, reject });
-        worker.postMessage({ id, command, payload });
+        try {
+            worker.postMessage({ id, command, payload });
+        } catch (error) {
+            storageWorkerRequests.delete(id);
+            const err = error instanceof Error ? error : new Error(String(error));
+            failStorageWorker(err);
+            reject(err);
+        }
     });
 }
 
-function postStorageWorker(command: string, payload?: unknown): void {
+function postStorageWorker(command: string, payload?: unknown): boolean {
     const worker = ensureStorageWorker();
-    if (!worker) return;
-    worker.postMessage({ command, payload });
+    if (!worker) return false;
+    try {
+        worker.postMessage({ command, payload });
+        return true;
+    } catch (error) {
+        failStorageWorker(error instanceof Error ? error : new Error(String(error)));
+        return false;
+    }
 }
 
 function touchCacheKey(key: string): void {
@@ -288,12 +332,16 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
 
 // ---------------- lifecycle ----------------
 export function pauseStorageWrites(reason = 'maintenance'): void {
-    if (USE_STORAGE_WORKER) postStorageWorker('pause', { reason });
+    if (USE_STORAGE_WORKER) {
+        flushStorageWorkerBatch();
+        postStorageWorker('pause', { reason });
+    }
     maintenancePauseDepth++;
     if (flushTimer) {
         clearTimeout(flushTimer);
         flushTimer = null;
     }
+    clearStorageWorkerBatchTimer();
 }
 
 export function resumeStorageWrites(reason = 'maintenance'): void {
@@ -312,17 +360,47 @@ export function withStorageMaintenance<T>(fn: () => T): T {
     }
 }
 
+function enqueueStorageWorkerBatch(entry: PendingEntry, estimatedBytes: number): void {
+    if (storageWorkerFailure) {
+        if (!storageWorkerFailureLogged) failStorageWorker(storageWorkerFailure);
+        return;
+    }
+    storageWorkerBatch.push(entry);
+    storageWorkerBatchBytes += estimatedBytes;
+    if (storageWorkerBatch.length >= STORAGE_WORKER_BATCH_ENTRIES || storageWorkerBatchBytes >= STORAGE_WORKER_BATCH_BYTES) {
+        flushStorageWorkerBatch();
+        return;
+    }
+    if (maintenancePauseDepth > 0 || storageWorkerBatchTimer) return;
+    storageWorkerBatchTimer = setTimeout(() => {
+        storageWorkerBatchTimer = null;
+        flushStorageWorkerBatch();
+    }, STORAGE_WORKER_BATCH_MS);
+}
+
+function flushStorageWorkerBatch(): void {
+    clearStorageWorkerBatchTimer();
+    if (!USE_STORAGE_WORKER || storageWorkerBatch.length === 0) return;
+    if (storageWorkerFailure) throw storageWorkerFailure;
+    const batch = storageWorkerBatch.splice(0, storageWorkerBatch.length);
+    storageWorkerBatchBytes = 0;
+    if (!postStorageWorker('enqueueBatch', batch)) {
+        throw storageWorkerUnavailableError();
+    }
+}
+
 // ---------------- flush ----------------
 export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
     if (!connectionId) return;
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
     const entry = { connectionId, topic, payload, tsMs, ...meta, payloadSize };
+    const estimatedBytes = payloadSize + topic.length + 16;
     if (USE_STORAGE_WORKER) {
-        postStorageWorker('enqueue', entry);
+        enqueueStorageWorkerBatch(entry, estimatedBytes);
         return;
     }
     pending.push(entry);
-    pendingBytes += payloadSize + topic.length + 16;
+    pendingBytes += estimatedBytes;
     if (pending.length >= STORAGE_HARD_ENTRIES || pendingBytes >= STORAGE_FLUSH_BYTES) {
         flushStorageLocal();
     } else {
@@ -361,6 +439,7 @@ export function flushStorage(): void {
 
 export async function flushStorageAsync(): Promise<void> {
     if (USE_STORAGE_WORKER) {
+        flushStorageWorkerBatch();
         await callStorageWorker('flush');
         return;
     }
@@ -721,6 +800,7 @@ export function closeAllLogDbs(): void {
 
 export async function closeAllLogDbsAsync(): Promise<void> {
     if (USE_STORAGE_WORKER) {
+        flushStorageWorkerBatch();
         await callStorageWorker('closeAll');
         return;
     }
@@ -854,16 +934,29 @@ export function shutdownStorage(): void {
 }
 
 export async function shutdownStorageAsync(): Promise<void> {
-    if (USE_STORAGE_WORKER && storageWorker) {
-        try {
-            await callStorageWorker('shutdown');
-        } finally {
-            const worker = storageWorker;
-            storageWorker = null;
-            await worker?.terminate().catch(() => undefined);
-            rejectStorageWorkerRequests(new Error('storage worker shutdown'));
+    if (USE_STORAGE_WORKER) {
+        clearStorageWorkerBatchTimer();
+        if (storageWorkerFailure) {
+            storageWorkerBatch.splice(0, storageWorkerBatch.length);
+            storageWorkerBatchBytes = 0;
+            return;
         }
-        return;
+        if (storageWorker) {
+            storageWorkerShuttingDown = true;
+            try {
+                flushStorageWorkerBatch();
+                await callStorageWorker('shutdown');
+            } finally {
+                const worker = storageWorker;
+                storageWorker = null;
+                storageWorkerBatch.splice(0, storageWorkerBatch.length);
+                storageWorkerBatchBytes = 0;
+                await worker?.terminate().catch(() => undefined);
+                rejectStorageWorkerRequests(new Error('storage worker shutdown'));
+                storageWorkerShuttingDown = false;
+            }
+            return;
+        }
     }
     closeAllLogDbs();
 }

@@ -130,11 +130,60 @@ function dayEndTsFromKey(dayKey) {
   return dayStartTsFromKey(dayKey) + 86_400_000 - 1;
 }
 
-function readPayloadSlice(blob, payloadOffset, payloadLen) {
+function readPayloadBytesSlice(blob, payloadOffset, payloadLen) {
   if (!Buffer.isBuffer(blob)) return null;
   if (!Number.isSafeInteger(payloadOffset) || !Number.isSafeInteger(payloadLen)) return null;
   if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > blob.length) return null;
-  return blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
+  return blob.subarray(payloadOffset, payloadOffset + payloadLen);
+}
+
+function decodePreview(bytes, maxChars) {
+  if (!Buffer.isBuffer(bytes)) return '';
+  if (maxChars <= 0) return '';
+  const text = bytes.subarray(0, Math.min(bytes.length, maxChars * 4)).toString('utf8');
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+function formatHistoryMessage(base, state, payloadSource = {}) {
+  const message = { ...base };
+  const payloadMode = state.payloadMode;
+  const payloadBytes = payloadSource.payloadBytes;
+  const payloadText = payloadSource.payloadText;
+  const payloadSize = Number.isFinite(payloadSource.payloadSize)
+    ? payloadSource.payloadSize
+    : Buffer.isBuffer(payloadBytes)
+      ? payloadBytes.length
+      : typeof payloadText === 'string'
+        ? Buffer.byteLength(payloadText, 'utf8')
+        : undefined;
+  if (payloadMode === 'none') return message;
+  if (payloadMode === 'metadata') {
+    if (payloadSize != null) message.payloadSize = payloadSize;
+    return message;
+  }
+  if (payloadMode === 'base64') {
+    if (Buffer.isBuffer(payloadBytes)) message.payloadBase64 = payloadBytes.toString('base64');
+    else if (typeof payloadText === 'string') message.payloadBase64 = Buffer.from(payloadText, 'utf8').toString('base64');
+    if (payloadSize != null) message.payloadSize = payloadSize;
+    return message;
+  }
+  if (payloadMode === 'preview') {
+    const preview = Buffer.isBuffer(payloadBytes)
+      ? decodePreview(payloadBytes, state.payloadPreviewChars)
+      : String(payloadText || '').slice(0, state.payloadPreviewChars);
+    message.payloadPreview = preview;
+    if (payloadSize != null) message.payloadSize = payloadSize;
+    message.payloadTruncated = payloadSize != null
+      ? payloadSize > Buffer.byteLength(preview, 'utf8')
+      : typeof payloadText === 'string' && payloadText.length > preview.length;
+    return message;
+  }
+  message.payload = typeof payloadText === 'string'
+    ? payloadText
+    : Buffer.isBuffer(payloadBytes)
+      ? payloadBytes.toString('utf8')
+      : '';
+  return message;
 }
 
 function decodeBucket(blob, bucketSec, topic, connectionId) {
@@ -588,6 +637,9 @@ function buildQueryState(options) {
   const terms = conditions.length
     ? []
     : parseKeywordTerms(Array.isArray(options.keywords) && options.keywords.length ? options.keywords : options.keyword);
+  const payloadMode = ['full', 'preview', 'metadata', 'base64', 'none'].includes(options.payloadMode)
+    ? options.payloadMode
+    : 'full';
   return {
     startTime,
     endTime,
@@ -598,6 +650,8 @@ function buildQueryState(options) {
     topic: options.topic && options.topic.trim() ? options.topic.trim() : null,
     conditions,
     terms,
+    payloadMode,
+    payloadPreviewChars: Math.min(2000, Math.max(0, Number.isFinite(options.payloadPreviewChars) ? Math.floor(options.payloadPreviewChars) : 300)),
     skipped: 0,
     out: []
   };
@@ -640,14 +694,23 @@ function queryIndexedFile(db, connectionId, state, schemaVersion) {
         state.skipped += 1;
         continue;
       }
+      const base = { connectionId, topic: row.topic, time: row.time_ms };
+      const payloadLen = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION ? row.payload_len : undefined;
+      if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
+        state.out.push(formatHistoryMessage(base, state, { payloadSize: payloadLen }));
+        if (state.out.length >= state.limit) return;
+        continue;
+      }
       const cacheKey = `${row.bucket_ts}|${row.topic}`;
       const bucket = bucketStmt.get(row.bucket_ts, row.topic);
       if (!bucket) continue;
+      let payloadBytes = null;
       let payload = null;
       if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-        payload = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
+        payloadBytes = readPayloadBytesSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
+        if (state.payloadMode === 'full' && payloadBytes) payload = payloadBytes.toString('utf8');
       }
-      if (payload == null) {
+      if (!payloadBytes && payload == null) {
         let decoded = bucketCache.get(cacheKey);
         if (!decoded) {
           decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId);
@@ -655,13 +718,8 @@ function queryIndexedFile(db, connectionId, state, schemaVersion) {
         }
         payload = decoded[row.msg_index]?.payload ?? null;
       }
-      if (payload == null) continue;
-      state.out.push({
-        connectionId,
-        topic: row.topic,
-        payload,
-        time: row.time_ms
-      });
+      if (!payloadBytes && payload == null) continue;
+      state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText: payload, payloadSize: payloadLen }));
       if (state.out.length >= state.limit) return;
     }
     offset += rows.length;
@@ -695,7 +753,15 @@ function queryBucketFile(db, connectionId, state) {
       for (let i = start; i !== end; i += step) {
         const message = decoded[i];
         if (message.time < state.startTime || message.time > state.endTime) continue;
-        const done = acceptHistoryMessage(state, message);
+        const done = acceptHistoryMessage(
+          state,
+          formatHistoryMessage(
+            { connectionId: message.connectionId, topic: message.topic, time: message.time },
+            state,
+            { payloadText: message.payload }
+          ),
+          normalizeKeyword(String(message.topic || '') + String(message.payload || ''))
+        );
         if (done) return;
       }
     }
@@ -932,6 +998,8 @@ async function main() {
         offset: z.number().int().min(0).default(0).describe('Number of matched messages to skip for pagination.'),
         startTime: z.number().optional().describe('Start timestamp in milliseconds since Unix epoch.'),
         endTime: z.number().optional().describe('End timestamp in milliseconds since Unix epoch.'),
+        payloadMode: z.enum(['full', 'preview', 'metadata', 'base64', 'none']).default('full').describe('Payload output mode. Default full preserves the legacy response shape.'),
+        payloadPreviewChars: z.number().int().min(0).max(2000).default(300).describe('Preview character limit when payloadMode is preview.'),
         limit: z.number().int().min(1).max(MAX_LIMIT).default(200)
       })
     },

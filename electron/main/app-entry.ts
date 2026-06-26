@@ -22,6 +22,8 @@ function resolveIconPath(): string {
 
 let win: BrowserWindow | null = null;
 let mqttService: MqttService | null = null;
+let quitAfterStorageShutdown = false;
+let quitShutdownPromise: Promise<void> | null = null;
 
 function focusExistingWindow(): void {
     if (!win || win.isDestroyed()) return;
@@ -29,6 +31,17 @@ function focusExistingWindow(): void {
     if (!win.isVisible()) win.show();
     win.focus();
     win.webContents.focus();
+}
+
+function shutdownForQuit(): Promise<void> {
+    if (quitShutdownPromise) return quitShutdownPromise;
+    quitShutdownPromise = (async () => {
+        stopAutoDeleteScheduler();
+        mqttService?.shutdown();
+        await shutdownStorageAsync();
+        pluginManager.shutdown();
+    })();
+    return quitShutdownPromise;
 }
 
 async function createWindow() {
@@ -78,7 +91,6 @@ async function createWindow() {
     win.webContents.on('did-finish-load', notifyFocus);
 
     win.on('closed', () => {
-        mqttService?.shutdown();
         win = null;
     });
 }
@@ -101,17 +113,18 @@ app.whenReady().then(async () => {
     startAutoDeleteScheduler(() => win);
 });
 
-app.on('before-quit', () => {
-    stopAutoDeleteScheduler();
-    mqttService?.flush();
-    void shutdownStorageAsync();
+app.on('before-quit', (event) => {
+    if (quitAfterStorageShutdown) return;
+    event.preventDefault();
+    void shutdownForQuit()
+        .catch((error) => console.error('[main] shutdown before quit failed:', error))
+        .finally(() => {
+            quitAfterStorageShutdown = true;
+            app.quit();
+        });
 });
 
 app.on('window-all-closed', () => {
-    stopAutoDeleteScheduler();
-    mqttService?.shutdown();
-    void shutdownStorageAsync();
-    pluginManager.shutdown();
     if (process.platform !== 'darwin') app.quit();
 });
 

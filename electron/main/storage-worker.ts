@@ -36,6 +36,14 @@ parentPort?.on('message', (msg: StorageWorkerRequest) => {
                 reply(msg.id, true);
                 break;
             }
+            case 'enqueueBatch': {
+                if (!Array.isArray(msg.payload)) throw new Error('enqueueBatch payload must be an array');
+                for (const item of msg.payload as EnqueuePayload[]) {
+                    enqueueMessage(item.connectionId, item.topic, item.payload, item.tsMs, item);
+                }
+                reply(msg.id, true);
+                break;
+            }
             case 'flush':
                 flushStorage();
                 reply(msg.id, true);
