@@ -9,7 +9,7 @@ import DynamicVirtualList from '@/components/DynamicVirtualList.vue';
 import { highlight, normalize, type SearchLogic } from '@/utils/filter';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
-import type { HistoryKeywordCondition, HistoryMessage, HistoryQueryDone } from '@shared/types';
+import type { HistoryIndexStatus, HistoryKeywordCondition, HistoryMessage, HistoryQueryDone } from '@shared/types';
 
 const msg = useMessageStore();
 const conn = useConnectionStore();
@@ -33,9 +33,15 @@ const placeholderTip = computed(() => {
 type ViewMode = 'timeline' | 'topic';
 const viewMode = ref<ViewMode>('topic');
 type FilterJoin = SearchLogic | 'not';
+type SelectedTopicHistoryRangeKey = '5m' | '15m' | '1h' | '6h' | '24h' | 'all';
 interface FilterCondition {
     term: string;
     join: FilterJoin;
+}
+interface SelectedTopicHistoryPageResult {
+    rows: HistoryMessage[];
+    hasMore: boolean;
+    timedOut?: boolean;
 }
 const filterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
 const activeFilterConditions = ref<FilterCondition[]>([{ term: '', join: 'and' }]);
@@ -43,7 +49,18 @@ const autoFollow = ref(true);
 const showJumpBtn = ref(false);
 const DETAIL_HISTORY_LIMIT = 200;
 const DETAIL_HISTORY_TIMEOUT_MS = 12_000;
+const SELECTED_TOPIC_HISTORY_RANGES: Array<{ key: SelectedTopicHistoryRangeKey; label: string; ms: number | null }> = [
+    { key: '5m', label: '近5分钟', ms: 5 * 60 * 1000 },
+    { key: '15m', label: '近15分钟', ms: 15 * 60 * 1000 },
+    { key: '1h', label: '近1小时', ms: 60 * 60 * 1000 },
+    { key: '6h', label: '近6小时', ms: 6 * 60 * 60 * 1000 },
+    { key: '24h', label: '近24小时', ms: 24 * 60 * 60 * 1000 },
+    { key: 'all', label: '全部历史', ms: null }
+];
 const selectedTopicHistoryRows = ref<HistoryMessage[]>([]);
+const selectedTopicHistoryRange = ref<SelectedTopicHistoryRangeKey>('15m');
+const selectedTopicHistoryRangeStartTime = ref<number | undefined>(undefined);
+const selectedTopicHistoryRangeEndTime = ref<number | undefined>(undefined);
 const selectedTopicHistoryEndTime = ref<number | undefined>(undefined);
 const selectedTopicHistoryHasMore = ref(false);
 const selectedTopicHistoryLoading = ref(false);
@@ -53,6 +70,9 @@ let activeSelectedTopicHistoryStreamId: string | null = null;
 let selectedTopicHistoryStreamSeq = 0;
 const selectedTopicHistoryCache = new Map<string, { rows: HistoryMessage[]; hasMore: boolean }>();
 const SELECTED_TOPIC_HISTORY_CACHE_LIMIT = 80;
+const selectedTopicHistoryIndexStatus = ref<HistoryIndexStatus | null>(null);
+const selectedTopicHistoryIndexStatusConnectionId = ref<string | null>(null);
+const selectedTopicHistoryIndexStatusLoading = ref(false);
 
 let filterTimer: number | null = null;
 watch(filterConditions, (v) => {
@@ -278,12 +298,29 @@ const selectedTopicMessages = computed<MsgRow[]>(() => {
     return out;
 });
 
+const selectedTopicHistoryRangeLabel = computed(() => SELECTED_TOPIC_HISTORY_RANGES.find((item) => item.key === selectedTopicHistoryRange.value)?.label ?? '近15分钟');
+const selectedTopicHistoryIndexHint = computed(() => {
+    if (!hasActiveFilter.value || selectedTopicHistoryIndexStatusLoading.value) return '';
+    const shortKeyword = activeHistoryConditions().some((item) => {
+        const length = Array.from(item.term.trim()).length;
+        return length > 0 && length < 3;
+    });
+    if (shortKeyword && (selectedTopicHistoryRange.value === 'all' || selectedTopicHistoryRange.value === '24h')) {
+        return '短关键词建议输入至少 3 个字符或缩小时间范围';
+    }
+    const status = selectedTopicHistoryIndexStatus.value;
+    if (!status || status.totalFiles === 0) return '';
+    if (status.incompleteFiles > 0 || status.indexedFiles < status.totalFiles) return '关键词历史建议先建立索引';
+    return '';
+});
 const selectedTopicHistoryStatus = computed(() => {
     if (!selectedTopicView.value) return '';
-    if (selectedTopicHistoryLoading.value) return '加载历史中...';
-    if (selectedTopicHistoryLoadedOnce.value && selectedTopicHistoryHasMore.value) return `已含历史 ${selectedTopicHistoryRows.value.length} 条`;
-    if (selectedTopicHistoryLoadedOnce.value) return `历史已加载 ${selectedTopicHistoryRows.value.length} 条`;
-    return '可加载历史';
+    const rangeLabel = selectedTopicHistoryRangeLabel.value;
+    if (selectedTopicHistoryLoading.value) return `${rangeLabel}加载中...`;
+    if (selectedTopicHistoryLoadedOnce.value && selectedTopicHistoryHasMore.value) return `${rangeLabel}已加载 ${selectedTopicHistoryRows.value.length} 条`;
+    if (selectedTopicHistoryLoadedOnce.value) return `${rangeLabel}历史已加载 ${selectedTopicHistoryRows.value.length} 条`;
+    if (selectedTopicHistoryRange.value === 'all') return '全部历史查询可能较慢';
+    return `${rangeLabel}可加载历史`;
 });
 
 const showSelectedTopicHistoryAction = computed(() => {
@@ -340,7 +377,13 @@ function selectedTopicHistoryRequestKey(): string {
 }
 
 function selectedTopicHistoryCacheKey(endTime: number | undefined): string {
-    return JSON.stringify({ key: selectedTopicHistoryRequestKey(), endTime, limit: DETAIL_HISTORY_LIMIT });
+    return JSON.stringify({
+        key: selectedTopicHistoryRequestKey(),
+        range: selectedTopicHistoryRange.value,
+        startTime: selectedTopicHistoryRangeStartTime.value,
+        endTime,
+        limit: DETAIL_HISTORY_LIMIT
+    });
 }
 
 function cacheSelectedTopicHistoryPage(key: string, value: { rows: HistoryMessage[]; hasMore: boolean }): void {
@@ -353,7 +396,7 @@ function cacheSelectedTopicHistoryPage(key: string, value: { rows: HistoryMessag
     }
 }
 
-function getCachedSelectedTopicHistoryPage(key: string): { rows: HistoryMessage[]; hasMore: boolean } | null {
+function getCachedSelectedTopicHistoryPage(key: string): SelectedTopicHistoryPageResult | null {
     const cached = selectedTopicHistoryCache.get(key);
     if (!cached) return null;
     selectedTopicHistoryCache.delete(key);
@@ -370,10 +413,30 @@ function resetSelectedTopicHistory(): void {
     selectedTopicHistoryRequestSeq++;
     void cancelActiveSelectedTopicHistoryStream();
     selectedTopicHistoryRows.value = [];
+    selectedTopicHistoryRangeStartTime.value = undefined;
+    selectedTopicHistoryRangeEndTime.value = undefined;
     selectedTopicHistoryEndTime.value = undefined;
     selectedTopicHistoryHasMore.value = false;
     selectedTopicHistoryLoading.value = false;
     selectedTopicHistoryLoadedOnce.value = false;
+}
+
+function selectedTopicHistoryRangeMs(): number | null {
+    return SELECTED_TOPIC_HISTORY_RANGES.find((item) => item.key === selectedTopicHistoryRange.value)?.ms ?? 15 * 60 * 1000;
+}
+
+function ensureSelectedTopicHistoryRangeBounds(initialEndTime: number | undefined): void {
+    if (selectedTopicHistoryRangeEndTime.value != null) return;
+    const end = initialEndTime ?? Date.now();
+    selectedTopicHistoryRangeEndTime.value = end;
+    const rangeMs = selectedTopicHistoryRangeMs();
+    selectedTopicHistoryRangeStartTime.value = rangeMs == null ? undefined : Math.max(0, end - rangeMs);
+}
+
+function changeSelectedTopicHistoryRange(event: Event): void {
+    selectedTopicHistoryRange.value = (event.target as HTMLSelectElement).value as SelectedTopicHistoryRangeKey;
+    selectedTopicHistoryCache.clear();
+    resetSelectedTopicHistory();
 }
 
 function initialSelectedTopicHistoryEndTime(): number | undefined {
@@ -388,10 +451,12 @@ async function cancelActiveSelectedTopicHistoryStream(): Promise<void> {
     if (requestId) await window.api.historyQueryStreamCancel({ requestId });
 }
 
-async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promise<{ rows: HistoryMessage[]; hasMore: boolean } | null> {
+async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promise<SelectedTopicHistoryPageResult | null> {
     const connectionId = conn.selectedId;
     const topic = selectedTopicView.value?.topic;
     if (!connectionId || !topic) return null;
+    const startTime = selectedTopicHistoryRangeStartTime.value;
+    if (startTime != null && endTime != null && endTime < startTime) return { rows: [], hasMore: false };
     const conditions = selectedTopicEffectiveHistoryConditions(topic);
     const cacheKey = selectedTopicHistoryCacheKey(endTime);
     const cached = getCachedSelectedTopicHistoryPage(cacheKey);
@@ -412,11 +477,11 @@ async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promis
             offError();
             if (activeSelectedTopicHistoryStreamId === requestId) activeSelectedTopicHistoryStreamId = null;
         };
-        const finish = (result: { rows: HistoryMessage[]; hasMore: boolean } | null) => {
+        const finish = (result: SelectedTopicHistoryPageResult | null) => {
             if (settled) return;
             settled = true;
             cleanup();
-                if (result) cacheSelectedTopicHistoryPage(cacheKey, result);
+            if (result && !result.timedOut) cacheSelectedTopicHistoryPage(cacheKey, result);
             resolve(result);
         };
         const offChunk = window.api.onHistoryQueryChunk((chunk) => {
@@ -434,7 +499,7 @@ async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promis
         });
         timeoutId = window.setTimeout(() => {
             void window.api.historyQueryStreamCancel({ requestId });
-            finish(null);
+            finish({ rows: rows.slice(0, DETAIL_HISTORY_LIMIT), hasMore: true, timedOut: true });
         }, DETAIL_HISTORY_TIMEOUT_MS);
 
         window.api.historyQueryStreamStart({
@@ -443,6 +508,7 @@ async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promis
                 connectionId,
                 topic,
                 conditions,
+                startTime,
                 endTime,
                 order: 'desc',
                 limit: DETAIL_HISTORY_LIMIT + 1,
@@ -461,36 +527,60 @@ async function loadSelectedTopicHistoryPage(endTime: number | undefined): Promis
     });
 }
 
+async function refreshSelectedTopicHistoryIndexStatus(): Promise<void> {
+    const connectionId = conn.selectedId;
+    if (!connectionId || selectedTopicHistoryIndexStatusLoading.value) return;
+    if (selectedTopicHistoryIndexStatusConnectionId.value === connectionId && selectedTopicHistoryIndexStatus.value) return;
+    selectedTopicHistoryIndexStatusLoading.value = true;
+    try {
+        const r = await window.api.historyIndexStatus({ connectionId });
+        if (r.success && r.data && conn.selectedId === connectionId) {
+            selectedTopicHistoryIndexStatus.value = r.data;
+            selectedTopicHistoryIndexStatusConnectionId.value = connectionId;
+        }
+    } finally {
+        selectedTopicHistoryIndexStatusLoading.value = false;
+    }
+}
+
 async function loadMoreSelectedTopicHistory(): Promise<void> {
     if (selectedTopicHistoryLoading.value) return;
     if (selectedTopicHistoryLoadedOnce.value && !selectedTopicHistoryHasMore.value) return;
     if (!conn.selectedId || !selectedTopicView.value) return;
+    void refreshSelectedTopicHistoryIndexStatus();
     const requestKey = selectedTopicHistoryRequestKey();
     const requestSeq = ++selectedTopicHistoryRequestSeq;
+    const initialEndTime = initialSelectedTopicHistoryEndTime();
+    ensureSelectedTopicHistoryRangeBounds(initialEndTime);
     const endTime = selectedTopicHistoryLoadedOnce.value
         ? selectedTopicHistoryEndTime.value
-        : initialSelectedTopicHistoryEndTime();
+        : selectedTopicHistoryRangeEndTime.value;
     selectedTopicHistoryLoading.value = true;
-    let timeoutId: number | null = null;
-    const timeout = new Promise<null>((resolve) => {
-        timeoutId = window.setTimeout(() => resolve(null), DETAIL_HISTORY_TIMEOUT_MS);
-    });
     try {
-        const result = await Promise.race([loadSelectedTopicHistoryPage(endTime), timeout]);
-        if (timeoutId != null) window.clearTimeout(timeoutId);
+        const result = await loadSelectedTopicHistoryPage(endTime);
         if (requestSeq !== selectedTopicHistoryRequestSeq || requestKey !== selectedTopicHistoryRequestKey()) return;
         if (!result) {
             await cancelActiveSelectedTopicHistoryStream();
             selectedTopicHistoryHasMore.value = true;
-            toast.warning('历史查询较慢，已先解除加载状态，可稍后再试');
+            toast.warning('加载历史失败，可稍后再试');
             return;
         }
-        selectedTopicHistoryHasMore.value = result.hasMore;
+        const nextEndTime = result.rows.length ? Math.min(...result.rows.map((row) => row.time)) - 1 : endTime;
+        const startTime = selectedTopicHistoryRangeStartTime.value;
+        selectedTopicHistoryHasMore.value = result.hasMore && !(startTime != null && nextEndTime != null && nextEndTime < startTime);
         selectedTopicHistoryRows.value.push(...result.rows);
-        selectedTopicHistoryEndTime.value = result.rows.length ? Math.min(...result.rows.map((row) => row.time)) - 1 : endTime;
+        selectedTopicHistoryEndTime.value = nextEndTime;
         selectedTopicHistoryLoadedOnce.value = true;
+        if (result.timedOut) {
+            if (result.rows.length > 0) {
+                toast.info(`已先加载 ${result.rows.length} 条历史结果，${selectedTopicHistoryRangeLabel.value}查询仍在继续可稍后重试`);
+            } else if (selectedTopicHistoryRange.value === 'all') {
+                toast.warning('正在查询全部历史，建议先切到近15分钟或近1小时');
+            } else {
+                toast.warning(`${selectedTopicHistoryRangeLabel.value}历史查询仍较慢，可能是索引未完成或关键词过短，可建立索引后重试`);
+            }
+        }
     } finally {
-        if (timeoutId != null) window.clearTimeout(timeoutId);
         if (requestSeq === selectedTopicHistoryRequestSeq) selectedTopicHistoryLoading.value = false;
     }
 }
@@ -684,9 +774,13 @@ function scrollToTop(smooth = true): void {
 }
 
 watch(
-    () => [conn.selectedId, bucket.value.selectedTopic, activeFilterKey.value] as const,
+    () => [conn.selectedId, bucket.value.selectedTopic, activeFilterKey.value, selectedTopicHistoryRange.value] as const,
     async () => {
         if (conn.selectedId == null || bucket.value.selectedTopic == null) selectedTopicHistoryCache.clear();
+        if (selectedTopicHistoryIndexStatusConnectionId.value !== conn.selectedId) {
+            selectedTopicHistoryIndexStatus.value = null;
+            selectedTopicHistoryIndexStatusConnectionId.value = conn.selectedId;
+        }
         resetSelectedTopicHistory();
         await nextTick();
         topicVirtualRef.value?.resetMeasurements(true);
@@ -842,7 +936,12 @@ onUnmounted(() => {
                     <div class="t-head">
                         <span v-if="selectedTopicView" class="t-head-name" :title="selectedTopicView.topic">{{ selectedTopicView.topic }}</span>
                         <span v-else class="empty">请从左侧选择主题</span>
-                        <span v-if="selectedTopicView" class="history-status">{{ selectedTopicMessages.length }} 条 · {{ selectedTopicHistoryStatus }}</span>
+                        <div v-if="selectedTopicView" class="history-tools">
+                            <select class="sort-select history-range-select" :value="selectedTopicHistoryRange" title="历史加载范围" @change="changeSelectedTopicHistoryRange">
+                                <option v-for="item in SELECTED_TOPIC_HISTORY_RANGES" :key="item.key" :value="item.key">{{ item.label }}</option>
+                            </select>
+                            <span class="history-status">{{ selectedTopicMessages.length }} 条 · {{ selectedTopicHistoryStatus }}</span>
+                        </div>
                     </div>
                     <DynamicVirtualList
                         v-if="selectedTopicView"
@@ -872,6 +971,7 @@ onUnmounted(() => {
                         </template>
                         <template #after>
                             <div v-if="showSelectedTopicHistoryAction" class="history-footer">
+                                <span v-if="selectedTopicHistoryIndexHint" class="history-index-hint">{{ selectedTopicHistoryIndexHint }}，可到「历史查询」建立/重建索引</span>
                                 <button class="history-load-btn" :disabled="selectedTopicHistoryLoading" @click="loadMoreSelectedTopicHistory">
                                     {{ selectedTopicHistoryActionText }}
                                 </button>
@@ -1214,8 +1314,19 @@ onUnmounted(() => {
         word-break: break-all;
         line-height: 1.4;
     }
-    .history-status {
+    .history-tools {
         flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+    }
+    .history-range-select {
+        max-width: 96px;
+        height: 24px;
+        padding: 1px 5px;
+    }
+    .history-status {
         color: var(--text-3);
         font-size: 11px;
         font-weight: 500;
@@ -1327,7 +1438,16 @@ onUnmounted(() => {
 .history-footer {
     padding: 8px 6px 12px;
     display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
     justify-content: center;
+}
+.history-index-hint {
+    color: #fbbf24;
+    font-size: 11px;
+    line-height: 1.4;
+    text-align: center;
 }
 .history-load-btn {
     min-width: 120px;

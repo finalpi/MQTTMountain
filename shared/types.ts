@@ -96,6 +96,7 @@ export interface HistoryQueryOptions {
     order?: 'desc' | 'asc';
     limit?: number;
     offset?: number;
+    freshness?: 'strict' | 'best-effort' | 'stale-ok';
 }
 
 export interface HistoryMessage extends PayloadMetadata {
@@ -207,6 +208,14 @@ export interface UpdateInfo {
     body?: string;
 }
 
+export interface StartupMaintenanceDone {
+    kind: 'staleLogs' | 'oldHistoryIndexes';
+    success: boolean;
+    deletedFiles?: number;
+    deletedDirs?: number;
+    message?: string;
+}
+
 export type IpcChannels = {
     'mqtt:connect': (p: ConnectPayload) => ApiResult;
     'mqtt:disconnect': (connectionId: string) => ApiResult;
@@ -249,6 +258,7 @@ export type IpcEvents = {
     'mqtt:messages': (batch: MqttMessage[]) => void;
     'mqtt:state': (p: { connectionId: string; state: 'connected' | 'reconnecting' | 'offline' | 'closed' | 'error'; message?: string }) => void;
     'app:autoDeleteDone': (files: number) => void;
+    'app:startupMaintenanceDone': (p: StartupMaintenanceDone) => void;
     'window:focused': () => void;
     'history:exportProgress': (p: HistoryExportProgress) => void;
     'history:indexProgress': (p: HistoryIndexProgress) => void;

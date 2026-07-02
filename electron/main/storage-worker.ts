@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage } from './storage';
+import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage, stopAcceptingStorageWrites } from './storage';
 import type { BucketItem } from './history-bucket-codec';
 
 interface StorageWorkerRequest {
@@ -61,6 +61,7 @@ parentPort?.on('message', (msg: StorageWorkerRequest) => {
                 reply(msg.id, true);
                 break;
             case 'shutdown':
+                stopAcceptingStorageWrites();
                 shutdownStorage();
                 reply(msg.id, true);
                 break;

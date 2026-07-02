@@ -11,13 +11,14 @@ const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
 const MAX_LIMIT = 5000;
 const INDEX_QUERY_CHUNK_SIZE = 1000;
 const BUCKET_QUERY_CHUNK_SIZE = 256;
-const HISTORY_INDEX_SCHEMA_VERSION = '3';
+const HISTORY_INDEX_SCHEMA_VERSION = '5';
+const OFFSET_INDEX_SCHEMA_VERSIONS = new Set(['3', '4', '5']);
 const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '2';
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
 const DEFAULT_PAYLOAD_PREVIEW_CHARS = 300;
-const PACKAGE_VERSION = '0.1.3';
+const PACKAGE_VERSION = '0.1.4';
 
 function printHelp() {
   process.stdout.write(`mqttmountain-mcp ${PACKAGE_VERSION}
@@ -621,7 +622,55 @@ function getIndexMeta(db, key) {
 
 function getHistoryIndexSchemaVersion(db) {
   const version = getIndexMeta(db, 'schema_version');
-  return version === HISTORY_INDEX_SCHEMA_VERSION || version === LEGACY_HISTORY_INDEX_SCHEMA_VERSION ? version : null;
+  return version === HISTORY_INDEX_SCHEMA_VERSION || OFFSET_INDEX_SCHEMA_VERSIONS.has(version) || version === LEGACY_HISTORY_INDEX_SCHEMA_VERSION ? version : null;
+}
+
+function hasOffsetIndexSchema(schemaVersion) {
+  return OFFSET_INDEX_SCHEMA_VERSIONS.has(schemaVersion);
+}
+
+function hasFtsIndex(db) {
+  return getIndexMeta(db, 'fts5_enabled') === '1' && tableExists(db, 'history_messages_fts');
+}
+
+function escapeFtsPhrase(term) {
+  if (/^[\p{L}\p{N}_]+$/u.test(term)) return `${term}*`;
+  return `"${String(term).replace(/"/g, '""')}"`;
+}
+
+function buildFtsMatch(conditions, terms, keywordLogic = 'and') {
+  if (conditions.length) {
+    const parts = [];
+    for (let i = 0; i < conditions.length; i++) {
+      const item = conditions[i];
+      const phrase = escapeFtsPhrase(item.term);
+      if (i === 0) parts.push(item.join === 'not' ? `NOT ${phrase}` : phrase);
+      else if (item.join === 'or') parts.push('OR', phrase);
+      else if (item.join === 'not') parts.push('NOT', phrase);
+      else parts.push('AND', phrase);
+    }
+    return parts.length ? parts.join(' ') : null;
+  }
+  if (!terms.length) return null;
+  return terms.map(escapeFtsPhrase).join(keywordLogic === 'or' ? ' OR ' : ' AND ');
+}
+
+function hasShortFtsTerm(conditions, terms) {
+  const values = conditions.length ? conditions.map((item) => item.term) : terms;
+  return values.some((term) => Array.from(term).length < 3);
+}
+
+function hasPositiveFtsTerm(conditions, terms) {
+  const values = conditions.length ? conditions.filter((item) => item.join !== 'not').map((item) => item.term) : terms;
+  return values.length > 0;
+}
+
+function canUseFts(db, state) {
+  return hasFtsIndex(db) && hasPositiveFtsTerm(state.conditions, state.terms) && !hasShortFtsTerm(state.conditions, state.terms);
+}
+
+function rowSearchText(row) {
+  return normalizeKeyword(String(row.topic || '') + String(row.search_text || ''));
 }
 
 function getUsableIndexVersion(db) {
@@ -668,8 +717,94 @@ function acceptHistoryMessage(state, message, searchText) {
   return state.out.length >= state.limit;
 }
 
+function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache) {
+  const base = { connectionId, topic: row.topic, time: row.time_ms };
+  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+  const payloadLen = hasOffsets ? row.payload_len : undefined;
+  if (hasOffsets && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
+    state.out.push(formatHistoryMessage(base, state, { payloadSize: payloadLen }));
+    return state.out.length >= state.limit;
+  }
+  const bucket = bucketStmt.get(row.bucket_ts, row.topic);
+  if (!bucket) return false;
+  let payloadBytes = null;
+  let payload = null;
+  if (hasOffsets) {
+    payloadBytes = readPayloadBytesSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
+    if (state.payloadMode === 'full' && payloadBytes) payload = payloadBytes.toString('utf8');
+  }
+  if (!payloadBytes && payload == null) {
+    const cacheKey = `${row.bucket_ts}|${row.topic}`;
+    let decoded = bucketCache.get(cacheKey);
+    if (!decoded) {
+      decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId);
+      bucketCache.set(cacheKey, decoded);
+    }
+    payload = decoded[row.msg_index]?.payload ?? null;
+  }
+  if (!payloadBytes && payload == null) return false;
+  state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText: payload, payloadSize: payloadLen }));
+  return state.out.length >= state.limit;
+}
+
+function queryFtsIndexedFile(db, connectionId, state, schemaVersion) {
+  const match = buildFtsMatch(state.conditions, state.terms, state.keywordLogic);
+  if (!match || !canUseFts(db, state)) return false;
+  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+  let sql = hasOffsets
+    ? `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
+       FROM history_messages_fts
+       JOIN history_messages m
+         ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+       WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`
+    : `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text
+       FROM history_messages_fts
+       JOIN history_messages m
+         ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+       WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
+  const params = [match, state.startTime, state.endTime];
+  if (state.topic) {
+    sql += ' AND m.topic = ?';
+    params.push(state.topic);
+  }
+  const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
+  const bucketCache = new Map();
+  let lastTime = null;
+  let lastTopic = null;
+  let lastMsgIndex = null;
+  while (state.out.length < state.limit) {
+    const pageSql = lastTime == null
+      ? sql
+      : `${sql}${state.order === 'asc'
+          ? ' AND (m.time_ms > ? OR (m.time_ms = ? AND m.topic > ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index > ?))'
+          : ' AND (m.time_ms < ? OR (m.time_ms = ? AND m.topic < ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index < ?))'}`;
+    const pageParams = lastTime == null
+      ? [...params]
+      : [...params, lastTime, lastTime, lastTopic, lastTime, lastTopic, lastMsgIndex];
+    const rows = db.prepare(`${pageSql}${state.order === 'asc'
+      ? ' ORDER BY m.time_ms ASC, m.topic ASC, m.msg_index ASC LIMIT ?'
+      : ' ORDER BY m.time_ms DESC, m.topic DESC, m.msg_index DESC LIMIT ?'}`).all(...pageParams, INDEX_QUERY_CHUNK_SIZE);
+    if (!rows.length) break;
+    for (const row of rows) {
+      if (!matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
+      if (state.skipped < state.offset) {
+        state.skipped += 1;
+        continue;
+      }
+      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache)) return true;
+    }
+    const tail = rows[rows.length - 1];
+    lastTime = tail.time_ms;
+    lastTopic = tail.topic;
+    lastMsgIndex = tail.msg_index;
+    if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;
+  }
+  return true;
+}
+
 function queryIndexedFile(db, connectionId, state, schemaVersion) {
-  let sql = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+  let sql = hasOffsets
     ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
     : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
   const params = [state.startTime, state.endTime];
@@ -689,38 +824,12 @@ function queryIndexedFile(db, connectionId, state, schemaVersion) {
     const rows = db.prepare(sql).all(...params, INDEX_QUERY_CHUNK_SIZE, offset);
     if (!rows.length) break;
     for (const row of rows) {
-      if (!matchesSearchText(row.search_text || '', state.conditions, state.terms, state.keywordLogic)) continue;
+      if (!matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
       if (state.skipped < state.offset) {
         state.skipped += 1;
         continue;
       }
-      const base = { connectionId, topic: row.topic, time: row.time_ms };
-      const payloadLen = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION ? row.payload_len : undefined;
-      if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
-        state.out.push(formatHistoryMessage(base, state, { payloadSize: payloadLen }));
-        if (state.out.length >= state.limit) return;
-        continue;
-      }
-      const cacheKey = `${row.bucket_ts}|${row.topic}`;
-      const bucket = bucketStmt.get(row.bucket_ts, row.topic);
-      if (!bucket) continue;
-      let payloadBytes = null;
-      let payload = null;
-      if (schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-        payloadBytes = readPayloadBytesSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
-        if (state.payloadMode === 'full' && payloadBytes) payload = payloadBytes.toString('utf8');
-      }
-      if (!payloadBytes && payload == null) {
-        let decoded = bucketCache.get(cacheKey);
-        if (!decoded) {
-          decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId);
-          bucketCache.set(cacheKey, decoded);
-        }
-        payload = decoded[row.msg_index]?.payload ?? null;
-      }
-      if (!payloadBytes && payload == null) continue;
-      state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText: payload, payloadSize: payloadLen }));
-      if (state.out.length >= state.limit) return;
+      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache)) return;
     }
     offset += rows.length;
     if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;
@@ -789,8 +898,12 @@ function queryHistory(logDir, options) {
       const db = new Database(filePath, { readonly: true, fileMustExist: true });
       try {
         const indexSchemaVersion = getUsableIndexVersion(db);
-        if (indexSchemaVersion) queryIndexedFile(db, connectionId, state, indexSchemaVersion);
-        else queryBucketFile(db, connectionId, state);
+        if (indexSchemaVersion) {
+          const usedFts = queryFtsIndexedFile(db, connectionId, state, indexSchemaVersion);
+          if (!usedFts) queryIndexedFile(db, connectionId, state, indexSchemaVersion);
+        } else {
+          queryBucketFile(db, connectionId, state);
+        }
       } finally {
         db.close();
       }

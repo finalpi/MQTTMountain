@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 
-export const HISTORY_INDEX_SCHEMA_VERSION = '4';
+export const HISTORY_INDEX_SCHEMA_VERSION = '5';
 export type HistoryFtsTokenizer = 'trigram' | 'unicode61' | 'none';
 
 export function setIndexMeta(db: Database.Database, key: string, value: string | number): void {
@@ -103,9 +103,8 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
             entry_len INTEGER NOT NULL,
             PRIMARY KEY (bucket_ts, topic, msg_index)
         ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time ON history_messages(time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time ON history_messages(topic, time_ms);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic ON history_messages(time_ms, topic);
+        CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
+        CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
     `);
 
     let tokenizer = detectHistoryFtsTokenizer(db);

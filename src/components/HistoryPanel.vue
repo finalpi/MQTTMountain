@@ -272,6 +272,16 @@ const dataSourceLabel = computed(() => {
     if (replay.state.running) return `回放预览：${replay.state.sourceName}`;
     return dataSource.value === 'imported' ? `导入数据：${importedName.value || '未命名文件'}` : '历史查询结果';
 });
+const shortKeywordRangeHint = computed(() => {
+    const hasShortTerm = activeKeywordConditions().some((item) => Array.from(item.term.trim()).length > 0 && Array.from(item.term.trim()).length < 3);
+    if (!hasShortTerm) return '';
+    const st = datetimeLocalToTs(startTime.value);
+    const et = datetimeLocalToTs(endTime.value) || Date.now();
+    const windowMs = st > 0 ? et - st : Number.POSITIVE_INFINITY;
+    if (windowMs <= 24 * 60 * 60 * 1000) return '';
+    return '短关键词会退化为扫描，建议输入至少 3 个字符或缩小时间范围。';
+});
+
 const indexSummary = computed(() => {
     if (indexState.value.running && indexState.value.progress) {
         const p = indexState.value.progress;
@@ -927,6 +937,9 @@ watch(
                 <button class="btn btn-mini" :disabled="indexState.running" @click="buildIndex">
                     {{ indexState.running ? '索引中...' : '建立/重建索引' }}
                 </button>
+            </div>
+            <div v-if="shortKeywordRangeHint" class="query-note warn">
+                {{ shortKeywordRangeHint }}
             </div>
             <div v-if="(hasMoreHistory || loadingMore) && !loading" class="query-note">
                 {{ loadingMore ? '正在加载更多历史结果...' : `已加载 ${rows.length.toLocaleString()} 条，继续向下滚动可加载更多。` }}

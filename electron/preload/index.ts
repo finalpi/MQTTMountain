@@ -21,7 +21,8 @@ import type {
     MqttMessage,
     PublishPayload,
     ApiResult,
-    UpdateInfo
+    UpdateInfo,
+    StartupMaintenanceDone
 } from '../../shared/types';
 import type { DecodedResult, PluginRecord, PluginUpdateInfo } from '../../shared/plugin';
 
@@ -115,6 +116,11 @@ const api = {
         const listener = (_e: IpcRendererEvent, files: number) => cb(files);
         ipcRenderer.on('app:autoDeleteDone', listener);
         return () => ipcRenderer.removeListener('app:autoDeleteDone', listener);
+    },
+    onStartupMaintenanceDone: (cb: (p: StartupMaintenanceDone) => void) => {
+        const listener = (_e: IpcRendererEvent, p: StartupMaintenanceDone) => cb(p);
+        ipcRenderer.on('app:startupMaintenanceDone', listener);
+        return () => ipcRenderer.removeListener('app:startupMaintenanceDone', listener);
     },
     onWindowFocused: (cb: () => void) => {
         const listener = () => cb();

@@ -179,12 +179,21 @@ function pushIndexedRowIfMatches(
     out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
 }
 
-function topicWhereForSearch(conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): { sql: string; params: string[] } | null {
+function likeParam(term: string): string {
+    return `%${term.replace(/[\\%_]/g, '\\$&')}%`;
+}
+
+function buildLikeWhere(
+    column: string,
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or'
+): { sql: string; params: string[] } | null {
     if (conditions.length > 0) {
         const params: string[] = [];
         const parts = conditions.map((item, index) => {
-            params.push(`%${item.term}%`);
-            const expr = 'lower(topic) LIKE ?';
+            params.push(likeParam(item.term));
+            const expr = `${column} LIKE ? ESCAPE '\\'`;
             if (index === 0) return item.join === 'not' ? `NOT ${expr}` : expr;
             if (item.join === 'or') return `OR ${expr}`;
             if (item.join === 'not') return `AND NOT ${expr}`;
@@ -194,9 +203,22 @@ function topicWhereForSearch(conditions: NormalizedCondition[], terms: string[],
     }
     if (terms.length === 0) return null;
     return {
-        sql: terms.map(() => 'lower(topic) LIKE ?').join(keywordLogic === 'or' ? ' OR ' : ' AND '),
-        params: terms.map((term) => `%${term}%`)
+        sql: terms.map(() => `${column} LIKE ? ESCAPE '\\'`).join(keywordLogic === 'or' ? ' OR ' : ' AND '),
+        params: terms.map(likeParam)
     };
+}
+
+function topicWhereForSearch(conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): { sql: string; params: string[] } | null {
+    return buildLikeWhere('lower(topic)', conditions, terms, keywordLogic);
+}
+
+function searchTextWhereForSearch(conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): { sql: string; params: string[] } | null {
+    return buildLikeWhere('search_text', conditions, terms, keywordLogic);
+}
+
+function rowMatchesIndexedSearch(row: IndexedMessageRow, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): boolean {
+    if (conditions.length === 0 && terms.length === 0) return true;
+    return matchesSearchText(normalizeCombinedSearchText(row.topic, row.search_text), conditions, terms, keywordLogic);
 }
 
 function queryTopicTextIndexedFile(
@@ -259,6 +281,82 @@ function queryTopicTextIndexedFile(
         lastMsgIndex = tail.msg_index;
         if (rows.length < chunkSize) break;
     }
+}
+
+function queryTrigramFtsIndexedFile(
+    db: Database.Database,
+    schemaVersion: string,
+    fe: { san: string },
+    st: number,
+    et: number,
+    topicFilter: string | null,
+    order: 'asc' | 'desc',
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    offset: number,
+    skippedRef: { value: number },
+    seen: Set<string> | null,
+    out: QueryOutput
+): boolean {
+    if (getHistoryFtsTokenizer(db) !== 'trigram' || !hasFtsIndex(db)) return false;
+    const match = buildFtsMatch(conditions, terms, keywordLogic);
+    if (!match) return false;
+    const positiveTerms = conditions.length > 0
+        ? conditions.filter((item) => item.join !== 'not').map((item) => item.term)
+        : terms;
+    if (positiveTerms.length === 0 || positiveTerms.some((term) => Array.from(term).length < 3)) return false;
+    const chunkSize = 1000;
+    const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
+    const bucketCache = new Map<string, HistoryMessage[]>();
+    let lastTime: number | null = null;
+    let lastTopic: string | null = null;
+    let lastMsgIndex: number | null = null;
+    while (out.length < limit) {
+        let sql = `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
+                   FROM history_messages_fts
+                   JOIN history_messages m
+                     ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+                   WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
+        const params: Array<number | string> = [match, st, et];
+        if (topicFilter) {
+            sql += ' AND m.topic = ?';
+            params.push(topicFilter);
+        }
+        if (lastTime != null && lastTopic != null && lastMsgIndex != null) {
+            if (order === 'desc') {
+                sql += ' AND (m.time_ms < ? OR (m.time_ms = ? AND m.topic < ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index < ?))';
+            } else {
+                sql += ' AND (m.time_ms > ? OR (m.time_ms = ? AND m.topic > ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index > ?))';
+            }
+            params.push(lastTime, lastTime, lastTopic, lastTime, lastTopic, lastMsgIndex);
+        }
+        sql += order === 'desc'
+            ? ' ORDER BY m.time_ms DESC, m.topic DESC, m.msg_index DESC LIMIT ?'
+            : ' ORDER BY m.time_ms ASC, m.topic ASC, m.msg_index ASC LIMIT ?';
+        params.push(chunkSize);
+        const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
+        if (rows.length === 0) break;
+        for (const row of rows) {
+            if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
+            const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
+            if (seen?.has(key)) continue;
+            seen?.add(key);
+            if (skippedRef.value < offset) {
+                skippedRef.value++;
+                continue;
+            }
+            pushIndexedRow(db, bucketStmt, bucketCache, schemaVersion, fe, row, out);
+            if (out.length >= limit) break;
+        }
+        const tail = rows[rows.length - 1];
+        lastTime = tail.time_ms;
+        lastTopic = tail.topic;
+        lastMsgIndex = tail.msg_index;
+        if (rows.length < chunkSize) break;
+    }
+    return true;
 }
 
 function queryFtsIndexedFile(
@@ -355,11 +453,16 @@ function queryIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
+        const searchWhere = topicFilter ? searchTextWhereForSearch(conditions, terms, keywordLogic) : null;
         let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?';
         const params: Array<number | string> = [st, et];
         if (topicFilter) {
             sql += ' AND topic = ?';
             params.push(topicFilter);
+        }
+        if (searchWhere) {
+            sql += ` AND (${searchWhere.sql})`;
+            params.push(...searchWhere.params);
         }
         if (lastTime != null && lastTopic != null && lastMsgIndex != null) {
             if (order === 'desc') {
@@ -376,7 +479,7 @@ function queryIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!matchesSearchText(normalizeCombinedSearchText(row.topic, row.search_text), conditions, terms, keywordLogic)) continue;
+            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             if (skippedRef.value < offset) {
                 skippedRef.value++;
                 continue;
@@ -408,20 +511,26 @@ function queryRecentTopicIndexedFile(
     const hasTextFilter = conditions.length > 0 || terms.length > 0;
     if (hasTextFilter) {
         const skippedRef = { value: 0 };
+        const hasBoundedWindow = Number.isFinite(st) && Number.isFinite(et) && et >= st;
+        const windowMs = hasBoundedWindow ? et - st : Number.POSITIVE_INFINITY;
+        if (hasFtsIndex(db) && queryTrigramFtsIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, null, out)) return;
+        if (windowMs <= 24 * 60 * 60 * 1000) {
+            queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
+            return;
+        }
         if (!queryFtsIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, null, out)) {
             queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
         }
         return;
     }
     const candidateBatchSize = Math.max(1, limit);
-    const maxCandidates = limit;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
     const bucketCache = new Map<string, HistoryMessage[]>();
     let lastTime: number | null = null;
     let lastMsgIndex: number | null = null;
     let scanned = 0;
 
-    while (out.length < limit && scanned < maxCandidates) {
+    while (out.length < limit) {
         let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE topic = ? AND time_ms BETWEEN ? AND ?';
         const params: Array<number | string> = [topicFilter, st, et];
         if (lastTime != null && lastMsgIndex != null) {
@@ -429,13 +538,12 @@ function queryRecentTopicIndexedFile(
             params.push(lastTime, lastTime, lastMsgIndex);
         }
         sql += ' ORDER BY time_ms DESC, msg_index DESC LIMIT ?';
-        params.push(Math.min(candidateBatchSize, maxCandidates - scanned));
+        params.push(candidateBatchSize);
 
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         scanned += rows.length;
         for (const row of rows) {
-            if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
             pushIndexedRow(db, bucketStmt, bucketCache, schemaVersion, fe, row, out);
             if (out.length >= limit) break;
         }
@@ -448,6 +556,59 @@ function queryRecentTopicIndexedFile(
 
 function canUseRecentTopicFastPath(topicFilter: string | null, order: 'asc' | 'desc', offset: number): topicFilter is string {
     return Boolean(topicFilter) && order === 'desc' && offset === 0;
+}
+
+function queryRawTopicBuckets(
+    db: Database.Database,
+    fe: { san: string },
+    st: number,
+    et: number,
+    topicFilter: string,
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    out: QueryOutput
+): void {
+    const bucketStart = Math.floor(st / 1000);
+    const bucketEnd = Math.floor(et / 1000);
+    const rows = db.prepare(
+        `SELECT bucket_ts, topic, blob FROM buckets
+         WHERE topic = ? AND bucket_ts BETWEEN ? AND ?
+         ORDER BY bucket_ts DESC`
+    ).all(topicFilter, bucketStart, bucketEnd) as { bucket_ts: number; topic: string; blob: Buffer }[];
+    for (const row of rows) {
+        const entries = decodeBucket(row.blob, row.bucket_ts, row.topic)
+            .filter((item) => item.time >= st && item.time <= et)
+            .sort((a, b) => b.time - a.time);
+        for (const item of entries) {
+            if (!matchesSearchText(normalizeCombinedSearchText(item.topic, item.payload), conditions, terms, keywordLogic)) continue;
+            out.push({ connectionId: fe.san, topic: item.topic, payload: item.payload, time: item.time });
+            if (out.length >= limit) return;
+        }
+    }
+}
+
+function queryRawRecentTopicFiles(
+    st: number,
+    et: number,
+    topicFilter: string,
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    out: QueryOutput
+): void {
+    const files = collectDayFiles(logRoot, { connectionId: opts.connectionId, startTime: st, endTime: et, order: 'desc' });
+    for (const fe of files) {
+        if (out.length >= limit) break;
+        const db = new Database(fe.path, { readonly: true });
+        try {
+            queryRawTopicBuckets(db, fe, st, et, topicFilter, conditions, terms, keywordLogic, limit, out);
+        } finally {
+            db.close();
+        }
+    }
 }
 
 function queryHistory(out: QueryOutput): void {
@@ -475,6 +636,10 @@ function queryHistory(out: QueryOutput): void {
                 db.close();
             }
         }
+        if (out.length === 0 && conditions.length > 0) {
+            const topicOnlyConditions = conditions.filter((item) => item.join !== 'and' || !topicFilter.includes(item.term));
+            queryRawRecentTopicFiles(st, et, topicFilter, topicOnlyConditions, terms, keywordLogic, limit, out);
+        }
         return;
     }
 
@@ -492,10 +657,8 @@ function queryHistory(out: QueryOutput): void {
                         queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                     }
                 } else {
-                    const seen = new Set<string>();
-                    const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, seen, out);
+                    const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
                     if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-                    else if (out.length < limit) queryTopicTextIndexedFile(db, indexSchemaVersion, fe, st, et, order, conditions, terms, keywordLogic, limit, offset, skippedRef, seen, out);
                 }
             } else {
                 queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);

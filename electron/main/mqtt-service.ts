@@ -23,6 +23,7 @@ export class MqttService {
     private ipcQueue: MqttIpcQueue;
     private seq = 0;
     private getWin: () => BrowserWindow | null;
+    private shuttingDown = false;
 
     constructor(getWin: () => BrowserWindow | null) {
         this.getWin = getWin;
@@ -119,7 +120,7 @@ export class MqttService {
 
                 let msgCount = 0;
                 client.on('message', (topic, payload, _packet?: IPublishPacket) => {
-                    if (ctx.disabledTopics.has(topic)) return;
+                    if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) return;
                     const payloadView = decodePayloadView(payload);
                     const text = payloadView.text;
                     const now = Date.now();
@@ -230,6 +231,7 @@ export class MqttService {
     }
 
     shutdown(): void {
+        this.shuttingDown = true;
         this.ipcQueue.flush();
         for (const id of [...this.conns.keys()]) this.disconnect(id);
         this.ipcQueue.shutdown();

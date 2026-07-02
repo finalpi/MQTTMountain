@@ -1,12 +1,12 @@
 {
   "name": "mqttmountain",
-  "version": "1.0.32",
+  "version": "1.0.33",
   "description": "高性能 MQTT 客户端（Electron + Vue 3 + TS）",
   "main": "dist-electron/main/index.js",
   "author": "",
   "license": "MIT",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev.mjs",
     "build": "vue-tsc --noEmit && vite build && electron-builder",
     "build:dir": "vue-tsc --noEmit && vite build && electron-builder --dir",
     "typecheck": "vue-tsc --noEmit",

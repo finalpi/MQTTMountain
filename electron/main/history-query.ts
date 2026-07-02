@@ -23,9 +23,18 @@ interface ActiveStream {
 }
 
 const activeStreams = new Map<string, ActiveStream>();
-const QUERY_FLUSH_WAIT_MS = 300;
+const QUERY_FLUSH_WAIT_MS = 80;
+const QUERY_RECENT_WINDOW_MS = 5_000;
 
-async function flushStorageForQuery(): Promise<void> {
+function shouldFlushForQuery(opts: HistoryQueryOptions): boolean {
+    if (opts.freshness === 'strict') return true;
+    if (opts.freshness === 'stale-ok') return false;
+    const endTime = opts.endTime;
+    return endTime == null || endTime <= 0 || endTime >= Date.now() - QUERY_RECENT_WINDOW_MS;
+}
+
+async function flushStorageForQuery(opts: HistoryQueryOptions): Promise<void> {
+    if (!shouldFlushForQuery(opts)) return;
     let timeoutId: NodeJS.Timeout | null = null;
     try {
         await Promise.race([
@@ -56,7 +65,7 @@ function sendIfAlive(sender: WebContents, channel: string, payload: unknown): bo
 
 export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<HistoryMessage[]> {
     return await scheduleHeavyJob({ kind: 'query', label: 'history-query', priority: 20 }, async () => {
-        await flushStorageForQuery();
+        await flushStorageForQuery(opts);
 
         const workerPath = path.join(__dirname, 'history-query-worker.js');
         const worker = new Worker(workerPath, {
@@ -101,13 +110,14 @@ async function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStrea
     const active = activeStreams.get(req.requestId);
     if (!active || active.cancelled) return;
 
-    await flushStorageAsync();
+    const opts = req.opts || {};
+    await flushStorageForQuery(opts);
 
     return await new Promise<void>((resolve, reject) => {
         const workerPath = path.join(__dirname, 'history-query-worker.js');
         const worker = new Worker(workerPath, {
             workerData: {
-                opts: req.opts || {},
+                opts,
                 logRoot: getLogRoot(),
                 stream: true,
                 requestId: req.requestId,

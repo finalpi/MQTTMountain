@@ -72,7 +72,13 @@ let storageWorkerSeq = 0;
 let storageWorkerFailure: Error | null = null;
 let storageWorkerFailureLogged = false;
 let storageWorkerShuttingDown = false;
-const storageWorkerRequests = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+let storageAcceptingWrites = true;
+const storageWorkerRequests = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+}>();
+const autoDeleteWorkers = new Set<Worker>();
 
 /** 单条消息条目（尚未合批） */
 interface PendingEntry extends BucketItem {
@@ -93,12 +99,14 @@ const STORAGE_HARD_ENTRIES = 20_000;
 const STORAGE_WORKER_BATCH_MS = 15;
 const STORAGE_WORKER_BATCH_BYTES = 512 * 1024;
 const STORAGE_WORKER_BATCH_ENTRIES = 1000;
+const STORAGE_WORKER_RPC_TIMEOUT_MS = 30_000;
+const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 8_000;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
     LOG_ROOT = logRoot;
+    storageAcceptingWrites = true;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
-    purgeNonCurrentHistoryIndexDbs();
     if (USE_STORAGE_WORKER) ensureStorageWorker();
 }
 
@@ -140,8 +148,8 @@ function isCurrentHistoryIndexDb(filePath: string): boolean {
     }
 }
 
-function purgeNonCurrentHistoryIndexDbs(): void {
-    if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return;
+function purgeNonCurrentHistoryIndexDbs(): number {
+    if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return 0;
     let deleted = 0;
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
     for (const d of dirs) {
@@ -154,10 +162,14 @@ function purgeNonCurrentHistoryIndexDbs(): void {
         }
     }
     if (deleted > 0) console.info(`[storage] purged ${deleted} old history db files; new history uses index schema v${HISTORY_INDEX_SCHEMA_VERSION}`);
+    return deleted;
 }
 
 function rejectStorageWorkerRequests(error: Error): void {
-    for (const request of storageWorkerRequests.values()) request.reject(error);
+    for (const request of storageWorkerRequests.values()) {
+        clearTimeout(request.timer);
+        request.reject(error);
+    }
     storageWorkerRequests.clear();
 }
 
@@ -188,6 +200,7 @@ function ensureStorageWorker(): Worker | null {
         const request = storageWorkerRequests.get(msg.id);
         if (!request) return;
         storageWorkerRequests.delete(msg.id);
+        clearTimeout(request.timer);
         if (msg.ok) request.resolve(msg.result);
         else request.reject(new Error(msg.error || 'storage worker error'));
     });
@@ -209,16 +222,21 @@ function storageWorkerUnavailableError(): Error {
     return storageWorkerFailure ?? new Error('storage worker is disabled');
 }
 
-function callStorageWorker(command: string, payload?: unknown): Promise<unknown> {
+function callStorageWorker(command: string, payload?: unknown, timeoutMs = STORAGE_WORKER_RPC_TIMEOUT_MS): Promise<unknown> {
     const worker = ensureStorageWorker();
     if (!worker) return Promise.reject(storageWorkerUnavailableError());
     const id = ++storageWorkerSeq;
     return new Promise((resolve, reject) => {
-        storageWorkerRequests.set(id, { resolve, reject });
+        const timer = setTimeout(() => {
+            storageWorkerRequests.delete(id);
+            reject(new Error(`storage worker ${command} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        storageWorkerRequests.set(id, { resolve, reject, timer });
         try {
             worker.postMessage({ id, command, payload });
         } catch (error) {
             storageWorkerRequests.delete(id);
+            clearTimeout(timer);
             const err = error instanceof Error ? error : new Error(String(error));
             failStorageWorker(err);
             reject(err);
@@ -443,8 +461,13 @@ function flushStorageWorkerBatch(): void {
 }
 
 // ---------------- flush ----------------
+export function stopAcceptingStorageWrites(): void {
+    storageAcceptingWrites = false;
+    clearStorageWorkerBatchTimer();
+}
+
 export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
-    if (!connectionId) return;
+    if (!storageAcceptingWrites || !connectionId) return;
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
     const entry = { connectionId, topic, payload, tsMs, ...meta, payloadSize };
     const estimatedBytes = payloadSize + topic.length + 16;
@@ -947,6 +970,19 @@ export async function clearLogsWithoutConnectionsAsync(connectionIds: string[]):
     }
 }
 
+export async function purgeNonCurrentHistoryIndexDbsAsync(): Promise<{ deletedFiles: number }> {
+    if (!USE_STORAGE_WORKER) {
+        return withStorageMaintenance(() => ({ deletedFiles: purgeNonCurrentHistoryIndexDbs() }));
+    }
+    pauseStorageWrites('purge-old-history-indexes');
+    try {
+        await closeAllLogDbsAsync();
+        return { deletedFiles: purgeNonCurrentHistoryIndexDbs() };
+    } finally {
+        resumeStorageWrites('purge-old-history-indexes');
+    }
+}
+
 // ---------------- cleanup ----------------
 export function runAutoDeleteAsync(days: number, onDone: (files: number) => void, onFinish?: () => void): void {
     if (days <= 0) {
@@ -959,10 +995,12 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
     closeOldLogDbs(cutoff);
     const workerPath = path.join(__dirname, 'auto-delete-worker.js');
     const w = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT, cutoff } });
+    autoDeleteWorkers.add(w);
     let finished = false;
     const finish = () => {
         if (finished) return;
         finished = true;
+        autoDeleteWorkers.delete(w);
         resumeStorageWrites('auto-delete');
         onFinish?.();
     };
@@ -978,6 +1016,12 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
     w.once('exit', finish);
 }
 
+export async function stopAutoDeleteWorkers(): Promise<void> {
+    const workers = [...autoDeleteWorkers];
+    autoDeleteWorkers.clear();
+    await Promise.all(workers.map((worker) => worker.terminate().catch(() => undefined)));
+}
+
 export function shutdownStorage(): void {
     if (USE_STORAGE_WORKER) {
         void shutdownStorageAsync();
@@ -987,6 +1031,7 @@ export function shutdownStorage(): void {
 }
 
 export async function shutdownStorageAsync(): Promise<void> {
+    storageAcceptingWrites = false;
     if (USE_STORAGE_WORKER) {
         clearStorageWorkerBatchTimer();
         if (storageWorkerFailure) {
@@ -998,7 +1043,9 @@ export async function shutdownStorageAsync(): Promise<void> {
             storageWorkerShuttingDown = true;
             try {
                 flushStorageWorkerBatch();
-                await callStorageWorker('shutdown');
+                await callStorageWorker('shutdown', undefined, STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS).catch((error) => {
+                    console.warn('[storage] worker shutdown timed out; forcing terminate:', error);
+                });
             } finally {
                 const worker = storageWorker;
                 storageWorker = null;
