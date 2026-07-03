@@ -81,11 +81,12 @@ export function appendEntriesToBucketBlob(existingBlob: Buffer, existingCount: n
     return { blob, count, bytes: blob.length };
 }
 
-export function iterateBucketEntries(blob: Buffer, bucketSec: number): BucketEntry[] {
+export function iterateBucketEntries(blob: Buffer, bucketSec: number, startIndex = 0): BucketEntry[] {
     const out: BucketEntry[] = [];
     if (!blob || blob.length < 4) return out;
     const base = bucketSec * 1000;
     const n = blob.readUInt32LE(0);
+    const firstIndex = Math.max(0, startIndex | 0);
     let p = 4;
     for (let i = 0; i < n && p + 6 <= blob.length; i++) {
         const entryOffset = p;
@@ -93,8 +94,9 @@ export function iterateBucketEntries(blob: Buffer, bucketSec: number): BucketEnt
         const payloadLen = blob.readUInt32LE(p); p += 4;
         const payloadOffset = p;
         if (payloadOffset + payloadLen > blob.length) break;
-        const payload = blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
         p += payloadLen;
+        if (i < firstIndex) continue;
+        const payload = blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
         out.push({
             msgIndex: i,
             time: base + off,

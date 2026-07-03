@@ -469,7 +469,7 @@ export function stopAcceptingStorageWrites(): void {
 export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
     if (!storageAcceptingWrites || !connectionId) return;
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
-    const entry = { connectionId, topic, payload, tsMs, ...meta, payloadSize };
+    const entry = { connectionId, topic, payload, tsMs, payloadSize, payloadEncoding: meta.payloadEncoding };
     const estimatedBytes = payloadSize + topic.length + 16;
     if (USE_STORAGE_WORKER) {
         enqueueStorageWorkerBatch(entry, estimatedBytes);
@@ -617,7 +617,7 @@ function flushStorageLocal(): void {
 
                     if (!canAppendIndex || !nextBlob || !indexSchemaVersion) continue;
                     try {
-                        const entries = iterateBucketEntries(nextBlob, g.sec).slice(startIndex);
+                        const entries = iterateBucketEntries(nextBlob, g.sec, startIndex);
                         appendBucketIndex(pack.insertIndexStmt, pack.insertFtsStmt, g.sec, g.topic, entries);
                         indexedMessageDelta += entries.length;
                         if (isNewBucket) indexedBucketDelta++;
