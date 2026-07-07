@@ -11,12 +11,25 @@ import { MqttIpcQueue } from './mqtt-ipc-queue';
 import { decodePayloadView } from './payload-codec';
 import { enqueueMessage } from './storage';
 
+interface QueuedMqttMessage {
+    ctx: ConnectionCtx;
+    connectionId: string;
+    topic: string;
+    payload: Buffer;
+}
+
 interface ConnectionCtx {
     id: string;
     client: MqttClient;
     disabledTopics: Set<string>;
     closing: boolean;
+    msgCount: number;
+    droppedMessages: number;
 }
+
+const MESSAGE_PROCESS_INTERVAL_MS = 8;
+const MESSAGE_PROCESS_BATCH = 1000;
+const MESSAGE_PROCESS_QUEUE_HARD = 100_000;
 
 export class MqttService {
     private conns = new Map<string, ConnectionCtx>();
@@ -24,6 +37,9 @@ export class MqttService {
     private seq = 0;
     private getWin: () => BrowserWindow | null;
     private shuttingDown = false;
+    private messageQueue: QueuedMqttMessage[] = [];
+    private messageQueueHead = 0;
+    private messageQueueTimer: NodeJS.Timeout | null = null;
 
     constructor(getWin: () => BrowserWindow | null) {
         this.getWin = getWin;
@@ -63,7 +79,9 @@ export class MqttService {
                     id: p.connectionId,
                     client,
                     disabledTopics: new Set(p.disabledTopics || []),
-                    closing: false
+                    closing: false,
+                    msgCount: 0,
+                    droppedMessages: 0
                 };
                 this.conns.set(p.connectionId, ctx);
 
@@ -118,31 +136,8 @@ export class MqttService {
                     }
                 });
 
-                let msgCount = 0;
                 client.on('message', (topic, payload, _packet?: IPublishPacket) => {
-                    if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) return;
-                    const payloadView = decodePayloadView(payload);
-                    const text = payloadView.text;
-                    const now = Date.now();
-
-                    enqueueMessage(p.connectionId, topic, text, now, {
-                        payloadBytes: payload,
-                        payloadSize: payloadView.size,
-                        payloadEncoding: payloadView.encoding
-                    });
-                    const msg: MqttMessage = {
-                        connectionId: p.connectionId,
-                        topic,
-                        payload: text,
-                        payloadSize: payloadView.size,
-                        payloadEncoding: payloadView.encoding,
-                        time: now,
-                        seq: ++this.seq
-                    };
-                    this.ipcQueue.enqueue(msg);
-                    if (++msgCount <= 3 || msgCount % 500 === 0) {
-                        console.log(`[mqtt][${p.connectionId}] msg #${msgCount} ${topic} (${text.length}B)`);
-                    }
+                    this.enqueueIncomingMessage(ctx, p.connectionId, topic, payload);
                 });
             } catch (e) {
                 settle({ success: false, message: (e as Error).message });
@@ -220,6 +215,84 @@ export class MqttService {
         this.ipcQueue.setDisplayPaused(connectionId, paused);
     }
 
+    private enqueueIncomingMessage(ctx: ConnectionCtx, connectionId: string, topic: string, payload: Buffer): void {
+        if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) return;
+        if (this.queuedMessageCount() >= MESSAGE_PROCESS_QUEUE_HARD) {
+            const dropped = this.dropQueuedMessages(Math.ceil(MESSAGE_PROCESS_QUEUE_HARD * 0.1));
+            ctx.droppedMessages += dropped;
+            console.warn(`[mqtt][${connectionId}] 入站消息积压超限，已丢弃 ${dropped} 条，避免主进程卡死`);
+        }
+        this.messageQueue.push({ ctx, connectionId, topic, payload: Buffer.from(payload) });
+        this.scheduleMessageProcessing();
+    }
+
+    private queuedMessageCount(): number {
+        return this.messageQueue.length - this.messageQueueHead;
+    }
+
+    private dropQueuedMessages(count: number): number {
+        const dropped = Math.min(count, this.queuedMessageCount());
+        this.messageQueueHead += dropped;
+        this.compactMessageQueueIfNeeded();
+        return dropped;
+    }
+
+    private compactMessageQueueIfNeeded(): void {
+        if (this.messageQueueHead === 0) return;
+        if (this.messageQueueHead >= this.messageQueue.length) {
+            this.messageQueue.length = 0;
+            this.messageQueueHead = 0;
+            return;
+        }
+        if (this.messageQueueHead >= 4096 && this.messageQueueHead * 2 >= this.messageQueue.length) {
+            this.messageQueue = this.messageQueue.slice(this.messageQueueHead);
+            this.messageQueueHead = 0;
+        }
+    }
+
+    private scheduleMessageProcessing(): void {
+        if (this.messageQueueTimer || this.shuttingDown) return;
+        this.messageQueueTimer = setTimeout(() => {
+            this.messageQueueTimer = null;
+            this.processMessageQueue();
+        }, MESSAGE_PROCESS_INTERVAL_MS);
+    }
+
+    private processMessageQueue(): void {
+        const batchSize = Math.min(MESSAGE_PROCESS_BATCH, this.queuedMessageCount());
+        for (let i = 0; i < batchSize; i++) {
+            const item = this.messageQueue[this.messageQueueHead++];
+            if (!item) break;
+            const { ctx, connectionId, topic, payload } = item;
+            if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) continue;
+            const payloadView = decodePayloadView(payload);
+            const text = payloadView.text;
+            const now = Date.now();
+
+            enqueueMessage(connectionId, topic, text, now, {
+                payloadSize: payloadView.size,
+                payloadEncoding: payloadView.encoding
+            });
+            const msg: MqttMessage = {
+                connectionId,
+                topic,
+                payload: text,
+                payloadSize: payloadView.size,
+                payloadEncoding: payloadView.encoding,
+                time: now,
+                seq: ++this.seq
+            };
+            this.ipcQueue.enqueue(msg);
+            ctx.msgCount++;
+            if (ctx.msgCount <= 3 || ctx.msgCount % 500 === 0) {
+                const dropped = ctx.droppedMessages ? `, dropped=${ctx.droppedMessages}` : '';
+                console.log(`[mqtt][${connectionId}] msg #${ctx.msgCount} ${topic} (${text.length}B${dropped})`);
+            }
+        }
+        this.compactMessageQueueIfNeeded();
+        if (this.queuedMessageCount() > 0) this.scheduleMessageProcessing();
+    }
+
     private sendState(connectionId: string, state: string, message?: string): void {
         const win = this.getWin();
         if (!win || win.isDestroyed()) return;
@@ -232,6 +305,12 @@ export class MqttService {
 
     shutdown(): void {
         this.shuttingDown = true;
+        if (this.messageQueueTimer) {
+            clearTimeout(this.messageQueueTimer);
+            this.messageQueueTimer = null;
+        }
+        this.messageQueue.length = 0;
+        this.messageQueueHead = 0;
         this.ipcQueue.flush();
         for (const id of [...this.conns.keys()]) this.disconnect(id);
         this.ipcQueue.shutdown();

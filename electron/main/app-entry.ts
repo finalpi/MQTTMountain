@@ -1,4 +1,5 @@
 import { app, BrowserWindow, session } from 'electron';
+import fs from 'node:fs';
 import path from 'node:path';
 import { initIpc } from './ipc';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
@@ -23,6 +24,64 @@ const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const RENDERER_DIST = path.join(process.env.APP_ROOT!, 'dist');
 const STARTUP_MAINTENANCE_DELAY_MS = 5_000;
 const STORAGE_SHUTDOWN_TIMEOUT_MS = 10_000;
+const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
+
+function getDiagnosticLogPath(): string {
+    return path.join(app.getPath('userData'), 'logs', 'main-diagnostics.log');
+}
+
+function formatDiagnosticValue(value: unknown): string {
+    if (value instanceof Error) return `${value.stack || value.message}`;
+    if (typeof value === 'string') return value;
+    try {
+        return JSON.stringify(value);
+    } catch {
+        return String(value);
+    }
+}
+
+function writeDiagnosticLog(label: string, ...values: unknown[]): void {
+    try {
+        const logPath = getDiagnosticLogPath();
+        fs.mkdirSync(path.dirname(logPath), { recursive: true });
+        if (fs.existsSync(logPath) && fs.statSync(logPath).size > DIAGNOSTIC_LOG_MAX_BYTES) {
+            const rotatedPath = `${logPath}.1`;
+            try { fs.rmSync(rotatedPath, { force: true }); } catch {}
+            fs.renameSync(logPath, rotatedPath);
+        }
+        const line = [new Date().toISOString(), label, ...values.map(formatDiagnosticValue)].join(' ') + '\n';
+        fs.appendFileSync(logPath, line, 'utf8');
+    } catch {
+        // Diagnostics must never affect the app lifecycle.
+    }
+}
+
+function installDiagnosticHandlers(): void {
+    process.on('uncaughtException', (error) => {
+        writeDiagnosticLog('[process] uncaughtException', error);
+        console.error('[process] uncaughtException:', error);
+    });
+    process.on('unhandledRejection', (reason) => {
+        writeDiagnosticLog('[process] unhandledRejection', reason);
+        console.error('[process] unhandledRejection:', reason);
+    });
+    process.on('warning', (warning) => {
+        writeDiagnosticLog('[process] warning', warning);
+    });
+    app.on('render-process-gone', (_event, webContents, details) => {
+        writeDiagnosticLog('[electron] render-process-gone', { webContentsId: webContents.id, details });
+        console.error('[electron] render-process-gone:', details);
+    });
+    app.on('child-process-gone', (_event, details) => {
+        writeDiagnosticLog('[electron] child-process-gone', details);
+        console.error('[electron] child-process-gone:', details);
+    });
+    app.on('gpu-info-update', () => {
+        writeDiagnosticLog('[electron] gpu-info-update');
+    });
+}
+
+installDiagnosticHandlers();
 
 function resolveIconPath(): string {
     return app.isPackaged
@@ -116,6 +175,7 @@ async function runStartupMaintenance(): Promise<void> {
 }
 
 function shutdownForQuit(): Promise<void> {
+    writeDiagnosticLog('[main] shutdown start');
     isQuitting = true;
     stopAcceptingStorageWrites();
     if (quitShutdownPromise) return quitShutdownPromise;
@@ -131,6 +191,7 @@ function shutdownForQuit(): Promise<void> {
             console.warn('[main] storage shutdown did not finish cleanly:', error);
         });
         pluginManager.shutdown();
+        writeDiagnosticLog('[main] shutdown complete');
     })();
     return quitShutdownPromise;
 }
@@ -181,7 +242,17 @@ async function createWindow() {
     win.on('show', notifyFocus);
     win.webContents.on('did-finish-load', notifyFocus);
 
+    win.webContents.on('unresponsive', () => {
+        writeDiagnosticLog('[window] unresponsive');
+        console.error('[window] unresponsive');
+    });
+
+    win.webContents.on('responsive', () => {
+        writeDiagnosticLog('[window] responsive');
+    });
+
     win.on('close', () => {
+        writeDiagnosticLog('[window] close', { isQuitting });
         if (isQuitting) return;
         isQuitting = true;
         stopAcceptingStorageWrites();
@@ -189,6 +260,7 @@ async function createWindow() {
     });
 
     win.on('closed', () => {
+        writeDiagnosticLog('[window] closed');
         win = null;
     });
 }
@@ -198,15 +270,28 @@ app.on('second-instance', () => {
 });
 
 app.whenReady().then(async () => {
+    writeDiagnosticLog('[main] app ready', {
+        version: app.getVersion(),
+        packaged: app.isPackaged,
+        platform: process.platform,
+        arch: process.arch,
+        pid: process.pid
+    });
     initSettings();
     initStorage(getCurrentLogDir());
     await purgeOldHistoryBeforeUse();
-    await pluginManager.init().catch((e) => console.error('[plugin] init:', e));
+    await pluginManager.init().catch((e) => {
+        writeDiagnosticLog('[plugin] init failed', e);
+        console.error('[plugin] init:', e);
+    });
     mqttService = new MqttService(() => win);
     initIpc(mqttService);
     await createWindow();
     scheduleStartupMaintenance();
     startAutoDeleteScheduler(() => win);
+}).catch((error) => {
+    writeDiagnosticLog('[main] app ready failed', error);
+    console.error('[main] app ready failed:', error);
 });
 
 app.on('before-quit', (event) => {

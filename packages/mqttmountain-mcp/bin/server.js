@@ -955,6 +955,26 @@ function jsonText(data) {
   };
 }
 
+function installStdioExitHandlers(transport) {
+  let shuttingDown = false;
+  const shutdown = async (code = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    try {
+      await transport.close();
+    } catch {
+      // Ignore close errors while the stdio owner is already going away.
+    } finally {
+      process.exit(code);
+    }
+  };
+
+  process.stdin.once('end', () => void shutdown(0));
+  process.stdin.once('close', () => void shutdown(0));
+  process.once('SIGINT', () => void shutdown(0));
+  process.once('SIGTERM', () => void shutdown(0));
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -1127,7 +1147,9 @@ async function main() {
     }
   );
 
-  await server.connect(new StdioServerTransport());
+  const transport = new StdioServerTransport();
+  installStdioExitHandlers(transport);
+  await server.connect(transport);
 }
 
 main().catch((error) => {
