@@ -7,6 +7,7 @@ import {
     matchesSearchText,
     normalizeCombinedSearchText,
     normalizeConditions,
+    normalizeKeyword,
     parseKeywordTerms,
     type NormalizedCondition
 } from './history-query-common';
@@ -339,7 +340,7 @@ function queryTrigramFtsIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
+            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
             if (seen?.has(key)) continue;
             seen?.add(key);
@@ -377,7 +378,7 @@ function queryFtsIndexedFile(
     out: QueryOutput
 ): boolean {
     const match = buildFtsMatch(conditions, terms, keywordLogic);
-    if (!match || !hasFtsIndex(db) || shouldUseIndexedTextScan(db, conditions, terms)) return false;
+    if (!match || getHistoryFtsTokenizer(db) !== 'trigram' || !hasFtsIndex(db) || shouldUseIndexedTextScan(db, conditions, terms)) return false;
     const chunkSize = 1000;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
     const bucketCache = new Map<string, HistoryMessage[]>();
@@ -410,7 +411,7 @@ function queryFtsIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
+            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
             if (seen?.has(key)) continue;
             seen?.add(key);
@@ -453,7 +454,9 @@ function queryIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        const searchWhere = topicFilter ? searchTextWhereForSearch(conditions, terms, keywordLogic) : null;
+        const searchWhere = topicFilter && !matchesSearchText(normalizeKeyword(topicFilter), conditions, terms, keywordLogic)
+            ? searchTextWhereForSearch(conditions, terms, keywordLogic)
+            : null;
         let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?';
         const params: Array<number | string> = [st, et];
         if (topicFilter) {
@@ -495,6 +498,10 @@ function queryIndexedFile(
     }
 }
 
+function shouldPreferTimeIndexedScan(st: number, et: number): boolean {
+    return Number.isFinite(st) && Number.isFinite(et) && et >= st && et - st <= 24 * 60 * 60 * 1000;
+}
+
 function queryRecentTopicIndexedFile(
     db: Database.Database,
     schemaVersion: string,
@@ -511,16 +518,7 @@ function queryRecentTopicIndexedFile(
     const hasTextFilter = conditions.length > 0 || terms.length > 0;
     if (hasTextFilter) {
         const skippedRef = { value: 0 };
-        const hasBoundedWindow = Number.isFinite(st) && Number.isFinite(et) && et >= st;
-        const windowMs = hasBoundedWindow ? et - st : Number.POSITIVE_INFINITY;
-        if (hasFtsIndex(db) && queryTrigramFtsIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, null, out)) return;
-        if (windowMs <= 24 * 60 * 60 * 1000) {
-            queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
-            return;
-        }
-        if (!queryFtsIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, null, out)) {
-            queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
-        }
+        queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
         return;
     }
     const candidateBatchSize = Math.max(1, limit);
@@ -636,7 +634,7 @@ function queryHistory(out: QueryOutput): void {
                 db.close();
             }
         }
-        if (out.length === 0 && conditions.length > 0) {
+        if (out.length === 0 && (conditions.length > 0 || terms.length > 0)) {
             const topicOnlyConditions = conditions.filter((item) => item.join !== 'and' || !topicFilter.includes(item.term));
             queryRawRecentTopicFiles(st, et, topicFilter, topicOnlyConditions, terms, keywordLogic, limit, out);
         }
@@ -652,10 +650,8 @@ function queryHistory(out: QueryOutput): void {
             const indexSchemaVersion = getBestEffortIndexVersion(db);
             if (!indexSchemaVersion) continue;
             if (conditions.length > 0 || terms.length > 0) {
-                if (topicFilter) {
-                    if (!queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out)) {
-                        queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-                    }
+                if (shouldPreferTimeIndexedScan(st, et) || topicFilter) {
+                    queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                 } else {
                     const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
                     if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);

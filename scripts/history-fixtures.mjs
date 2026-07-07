@@ -21,7 +21,8 @@ const MESSAGES = [
   { topic: 'sensor/temp', payload: 'beta room 22', time: new Date(2026, 5, 25, 9, 0, 0, 450).getTime() },
   { topic: 'sensor/humidity', payload: 'alpha humidity 45', time: new Date(2026, 5, 25, 9, 0, 1, 50).getTime() },
   { topic: 'device/status', payload: 'online ok', time: new Date(2026, 5, 25, 9, 0, 1, 500).getTime() },
-  { topic: 'sensor/temp', payload: 'gamma room 23', time: new Date(2026, 5, 25, 9, 0, 2, 30).getTime() }
+  { topic: 'sensor/temp', payload: 'gamma room 23', time: new Date(2026, 5, 25, 9, 0, 2, 30).getTime() },
+  { topic: 'thing/product/hezhou', payload: 'payload does not repeat topic words', time: new Date(2026, 5, 25, 9, 0, 3, 10).getTime() }
 ];
 
 const QUERY_CASES = [
@@ -32,6 +33,8 @@ const QUERY_CASES = [
   { name: 'topic keyword bounded endTime', opts: { connectionId: CONNECTION_ID, order: 'desc', limit: 10, topic: 'sensor/temp', keyword: 'room', endTime: MESSAGES[1].time } },
   { name: 'topic no keyword recent startTime', opts: { connectionId: CONNECTION_ID, order: 'asc', limit: 10, topic: 'sensor/temp', startTime: MESSAGES[1].time } },
   { name: 'topic keyword all time', opts: { connectionId: CONNECTION_ID, order: 'asc', limit: 10, topic: 'sensor/temp', keyword: 'room' } },
+  { name: 'topic-only keyword bounded', opts: { connectionId: CONNECTION_ID, order: 'desc', limit: 10, keyword: 'thing/product', startTime: MESSAGES[5].time - 60_000, endTime: MESSAGES[5].time + 60_000 } },
+  { name: 'topic-only short keyword bounded', opts: { connectionId: CONNECTION_ID, order: 'desc', limit: 10, keyword: 'thing', startTime: MESSAGES[5].time - 60_000, endTime: MESSAGES[5].time + 60_000 } },
   { name: 'keyword and', opts: { connectionId: CONNECTION_ID, order: 'asc', limit: 10, keyword: 'alpha' } },
   { name: 'keyword or', opts: { connectionId: CONNECTION_ID, order: 'asc', limit: 10, keywords: ['humidity', 'online'], keywordLogic: 'or' } },
   { name: 'conditions not', opts: { connectionId: CONNECTION_ID, order: 'asc', limit: 10, conditions: [{ join: 'and', term: 'sensor' }, { join: 'not', term: 'gamma' }] } }
@@ -47,9 +50,17 @@ function normalizeKeyword(value) {
   return String(value || '').replace(/\s+/gu, '').toLowerCase();
 }
 
-function normalizeSearchText(topic, payload) {
-  if (arguments.length === 1) return normalizeKeyword(topic);
+function normalizePayloadSearchText(payload) {
+  return normalizeKeyword(payload);
+}
+
+function normalizeCombinedSearchText(topic, payload) {
   return `${normalizeKeyword(topic)}${normalizeKeyword(payload)}`;
+}
+
+function normalizeSearchText(topic, payload) {
+  void topic;
+  return normalizePayloadSearchText(payload);
 }
 
 function encodeBucket(items, bucketSec) {
@@ -226,9 +237,7 @@ function buildFixtureDb(filePath, options = {}) {
         const blobRow = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?').get(group.sec, group.topic);
         const entries = iterateBucketEntries(blobRow.blob, group.sec);
         for (const entry of entries) {
-          const searchText = hasFts
-            ? normalizeSearchText(entry.payload)
-            : normalizeSearchText(group.topic, entry.payload);
+          const searchText = normalizeSearchText(group.topic, entry.payload);
           if (hasOffsetColumns) {
             insertIndex.run(group.sec, group.topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
           } else {
@@ -317,7 +326,7 @@ function queryFixture(logRoot, opts) {
       const cache = new Map();
       for (const row of rows) {
         if (row.time_ms < st || row.time_ms > et) continue;
-        if (!matchesSearchText(row.search_text, conditions, terms, keywordLogic)) continue;
+        if (!matchesSearchText(normalizeCombinedSearchText(row.topic, row.search_text), conditions, terms, keywordLogic)) continue;
         if (skipped < offset) { skipped++; continue; }
         const key = `${row.bucket_ts}\0${row.topic}`;
         const bucket = bucketStmt.get(row.bucket_ts, row.topic);
@@ -356,7 +365,7 @@ function queryFixture(logRoot, opts) {
       for (const index of indexes) {
         const item = decoded[index];
         if (item.time < st || item.time > et) continue;
-        const searchText = normalizeSearchText(item.topic, item.payload);
+        const searchText = normalizeCombinedSearchText(item.topic, item.payload);
         if (!matchesSearchText(searchText, conditions, terms, keywordLogic)) continue;
         if (skipped < offset) { skipped++; continue; }
         out.push({ connectionId: SAN_CONNECTION_ID, topic: item.topic, payload: item.payload, time: item.time });
@@ -389,7 +398,8 @@ function runBuiltWorker(logRoot, opts) {
     path.resolve('electron/main/history-query-common.ts')
   ];
   if (!fs.existsSync(workerPath)) return null;
-  if (sourcePaths.some((sourcePath) => fs.existsSync(sourcePath))) return null;
+  const workerMtime = fs.statSync(workerPath).mtimeMs;
+  if (sourcePaths.some((sourcePath) => fs.existsSync(sourcePath) && fs.statSync(sourcePath).mtimeMs > workerMtime)) return null;
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerPath, { workerData: { opts, logRoot } });
     worker.once('message', (message) => {
@@ -407,6 +417,7 @@ async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mqttmountain-history-fixtures-'));
   try {
     const variants = [
+      { name: 'v5-complete-index', options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } },
       { name: 'v4-complete-index', options: { index: 'complete', schemaVersion: V4_SCHEMA_VERSION } }
     ];
 
