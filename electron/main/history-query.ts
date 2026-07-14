@@ -4,15 +4,17 @@ import type { WebContents } from 'electron';
 import type { HistoryMessage, HistoryQueryOptions, HistoryQueryStreamStartRequest } from '../../shared/types';
 import { scheduleHeavyJob, type ScheduledHeavyJob } from './heavy-job-scheduler';
 import { flushStorageAsync, getLogRoot } from './storage';
+import { writeDiagnosticLog } from './diagnostics';
 
 interface WorkerMessage {
-    type: 'chunk' | 'done' | 'error';
+    type: 'chunk' | 'done' | 'error' | 'diagnostic';
     requestId?: string;
     rows?: HistoryMessage[];
-    data?: HistoryMessage[];
+    data?: HistoryMessage[] | Record<string, unknown>;
     total?: number;
     truncated?: boolean;
     error?: string;
+    label?: string;
 }
 
 interface ActiveStream {
@@ -79,9 +81,13 @@ export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<Hist
             let settled = false;
 
             worker.on('message', (msg: WorkerMessage) => {
+                if (msg.type === 'diagnostic' && msg.label) {
+                    writeDiagnosticLog(msg.label, msg.data);
+                    return;
+                }
                 if (msg.type === 'done' && msg.data) {
                     settled = true;
-                    resolve(msg.data);
+                    resolve(msg.data as HistoryMessage[]);
                     return;
                 }
                 if (msg.type === 'error') {
@@ -143,6 +149,10 @@ async function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStrea
             if (current.sender.isDestroyed()) {
                 stopStream(req.requestId);
                 resolve();
+                return;
+            }
+            if (msg.type === 'diagnostic' && msg.label) {
+                writeDiagnosticLog(msg.label, msg.data);
                 return;
             }
             if (msg.type === 'chunk') {

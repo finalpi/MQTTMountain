@@ -418,8 +418,7 @@ async function main() {
   try {
     const variants = [
       { name: 'v5-complete-index', options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } },
-      { name: 'v5-hourly-complete-index', fileKey: `${DAY}-09`, options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } },
-      { name: 'v4-complete-index', options: { index: 'complete', schemaVersion: V4_SCHEMA_VERSION } }
+      { name: 'v5-hourly-complete-index', fileKey: `${DAY}-09`, options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } }
     ];
 
     for (const variant of variants) {

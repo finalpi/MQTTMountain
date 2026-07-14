@@ -11,7 +11,7 @@ import {
     parseKeywordTerms,
     type NormalizedCondition
 } from './history-query-common';
-import { getHistoryFtsTokenizer, getHistoryIndexSchemaVersion, getIndexMeta } from './history-index-schema';
+import { getHistoryFtsLayout, getHistoryFtsTokenizer, getHistoryIndexSchemaVersion, getIndexMeta, isHistoryFtsComplete } from './history-index-schema';
 
 interface QueryWorkerData {
     opts: HistoryQueryOptions;
@@ -87,7 +87,19 @@ function tableExists(db: Database.Database, name: string): boolean {
 }
 
 function hasFtsIndex(db: Database.Database): boolean {
-    return getHistoryFtsTokenizer(db) !== 'none' && tableExists(db, 'history_messages_fts');
+    return getHistoryFtsTokenizer(db) !== 'none' && isHistoryFtsComplete(db) && tableExists(db, 'history_messages_fts');
+}
+
+function ftsJoinSql(db: Database.Database): string {
+    return getHistoryFtsLayout(db) === 'contentless'
+        ? 'FROM history_messages_fts JOIN history_messages m ON m.id = history_messages_fts.rowid'
+        : `FROM history_messages_fts
+           JOIN history_messages m
+             ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index`;
+}
+
+function sendDiagnostic(label: string, data: Record<string, unknown>): void {
+    parentPort?.postMessage({ type: 'diagnostic', label, data });
 }
 
 function escapeFtsPhrase(term: string): string {
@@ -316,9 +328,7 @@ function queryTrigramFtsIndexedFile(
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
         let sql = `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
-                   FROM history_messages_fts
-                   JOIN history_messages m
-                     ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+                   ${ftsJoinSql(db)}
                    WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [match, st, et];
         if (topicFilter) {
@@ -387,9 +397,7 @@ function queryFtsIndexedFile(
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
         let sql = `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
-                   FROM history_messages_fts
-                   JOIN history_messages m
-                     ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+                   ${ftsJoinSql(db)}
                    WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [match, st, et];
         if (topicFilter) {
@@ -653,6 +661,13 @@ function queryHistory(out: QueryOutput): void {
                 if (shouldPreferTimeIndexedScan(st, et) || topicFilter) {
                     queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                 } else {
+                    if (!isHistoryFtsComplete(db)) {
+                        sendDiagnostic('[history-query] fts tail fallback', {
+                            filePath: fe.path,
+                            ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
+                            reason: 'deferred-fts-incomplete'
+                        });
+                    }
                     const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
                     if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                 }

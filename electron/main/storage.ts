@@ -44,11 +44,14 @@ import {
 } from './history-query-common';
 import {
     ensureHistoryIndexSchema,
+    getHistoryFtsLayout,
     getHistoryFtsTokenizer,
     getHistoryIndexSchemaVersion,
     getIndexMeta,
     HISTORY_INDEX_SCHEMA_VERSION,
-    setIndexMeta
+    isHistoryFtsComplete,
+    setIndexMeta,
+    type HistoryFtsLayout
 } from './history-index-schema';
 
 const MAX_OPEN_LOG_DBS = 8;
@@ -56,11 +59,15 @@ const MAX_OPEN_LOG_DBS = 8;
 let LOG_ROOT = '';
 
 interface LogDbPack {
+    key: string;
+    filePath: string;
     db: Database.Database;
+    ftsLayout: HistoryFtsLayout;
     getStmt: Database.Statement;
     upsertStmt: Database.Statement;
     insertIndexStmt: Database.Statement;
     insertFtsStmt: Database.Statement | null;
+    insertDeferredFtsStmt: Database.Statement | null;
     deleteFtsStmt: Database.Statement | null;
     countIndexStmt: Database.Statement;
     insertBackupStmt: Database.Statement;
@@ -120,6 +127,16 @@ let storageFlushTotalMs = 0;
 let storageFlushLastMs = 0;
 let storageFlushMaxMs = 0;
 let storageFlushErrors = 0;
+let deferredFtsTimer: NodeJS.Timeout | null = null;
+let staleShardFinalizeTimer: NodeJS.Timeout | null = null;
+let deferredFtsRuns = 0;
+let deferredFtsIndexedEntries = 0;
+let deferredFtsLastMs = 0;
+let deferredFtsMaxMs = 0;
+let deferredFtsErrors = 0;
+let finalizedShards = 0;
+let finalizedShardErrors = 0;
+let storageDiagnosticListener: ((label: string, ...values: unknown[]) => void) | null = null;
 const STORAGE_FLUSH_MS = 1000;
 const STORAGE_FLUSH_BYTES = 4 * 1024 * 1024;
 const STORAGE_HARD_ENTRIES = 20_000;
@@ -134,6 +151,8 @@ const STORAGE_PRESSURE_LOW_BYTES = 8 * 1024 * 1024;
 const STORAGE_WORKER_RPC_TIMEOUT_MS = 30_000;
 const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 5 * 60_000;
 const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 55_000;
+const DEFERRED_FTS_INTERVAL_MS = 30_000;
+const DEFERRED_FTS_BATCH_ENTRIES = 5_000;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
@@ -141,6 +160,7 @@ export function initStorage(logRoot: string): void {
     storageAcceptingWrites = true;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
     if (USE_STORAGE_WORKER) ensureStorageWorker();
+    else scheduleStaleShardFinalization();
 }
 
 export function getLogRoot(): string {
@@ -149,7 +169,7 @@ export function getLogRoot(): string {
 
 export function getStorageDiagnostics(): Record<string, unknown> {
     const mem = process.memoryUsage();
-    const openDbFiles = [...logDbCache.keys()].map((key) => {
+    const openDbFiles = [...logDbCache.entries()].map(([key, pack]) => {
         const pipe = key.lastIndexOf('|');
         const san = pipe >= 0 ? key.slice(0, pipe) : key;
         const day = pipe >= 0 ? key.slice(pipe + 1) : '';
@@ -159,6 +179,9 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         };
         return {
             key,
+            ftsLayout: pack.ftsLayout,
+            ftsComplete: isHistoryFtsComplete(pack.db),
+            ftsIndexedId: Number(getIndexMeta(pack.db, 'fts_indexed_id') || 0),
             dbBytes: size(dbPath),
             walBytes: size(`${dbPath}-wal`),
             shmBytes: size(`${dbPath}-shm`)
@@ -194,6 +217,14 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         flushMaxMs: storageFlushMaxMs,
         flushAvgMs: storageFlushCount ? Math.round(storageFlushTotalMs / storageFlushCount) : 0,
         flushErrors: storageFlushErrors,
+        deferredFtsRuns,
+        deferredFtsIndexedEntries,
+        deferredFtsLastMs,
+        deferredFtsMaxMs,
+        deferredFtsErrors,
+        deferredFtsScheduled: deferredFtsTimer != null,
+        finalizedShards,
+        finalizedShardErrors,
         openLogDbs: logDbCache.size,
         openDbFiles,
         maintenancePauseDepth,
@@ -202,6 +233,14 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         externalMb: Math.round(mem.external / 1024 / 1024),
         arrayBuffersMb: Math.round(mem.arrayBuffers / 1024 / 1024)
     };
+}
+
+export function setStorageDiagnosticListener(listener: ((label: string, ...values: unknown[]) => void) | null): void {
+    storageDiagnosticListener = listener;
+}
+
+function reportStorageDiagnostic(label: string, ...values: unknown[]): void {
+    storageDiagnosticListener?.(label, ...values);
 }
 
 export function setStoragePressureListener(listener: ((pressured: boolean) => void) | null): void {
@@ -349,7 +388,11 @@ function ensureStorageWorker(): Worker | null {
     if (storageWorker) return storageWorker;
     const workerPath = path.join(__dirname, 'storage-worker.js');
     storageWorker = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT } });
-    storageWorker.on('message', (msg: { id?: number; ok?: boolean; result?: unknown; error?: string }) => {
+    storageWorker.on('message', (msg: { type?: string; label?: string; values?: unknown[]; id?: number; ok?: boolean; result?: unknown; error?: string }) => {
+        if (msg.type === 'diagnostic' && msg.label) {
+            reportStorageDiagnostic(msg.label, ...(msg.values ?? []));
+            return;
+        }
         if (msg.id == null) return;
         const request = storageWorkerRequests.get(msg.id);
         if (!request) return;
@@ -455,11 +498,16 @@ function refreshIndexedCounts(db: Database.Database): void {
     setIndexMeta(db, 'indexed_bucket_count', bucketRow.count);
 }
 
-function appendBucketIndex(insertStmt: Database.Statement, insertFtsStmt: Database.Statement | null, bucketSec: number, topic: string, entries: BucketEntry[]): void {
+function appendBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     for (const entry of entries) {
         const searchText = normalizeSearchText(topic, entry.payload);
-        insertStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
-        insertFtsStmt?.run(searchText, bucketSec, topic, entry.msgIndex, entry.time);
+        pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+        pack.insertFtsStmt?.run(searchText, bucketSec, topic, entry.msgIndex, entry.time);
+    }
+    if (entries.length > 0 && pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
+        setIndexMeta(pack.db, 'fts_index_complete', '0');
+        setIndexMeta(pack.db, 'fts_finalized_at', '');
+        scheduleDeferredFtsFlush();
     }
 }
 
@@ -467,7 +515,188 @@ function replaceBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, e
     const deleteStmt = pack.db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     deleteStmt.run(bucketSec, topic);
     pack.deleteFtsStmt?.run(bucketSec, topic);
-    appendBucketIndex(pack.insertIndexStmt, pack.insertFtsStmt, bucketSec, topic, entries);
+    appendBucketIndex(pack, bucketSec, topic, entries);
+}
+
+function deferredFtsCursor(pack: LogDbPack): number {
+    const value = Number(getIndexMeta(pack.db, 'fts_indexed_id') || 0);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string): number {
+    if (pack.ftsLayout !== 'contentless' || !pack.insertDeferredFtsStmt) return 0;
+    const startedAt = Date.now();
+    let indexed = 0;
+    try {
+        let cursor = deferredFtsCursor(pack);
+        while (true) {
+            const rows = pack.db.prepare(
+                'SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?'
+            ).all(cursor, DEFERRED_FTS_BATCH_ENTRIES) as Array<{ id: number; search_text: string }>;
+            if (rows.length === 0) {
+                setIndexMeta(pack.db, 'fts_index_complete', '1');
+                break;
+            }
+            const writeBatch = pack.db.transaction(() => {
+                for (const row of rows) pack.insertDeferredFtsStmt!.run(row.id, row.search_text);
+                cursor = rows[rows.length - 1].id;
+                setIndexMeta(pack.db, 'fts_indexed_id', cursor);
+                setIndexMeta(pack.db, 'fts_index_complete', rows.length < DEFERRED_FTS_BATCH_ENTRIES ? '1' : '0');
+            });
+            writeBatch();
+            indexed += rows.length;
+            if (!force || rows.length < DEFERRED_FTS_BATCH_ENTRIES) break;
+        }
+        const elapsed = Date.now() - startedAt;
+        deferredFtsRuns++;
+        deferredFtsIndexedEntries += indexed;
+        deferredFtsLastMs = elapsed;
+        deferredFtsMaxMs = Math.max(deferredFtsMaxMs, elapsed);
+        if (indexed > 0) {
+            reportStorageDiagnostic('[storage] deferred fts batch', {
+                key: pack.key,
+                reason,
+                indexed,
+                cursor: deferredFtsCursor(pack),
+                complete: isHistoryFtsComplete(pack.db),
+                elapsedMs: elapsed
+            });
+        }
+        return indexed;
+    } catch (error) {
+        deferredFtsErrors++;
+        try { setIndexMeta(pack.db, 'fts_index_complete', '0'); } catch {}
+        reportStorageDiagnostic('[storage] deferred fts failed', { key: pack.key, reason, indexed }, error);
+        return indexed;
+    }
+}
+
+function hasDeferredFtsWork(): boolean {
+    return [...logDbCache.values()].some((pack) => pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db));
+}
+
+export function flushDeferredHistoryFts(force = false, reason = 'manual'): { indexed: number; incompleteShards: number } {
+    let indexed = 0;
+    for (const pack of logDbCache.values()) indexed += flushDeferredFtsForPack(pack, force, reason);
+    return {
+        indexed,
+        incompleteShards: [...logDbCache.values()].filter(
+            (pack) => pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db)
+        ).length
+    };
+}
+
+function scheduleDeferredFtsFlush(): void {
+    if (deferredFtsTimer) return;
+    deferredFtsTimer = setTimeout(() => {
+        deferredFtsTimer = null;
+        flushDeferredHistoryFts(false, 'timer');
+        if (hasDeferredFtsWork()) scheduleDeferredFtsFlush();
+    }, DEFERRED_FTS_INTERVAL_MS);
+    deferredFtsTimer.unref();
+}
+
+function isHourlyShardKey(key: string): boolean {
+    return /^\d{4}-\d{2}-\d{2}-\d{2}$/u.test(key);
+}
+
+function finalizeShard(pack: LogDbPack, reason: string): boolean {
+    const startedAt = Date.now();
+    const size = (target: string): number => {
+        try { return fs.statSync(target).size; } catch { return 0; }
+    };
+    const before = { dbBytes: size(pack.filePath), walBytes: size(`${pack.filePath}-wal`) };
+    try {
+        const indexed = flushDeferredFtsForPack(pack, true, reason);
+        if (pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
+            pack.db.exec("INSERT INTO history_messages_fts(history_messages_fts) VALUES('optimize')");
+        }
+        setIndexMeta(pack.db, 'fts_finalized_at', Date.now());
+        const checkpoint = pack.db.pragma('wal_checkpoint(TRUNCATE)');
+        const after = { dbBytes: size(pack.filePath), walBytes: size(`${pack.filePath}-wal`) };
+        finalizedShards++;
+        reportStorageDiagnostic('[storage] shard finalized', {
+            key: pack.key,
+            reason,
+            indexed,
+            elapsedMs: Date.now() - startedAt,
+            before,
+            after,
+            checkpoint
+        });
+        return true;
+    } catch (error) {
+        finalizedShardErrors++;
+        reportStorageDiagnostic('[storage] shard finalize failed', { key: pack.key, reason }, error);
+        return false;
+    }
+}
+
+function finalizeClosedHourShards(currentKey: string): void {
+    if (!isHourlyShardKey(currentKey)) return;
+    for (const [key, pack] of [...logDbCache.entries()]) {
+        const pipe = key.lastIndexOf('|');
+        const shardKey = pipe >= 0 ? key.slice(pipe + 1) : '';
+        if (!isHourlyShardKey(shardKey) || shardKey >= currentKey) continue;
+        if (!finalizeShard(pack, 'hour-rollover')) continue;
+        try { pack.db.close(); } catch {}
+        logDbCache.delete(key);
+    }
+}
+
+function findStaleShardCandidates(currentKey: string): Array<{ san: string; key: string; path: string }> {
+    if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return [];
+    const candidates: Array<{ san: string; key: string; path: string }> = [];
+    const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    for (const dirEntry of dirs) {
+        const dir = path.join(LOG_ROOT, dirEntry.name);
+        const files = fs.readdirSync(dir).filter((file) => HISTORY_DB_FILE_RE.test(file));
+        for (const file of files) {
+            const key = file.slice(0, -3);
+            if (!isHourlyShardKey(key) || key >= currentKey) continue;
+            const filePath = path.join(dir, file);
+            let db: Database.Database | null = null;
+            try {
+                db = new Database(filePath, { readonly: true });
+                if (getIndexMeta(db, 'fts_layout') !== 'contentless') continue;
+                if (getIndexMeta(db, 'fts_finalized_at')) continue;
+                candidates.push({ san: dirEntry.name, key, path: filePath });
+            } catch (error) {
+                reportStorageDiagnostic('[storage] stale shard inspect failed', { filePath }, error);
+            } finally {
+                try { db?.close(); } catch {}
+            }
+        }
+    }
+    return candidates.sort((a, b) => a.key.localeCompare(b.key));
+}
+
+function runStaleShardFinalization(): void {
+    staleShardFinalizeTimer = null;
+    if (maintenancePauseDepth > 0) {
+        scheduleStaleShardFinalization();
+        return;
+    }
+    const currentKey = historyFileKeyFromTs(Date.now());
+    const candidates = findStaleShardCandidates(currentKey);
+    if (candidates.length === 0) return;
+    reportStorageDiagnostic('[storage] stale shard finalization scan', {
+        currentKey,
+        candidates: candidates.length
+    });
+    for (const candidate of candidates.slice(0, 2)) {
+        const pack = getOrOpenLogDb(candidate.san, candidate.key);
+        if (!finalizeShard(pack, 'startup-catchup')) continue;
+        try { pack.db.close(); } catch {}
+        logDbCache.delete(pack.key);
+    }
+    if (candidates.length > 2) scheduleStaleShardFinalization();
+}
+
+function scheduleStaleShardFinalization(): void {
+    if (staleShardFinalizeTimer) return;
+    staleShardFinalizeTimer = setTimeout(runStaleShardFinalization, 10_000);
+    staleShardFinalizeTimer.unref();
 }
 
 function backupBucketBlob(pack: LogDbPack, bucketSec: number, topic: string, existing: ExistingBucketRow, reason?: string): boolean {
@@ -494,6 +723,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         touchCacheKey(key);
         return cached;
     }
+    finalizeClosedHourShards(dk);
     evictLogDbIfNeeded();
     const dir = path.join(LOG_ROOT, san);
     fs.mkdirSync(dir, { recursive: true });
@@ -521,6 +751,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         ) WITHOUT ROWID;
     `);
     const ftsTokenizer = ensureHistoryIndexSchema(db, { initializeCompletion: true });
+    const ftsLayout = getHistoryFtsLayout(db);
     try {
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
@@ -528,8 +759,8 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         // The writer does sequential appends and does not benefit from mapping 256 MB per open day DB.
         // Keeping mmap disabled prevents native working-set growth when several connections/days are cached.
         db.pragma('mmap_size = 0');
-        db.pragma('wal_autocheckpoint = 16384');
-        db.pragma('journal_size_limit = 67108864');
+        db.pragma('wal_autocheckpoint = 65536');
+        db.pragma('journal_size_limit = 268435456');
     } catch {}
     const getStmt = db.prepare('SELECT blob, count, bytes FROM buckets WHERE bucket_ts = ? AND topic = ?');
     const upsertStmt = db.prepare(
@@ -540,22 +771,50 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
-    const insertFtsStmt = ftsTokenizer === 'none'
+    const insertFtsStmt = ftsTokenizer === 'none' || ftsLayout === 'contentless'
         ? null
         : db.prepare(
             `INSERT INTO history_messages_fts (search_text, bucket_ts, topic, msg_index, time_ms)
              VALUES (?, ?, ?, ?, ?)`
         );
+    const insertDeferredFtsStmt = ftsTokenizer === 'none' || ftsLayout !== 'contentless'
+        ? null
+        : db.prepare('INSERT INTO history_messages_fts (rowid, search_text) VALUES (?, ?)');
     const deleteFtsStmt = ftsTokenizer === 'none'
         ? null
-        : db.prepare('DELETE FROM history_messages_fts WHERE bucket_ts = ? AND topic = ?');
+        : ftsLayout === 'contentless'
+            ? db.prepare('DELETE FROM history_messages_fts WHERE rowid IN (SELECT id FROM history_messages WHERE bucket_ts = ? AND topic = ?)')
+            : db.prepare('DELETE FROM history_messages_fts WHERE bucket_ts = ? AND topic = ?');
     const countIndexStmt = db.prepare('SELECT COUNT(*) AS count FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     const insertBackupStmt = db.prepare(
         `INSERT INTO bucket_blob_backups (bucket_ts, topic, saved_at, reason, blob, count, bytes)
          VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
-    const pack: LogDbPack = { db, getStmt, upsertStmt, insertIndexStmt, insertFtsStmt, deleteFtsStmt, countIndexStmt, insertBackupStmt };
+    const pack: LogDbPack = {
+        key,
+        filePath,
+        db,
+        ftsLayout,
+        getStmt,
+        upsertStmt,
+        insertIndexStmt,
+        insertFtsStmt,
+        insertDeferredFtsStmt,
+        deleteFtsStmt,
+        countIndexStmt,
+        insertBackupStmt
+    };
     logDbCache.set(key, pack);
+    reportStorageDiagnostic('[storage] history db opened', {
+        key,
+        ftsTokenizer,
+        ftsLayout,
+        ftsComplete: isHistoryFtsComplete(db),
+        ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
+        walAutoCheckpointPages: 65536,
+        journalSizeLimitBytes: 268435456
+    });
+    if (ftsLayout === 'contentless' && !isHistoryFtsComplete(db)) scheduleDeferredFtsFlush();
     return pack;
 }
 
@@ -821,7 +1080,7 @@ function flushStorageLocal(): void {
                     if (!canAppendIndex || !nextBlob || !indexSchemaVersion) continue;
                     try {
                         const entries = iterateBucketEntries(nextBlob, g.sec, startIndex);
-                        appendBucketIndex(pack.insertIndexStmt, pack.insertFtsStmt, g.sec, g.topic, entries);
+                        appendBucketIndex(pack, g.sec, g.topic, entries);
                         indexedMessageDelta += entries.length;
                         if (isNewBucket) indexedBucketDelta++;
                     } catch (error) {
@@ -1084,6 +1343,14 @@ function closeOldLogDbs(cutoff: number): void {
 
 export function closeAllLogDbs(): void {
     flushStorageLocal();
+    if (deferredFtsTimer) {
+        clearTimeout(deferredFtsTimer);
+        deferredFtsTimer = null;
+    }
+    if (staleShardFinalizeTimer) {
+        clearTimeout(staleShardFinalizeTimer);
+        staleShardFinalizeTimer = null;
+    }
     for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
     logDbCache.clear();
 }

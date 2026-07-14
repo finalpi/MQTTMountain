@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
 import { iterateBucketEntries } from './history-bucket-codec';
 import { HISTORY_DB_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
-import { ensureHistoryIndexSchema, getIndexMeta, setIndexMeta } from './history-index-schema';
+import { ensureHistoryIndexSchema, getHistoryFtsLayout, getIndexMeta, setIndexMeta } from './history-index-schema';
 
 const port = parentPort;
 
@@ -53,6 +53,7 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
         db.pragma('temp_store = MEMORY');
         const ftsTokenizer = ensureHistoryIndexSchema(db, { rebuild: true });
         fts5Enabled = ftsTokenizer !== 'none';
+        const ftsLayout = getHistoryFtsLayout(db);
 
         for (let attempt = 0; attempt < 2; attempt++) {
             processedBuckets = 0;
@@ -68,10 +69,12 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
             );
             const insertFtsStmt = fts5Enabled
-                ? db.prepare(
-                    `INSERT INTO history_messages_fts (search_text, bucket_ts, topic, msg_index, time_ms)
-                     VALUES (?, ?, ?, ?, ?)`
-                )
+                ? ftsLayout === 'contentless'
+                    ? db.prepare('INSERT INTO history_messages_fts (rowid, search_text) VALUES (?, ?)')
+                    : db.prepare(
+                        `INSERT INTO history_messages_fts (search_text, bucket_ts, topic, msg_index, time_ms)
+                         VALUES (?, ?, ?, ?, ?)`
+                    )
                 : null;
             const selectStmt = db.prepare(
                 `SELECT bucket_ts, topic, blob FROM buckets
@@ -84,8 +87,9 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                     const entries = iterateBucketEntries(row.blob, row.bucket_ts);
                     for (const entry of entries) {
                         const searchText = normalizeSearchText(row.topic, entry.payload);
-                        insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
-                        insertFtsStmt?.run(searchText, row.bucket_ts, row.topic, entry.msgIndex, entry.time);
+                        const inserted = insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+                        if (ftsLayout === 'contentless') insertFtsStmt?.run(Number(inserted.lastInsertRowid), searchText);
+                        else insertFtsStmt?.run(searchText, row.bucket_ts, row.topic, entry.msgIndex, entry.time);
                     }
                     processedBuckets++;
                     processedMessages += entries.length;
@@ -118,6 +122,11 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
             }
             setIndexMeta(db, 'indexed_bucket_count', processedBuckets);
             setIndexMeta(db, 'indexed_message_count', processedMessages);
+            const maxId = ftsLayout === 'contentless'
+                ? Number((db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM history_messages').get() as { id: number }).id)
+                : 0;
+            setIndexMeta(db, 'fts_indexed_id', maxId);
+            setIndexMeta(db, 'fts_index_complete', '1');
             setIndexMeta(db, 'last_indexed_at', Date.now());
             if (getIndexMeta(db, 'index_dirty_at') === '0') {
                 setIndexMeta(db, 'index_complete', '1');

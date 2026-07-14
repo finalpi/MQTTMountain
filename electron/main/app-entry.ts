@@ -7,6 +7,7 @@ import {
     initStorage,
     purgeNonCurrentHistoryIndexDbsAsync,
     shutdownStorageAsync,
+    setStorageDiagnosticListener,
     stopAcceptingStorageWrites,
     stopAutoDeleteWorkers
 } from './storage';
@@ -61,6 +62,7 @@ function installDiagnosticHandlers(): void {
 }
 
 installDiagnosticHandlers();
+setStorageDiagnosticListener((label, ...values) => writeDiagnosticLog(label, ...values));
 
 function resolveIconPath(): string {
     return app.isPackaged

@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 
 export const HISTORY_INDEX_SCHEMA_VERSION = '5';
 export type HistoryFtsTokenizer = 'trigram' | 'unicode61' | 'none';
+export type HistoryFtsLayout = 'contentless' | 'legacy';
 
 export function setIndexMeta(db: Database.Database, key: string, value: string | number): void {
     db.prepare(
@@ -34,10 +35,20 @@ export function hasHistoryFts(db: Database.Database): boolean {
     return getHistoryFtsTokenizer(db) !== 'none';
 }
 
-function historyMessagesColumns(db: Database.Database): Set<string> {
+export function historyMessagesColumns(db: Database.Database): Set<string> {
     return new Set(db.prepare('PRAGMA table_info(history_messages)').all()
         .map((col) => String((col as { name?: string }).name ?? ''))
         .filter(Boolean));
+}
+
+export function getHistoryFtsLayout(db: Database.Database): HistoryFtsLayout {
+    const layout = getIndexMeta(db, 'fts_layout');
+    if (layout === 'contentless' || layout === 'legacy') return layout;
+    return historyMessagesColumns(db).has('id') ? 'contentless' : 'legacy';
+}
+
+export function isHistoryFtsComplete(db: Database.Database): boolean {
+    return getIndexMeta(db, 'fts_index_complete') !== '0';
 }
 
 function tableExists(db: Database.Database, name: string): boolean {
@@ -60,7 +71,22 @@ export function detectHistoryFtsTokenizer(db: Database.Database): HistoryFtsToke
     return 'none';
 }
 
-function createHistoryFtsTable(db: Database.Database, tokenizer: Exclude<HistoryFtsTokenizer, 'none'>): void {
+function createHistoryFtsTable(
+    db: Database.Database,
+    tokenizer: Exclude<HistoryFtsTokenizer, 'none'>,
+    layout: HistoryFtsLayout
+): void {
+    if (layout === 'contentless') {
+        db.exec(`
+            CREATE VIRTUAL TABLE IF NOT EXISTS history_messages_fts USING fts5(
+                search_text,
+                tokenize='${tokenizer}',
+                content='',
+                contentless_delete=1
+            );
+        `);
+        return;
+    }
     db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS history_messages_fts USING fts5(
             search_text,
@@ -90,27 +116,36 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
     if (resetIndex) {
         db.exec('DROP TABLE IF EXISTS history_messages_fts; DROP TABLE IF EXISTS history_messages;');
     }
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS history_messages (
-            bucket_ts INTEGER NOT NULL,
-            topic TEXT NOT NULL,
-            msg_index INTEGER NOT NULL,
-            time_ms INTEGER NOT NULL,
-            search_text TEXT NOT NULL,
-            payload_offset INTEGER NOT NULL,
-            payload_len INTEGER NOT NULL,
-            entry_offset INTEGER NOT NULL,
-            entry_len INTEGER NOT NULL,
-            PRIMARY KEY (bucket_ts, topic, msg_index)
-        ) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
-        CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
-    `);
+    const layout: HistoryFtsLayout = resetIndex || columns.has('id') ? 'contentless' : 'legacy';
+    if (layout === 'contentless') {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS history_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket_ts INTEGER NOT NULL,
+                topic TEXT NOT NULL,
+                msg_index INTEGER NOT NULL,
+                time_ms INTEGER NOT NULL,
+                search_text TEXT NOT NULL,
+                payload_offset INTEGER NOT NULL,
+                payload_len INTEGER NOT NULL,
+                entry_offset INTEGER NOT NULL,
+                entry_len INTEGER NOT NULL,
+                UNIQUE (bucket_ts, topic, msg_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
+            CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
+        `);
+    } else {
+        db.exec(`
+            CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
+            CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
+        `);
+    }
 
     let tokenizer = detectHistoryFtsTokenizer(db);
     if (tokenizer !== 'none') {
         try {
-            createHistoryFtsTable(db, tokenizer);
+            createHistoryFtsTable(db, tokenizer, layout);
         } catch {
             tokenizer = 'none';
             db.exec('DROP TABLE IF EXISTS history_messages_fts;');
@@ -122,6 +157,7 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
     setIndexMeta(db, 'schema_version', HISTORY_INDEX_SCHEMA_VERSION);
     setIndexMeta(db, 'fts5_enabled', tokenizer === 'none' ? '0' : '1');
     setIndexMeta(db, 'fts5_tokenizer', tokenizer);
+    setIndexMeta(db, 'fts_layout', layout);
     if (options.initializeCompletion) {
         const complete = getIndexMeta(db, 'index_complete');
         if (resetIndex || !complete) {
@@ -129,6 +165,8 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
             setIndexMeta(db, 'index_complete', row.count > 0 ? '0' : '1');
             setIndexMeta(db, 'indexed_message_count', 0);
             setIndexMeta(db, 'indexed_bucket_count', 0);
+            setIndexMeta(db, 'fts_indexed_id', 0);
+            setIndexMeta(db, 'fts_index_complete', row.count > 0 ? '0' : '1');
         }
     }
     return tokenizer;

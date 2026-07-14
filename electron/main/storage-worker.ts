@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage, stopAcceptingStorageWrites, getStorageDiagnostics } from './storage';
+import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage, stopAcceptingStorageWrites, getStorageDiagnostics, setStorageDiagnosticListener, flushDeferredHistoryFts } from './storage';
 import type { BucketItem } from './history-bucket-codec';
 
 interface StorageWorkerRequest {
@@ -15,6 +15,9 @@ interface EnqueuePayload extends Partial<BucketItem> {
     tsMs: number;
 }
 
+setStorageDiagnosticListener((label, ...values) => {
+    parentPort?.postMessage({ type: 'diagnostic', label, values });
+});
 initStorage((workerData as { logRoot: string }).logRoot);
 
 let processedBatches = 0;
@@ -128,6 +131,9 @@ parentPort?.on('message', (msg: StorageWorkerRequest) => {
                 break;
             case 'diagnostics':
                 reply(msg.id, true, workerDiagnostics());
+                break;
+            case 'flushDeferredFts':
+                reply(msg.id, true, flushDeferredHistoryFts(true, 'worker-rpc'));
                 break;
             case 'shutdown':
                 stopAcceptingStorageWrites();
