@@ -31,7 +31,7 @@ interface IndexedMessageRow {
     time_ms: number;
     topic: string;
     msg_index: number;
-    search_text: string;
+    search_text?: string;
     payload_offset?: number;
     payload_len?: number;
 }
@@ -61,6 +61,25 @@ class StreamQueryOutput implements QueryOutput {
 }
 
 const { opts, logRoot, stream, requestId, chunkSize } = workerData as QueryWorkerData;
+const MAX_DECODED_BUCKET_CACHE = 256;
+
+function getDecodedBucket(
+    cache: Map<string, HistoryMessage[]>,
+    key: string,
+    blob: Buffer,
+    bucketTs: number,
+    topic: string
+): HistoryMessage[] {
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const decoded = decodeBucket(blob, bucketTs, topic);
+    if (cache.size >= MAX_DECODED_BUCKET_CACHE) {
+        const oldest = cache.keys().next().value as string | undefined;
+        if (oldest != null) cache.delete(oldest);
+    }
+    cache.set(key, decoded);
+    return decoded;
+}
 
 function getIndexVersion(db: Database.Database, requireComplete: boolean): string | null {
     try {
@@ -129,6 +148,36 @@ function buildFtsMatch(conditions: NormalizedCondition[], terms: string[], keywo
     return terms.map(escapeFtsPhrase).join(keywordLogic === 'or' ? ' OR ' : ' AND ');
 }
 
+function compactTrigramTerm(term: string): string | null {
+    const chars = Array.from(term);
+    if (chars.length < 3) return null;
+    const trigrams = [...new Set(chars.slice(0, -2).map((_, index) => chars.slice(index, index + 3).join('')))];
+    return `(${trigrams.map((value) => `"${value.replace(/"/g, '""')}"`).join(' AND ')})`;
+}
+
+function buildCompactFtsMatch(conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): string | null {
+    if (conditions.some((item) => item.join === 'not')) return null;
+    const values = conditions.length > 0 ? conditions.map((item) => item.term) : terms;
+    const groups = values.map(compactTrigramTerm);
+    if (groups.length === 0 || groups.some((value) => !value)) return null;
+    if (conditions.length > 0) {
+        return groups.map((group, index) => index === 0 ? group : `${conditions[index].join === 'or' ? 'OR' : 'AND'} ${group}`).join(' ');
+    }
+    return groups.join(keywordLogic === 'or' ? ' OR ' : ' AND ');
+}
+
+function buildFtsMatchForSchema(schemaVersion: string, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): string | null {
+    return schemaVersion === '6'
+        ? buildCompactFtsMatch(conditions, terms, keywordLogic)
+        : buildFtsMatch(conditions, terms, keywordLogic);
+}
+
+function indexedSelectColumns(schemaVersion: string, alias = ''): string {
+    const p = alias ? `${alias}.` : '';
+    const search = schemaVersion === '5' ? `${p}search_text` : 'NULL AS search_text';
+    return `${p}bucket_ts, ${p}time_ms, ${p}topic, ${p}msg_index, ${search}, ${p}payload_offset, ${p}payload_len`;
+}
+
 function hasShortFtsTerm(conditions: NormalizedCondition[], terms: string[]): boolean {
     const values = conditions.length > 0 ? conditions.map((item) => item.term) : terms;
     return values.some((term) => Array.from(term).length < 3);
@@ -152,11 +201,7 @@ function pushIndexedRow(
     let payload: string | null = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
     if (payload == null) {
         const cacheKey = `${row.bucket_ts}|${row.topic}`;
-        let decoded = bucketCache.get(cacheKey);
-        if (!decoded) {
-            decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic);
-            bucketCache.set(cacheKey, decoded);
-        }
+        const decoded = getDecodedBucket(bucketCache, cacheKey, bucket.blob, row.bucket_ts, row.topic);
         payload = decoded[row.msg_index]?.payload ?? null;
     }
     if (payload == null) return;
@@ -173,23 +218,21 @@ function pushIndexedRowIfMatches(
     conditions: NormalizedCondition[],
     terms: string[],
     keywordLogic: 'and' | 'or',
-    out: QueryOutput
-): void {
+    out: QueryOutput,
+    emit = true
+): boolean {
     const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
-    if (!bucket) return;
+    if (!bucket) return false;
     let payload: string | null = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
     if (payload == null) {
         const cacheKey = `${row.bucket_ts}|${row.topic}`;
-        let decoded = bucketCache.get(cacheKey);
-        if (!decoded) {
-            decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic);
-            bucketCache.set(cacheKey, decoded);
-        }
+        const decoded = getDecodedBucket(bucketCache, cacheKey, bucket.blob, row.bucket_ts, row.topic);
         payload = decoded[row.msg_index]?.payload ?? null;
     }
-    if (payload == null) return;
-    if (!matchesSearchText(normalizeCombinedSearchText(row.topic, payload), conditions, terms, keywordLogic)) return;
-    out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
+    if (payload == null) return false;
+    if (!matchesSearchText(normalizeCombinedSearchText(row.topic, payload), conditions, terms, keywordLogic)) return false;
+    if (emit) out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
+    return true;
 }
 
 function likeParam(term: string): string {
@@ -231,6 +274,7 @@ function searchTextWhereForSearch(conditions: NormalizedCondition[], terms: stri
 
 function rowMatchesIndexedSearch(row: IndexedMessageRow, conditions: NormalizedCondition[], terms: string[], keywordLogic: 'and' | 'or'): boolean {
     if (conditions.length === 0 && terms.length === 0) return true;
+    if (row.search_text == null) return true;
     return matchesSearchText(normalizeCombinedSearchText(row.topic, row.search_text), conditions, terms, keywordLogic);
 }
 
@@ -259,7 +303,7 @@ function queryTopicTextIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        let sql = `SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len
+        let sql = `SELECT ${indexedSelectColumns(schemaVersion)}
                    FROM history_messages
                    WHERE time_ms BETWEEN ? AND ? AND (${where.sql})`;
         const params: Array<number | string> = [st, et, ...where.params];
@@ -314,7 +358,7 @@ function queryTrigramFtsIndexedFile(
     out: QueryOutput
 ): boolean {
     if (getHistoryFtsTokenizer(db) !== 'trigram' || !hasFtsIndex(db)) return false;
-    const match = buildFtsMatch(conditions, terms, keywordLogic);
+    const match = buildFtsMatchForSchema(schemaVersion, conditions, terms, keywordLogic);
     if (!match) return false;
     const positiveTerms = conditions.length > 0
         ? conditions.filter((item) => item.join !== 'not').map((item) => item.term)
@@ -327,7 +371,7 @@ function queryTrigramFtsIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        let sql = `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
+        let sql = `SELECT ${indexedSelectColumns(schemaVersion, 'm')}
                    ${ftsJoinSql(db)}
                    WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [match, st, et];
@@ -350,7 +394,9 @@ function queryTrigramFtsIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
+            if (schemaVersion === '6'
+                ? !pushIndexedRowIfMatches(db, bucketStmt, bucketCache, schemaVersion, fe, row, conditions, terms, keywordLogic, out, false)
+                : !rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
             if (seen?.has(key)) continue;
             seen?.add(key);
@@ -387,7 +433,7 @@ function queryFtsIndexedFile(
     seen: Set<string> | null,
     out: QueryOutput
 ): boolean {
-    const match = buildFtsMatch(conditions, terms, keywordLogic);
+    const match = buildFtsMatchForSchema(schemaVersion, conditions, terms, keywordLogic);
     if (!match || getHistoryFtsTokenizer(db) !== 'trigram' || !hasFtsIndex(db) || shouldUseIndexedTextScan(db, conditions, terms)) return false;
     const chunkSize = 1000;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
@@ -396,7 +442,7 @@ function queryFtsIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        let sql = `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
+        let sql = `SELECT ${indexedSelectColumns(schemaVersion, 'm')}
                    ${ftsJoinSql(db)}
                    WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [match, st, et];
@@ -419,7 +465,9 @@ function queryFtsIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
+            if (schemaVersion === '6'
+                ? !pushIndexedRowIfMatches(db, bucketStmt, bucketCache, schemaVersion, fe, row, conditions, terms, keywordLogic, out, false)
+                : !rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
             if (seen?.has(key)) continue;
             seen?.add(key);
@@ -462,10 +510,10 @@ function queryIndexedFile(
     let lastTopic: string | null = null;
     let lastMsgIndex: number | null = null;
     while (out.length < limit) {
-        const searchWhere = topicFilter && !matchesSearchText(normalizeKeyword(topicFilter), conditions, terms, keywordLogic)
+        const searchWhere = schemaVersion === '5' && topicFilter && !matchesSearchText(normalizeKeyword(topicFilter), conditions, terms, keywordLogic)
             ? searchTextWhereForSearch(conditions, terms, keywordLogic)
             : null;
-        let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+        let sql = `SELECT ${indexedSelectColumns(schemaVersion)} FROM history_messages WHERE time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [st, et];
         if (topicFilter) {
             sql += ' AND topic = ?';
@@ -490,7 +538,9 @@ function queryIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
-            if (!rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
+            if (schemaVersion === '6'
+                ? !pushIndexedRowIfMatches(db, bucketStmt, bucketCache, schemaVersion, fe, row, conditions, terms, keywordLogic, out, false)
+                : !rowMatchesIndexedSearch(row, conditions, terms, keywordLogic)) continue;
             if (skippedRef.value < offset) {
                 skippedRef.value++;
                 continue;
@@ -526,6 +576,13 @@ function queryRecentTopicIndexedFile(
     const hasTextFilter = conditions.length > 0 || terms.length > 0;
     if (hasTextFilter) {
         const skippedRef = { value: 0 };
+        if (schemaVersion === '6') {
+            const usedFts = queryFtsIndexedFile(
+                db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic,
+                limit, 0, skippedRef, null, out
+            );
+            if (usedFts) return;
+        }
         queryIndexedFile(db, schemaVersion, fe, st, et, topicFilter, 'desc', conditions, terms, keywordLogic, limit, 0, skippedRef, out);
         return;
     }
@@ -537,7 +594,7 @@ function queryRecentTopicIndexedFile(
     let scanned = 0;
 
     while (out.length < limit) {
-        let sql = 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE topic = ? AND time_ms BETWEEN ? AND ?';
+        let sql = `SELECT ${indexedSelectColumns(schemaVersion)} FROM history_messages WHERE topic = ? AND time_ms BETWEEN ? AND ?`;
         const params: Array<number | string> = [topicFilter, st, et];
         if (lastTime != null && lastMsgIndex != null) {
             sql += ' AND (time_ms < ? OR (time_ms = ? AND msg_index < ?))';
@@ -658,7 +715,17 @@ function queryHistory(out: QueryOutput): void {
             const indexSchemaVersion = getBestEffortIndexVersion(db);
             if (!indexSchemaVersion) continue;
             if (conditions.length > 0 || terms.length > 0) {
-                if (shouldPreferTimeIndexedScan(st, et) || topicFilter) {
+                if (indexSchemaVersion === '6') {
+                    if (!isHistoryFtsComplete(db)) {
+                        sendDiagnostic('[history-query] compact fts fallback', {
+                            filePath: fe.path,
+                            ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
+                            reason: 'deferred-fts-incomplete'
+                        });
+                    }
+                    const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
+                    if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
+                } else if (shouldPreferTimeIndexedScan(st, et) || topicFilter) {
                     queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
                 } else {
                     if (!isHistoryFtsComplete(db)) {

@@ -5,7 +5,7 @@
  *   table buckets:
  *     bucket_ts   INTEGER   -- 秒级时间戳 (second precision)
  *     topic       TEXT
- *     blob        BLOB      -- [u32 count][u16 offset_ms][u32 len][payload_utf8]...
+ *     blob        BLOB      -- MMZ1 + deflate-raw（旧分片仍兼容未压缩的 bucket 编码）
  *     count       INTEGER   -- blob 内消息条数，与 header count 保持一致
  *     bytes       INTEGER   -- blob 字节数
  *     PRIMARY KEY(bucket_ts, topic)
@@ -22,6 +22,7 @@ import Database from 'better-sqlite3';
 import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
 import {
     appendEntriesToBucketBlob,
+    bucketUncompressedBytes,
     decodeBucket,
     encodeBucket,
     iterateBucketEntries,
@@ -62,12 +63,15 @@ interface LogDbPack {
     key: string;
     filePath: string;
     db: Database.Database;
+    schemaVersion: string;
     ftsLayout: HistoryFtsLayout;
     getStmt: Database.Statement;
     upsertStmt: Database.Statement;
     insertIndexStmt: Database.Statement;
     insertFtsStmt: Database.Statement | null;
     insertDeferredFtsStmt: Database.Statement | null;
+    insertPendingFtsStmt: Database.Statement | null;
+    deletePendingFtsStmt: Database.Statement | null;
     deleteFtsStmt: Database.Statement | null;
     countIndexStmt: Database.Statement;
     insertBackupStmt: Database.Statement;
@@ -122,6 +126,8 @@ let storageFlushedEntries = 0;
 let storageFlushedBytes = 0;
 let storageCommittedEntries = 0;
 let storageCommittedBytes = 0;
+let storageBucketRawBytes = 0;
+let storageBucketStoredBytes = 0;
 let storageRetriedEntries = 0;
 let storageFlushTotalMs = 0;
 let storageFlushLastMs = 0;
@@ -216,6 +222,11 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         flushedBytes: storageFlushedBytes,
         committedEntries: storageCommittedEntries,
         committedBytes: storageCommittedBytes,
+        bucketRawBytes: storageBucketRawBytes,
+        bucketStoredBytes: storageBucketStoredBytes,
+        bucketCompressionRatio: storageBucketRawBytes > 0
+            ? Number((storageBucketStoredBytes / storageBucketRawBytes).toFixed(3))
+            : 1,
         retriedEntries: storageRetriedEntries,
         flushLastMs: storageFlushLastMs,
         flushMaxMs: storageFlushMaxMs,
@@ -297,10 +308,13 @@ function isCurrentHistoryIndexDb(filePath: string): boolean {
     let db: Database.Database | null = null;
     try {
         db = new Database(filePath, { readonly: true });
-        if (getIndexMeta(db, 'schema_version') !== HISTORY_INDEX_SCHEMA_VERSION) return false;
+        const version = getHistoryIndexSchemaVersion(db);
+        if (!version) return false;
         const columns = new Set(db.prepare('PRAGMA table_info(history_messages)').all()
             .map((col) => String((col as { name?: string }).name ?? '')));
-        const hasColumns = ['bucket_ts', 'topic', 'msg_index', 'time_ms', 'search_text', 'payload_offset', 'payload_len', 'entry_offset', 'entry_len']
+        const requiredColumns = ['bucket_ts', 'topic', 'msg_index', 'time_ms', 'payload_offset', 'payload_len', 'entry_offset', 'entry_len'];
+        if (version === '5') requiredColumns.push('search_text');
+        const hasColumns = requiredColumns
             .every((name) => columns.has(name));
         if (!hasColumns) return false;
         return getHistoryFtsTokenizer(db) === 'none' || tableExists(db, 'history_messages_fts');
@@ -513,7 +527,12 @@ function refreshIndexedCounts(db: Database.Database): void {
 function appendBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     for (const entry of entries) {
         const searchText = normalizeSearchText(topic, entry.payload);
-        pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+        const inserted = pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+            ? pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen)
+            : pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+        if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+            pack.insertPendingFtsStmt?.run(Number(inserted.lastInsertRowid), searchText);
+        }
         pack.insertFtsStmt?.run(searchText, bucketSec, topic, entry.msgIndex, entry.time);
     }
     if (entries.length > 0 && pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
@@ -525,8 +544,9 @@ function appendBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, en
 
 function replaceBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     const deleteStmt = pack.db.prepare('DELETE FROM history_messages WHERE bucket_ts = ? AND topic = ?');
-    deleteStmt.run(bucketSec, topic);
     pack.deleteFtsStmt?.run(bucketSec, topic);
+    pack.deletePendingFtsStmt?.run(bucketSec, topic);
+    deleteStmt.run(bucketSec, topic);
     appendBucketIndex(pack, bucketSec, topic, entries);
 }
 
@@ -542,9 +562,10 @@ function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string
     try {
         let cursor = deferredFtsCursor(pack);
         while (true) {
-            const rows = pack.db.prepare(
-                'SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?'
-            ).all(cursor, DEFERRED_FTS_BATCH_ENTRIES) as Array<{ id: number; search_text: string }>;
+            const rows = (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+                ? pack.db.prepare('SELECT id, search_text FROM history_fts_pending ORDER BY id ASC LIMIT ?').all(DEFERRED_FTS_BATCH_ENTRIES)
+                : pack.db.prepare('SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?').all(cursor, DEFERRED_FTS_BATCH_ENTRIES)
+            ) as Array<{ id: number; search_text: string }>;
             if (rows.length === 0) {
                 setIndexMeta(pack.db, 'fts_index_complete', '1');
                 break;
@@ -552,8 +573,14 @@ function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string
             const writeBatch = pack.db.transaction(() => {
                 for (const row of rows) pack.insertDeferredFtsStmt!.run(row.id, row.search_text);
                 cursor = rows[rows.length - 1].id;
+                if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+                    pack.db.prepare('DELETE FROM history_fts_pending WHERE id <= ?').run(cursor);
+                }
                 setIndexMeta(pack.db, 'fts_indexed_id', cursor);
-                setIndexMeta(pack.db, 'fts_index_complete', rows.length < DEFERRED_FTS_BATCH_ENTRIES ? '1' : '0');
+                const hasMore = pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+                    ? Boolean(pack.db.prepare('SELECT 1 FROM history_fts_pending LIMIT 1').get())
+                    : rows.length >= DEFERRED_FTS_BATCH_ENTRIES;
+                setIndexMeta(pack.db, 'fts_index_complete', hasMore ? '0' : '1');
             });
             writeBatch();
             indexed += rows.length;
@@ -777,6 +804,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     `);
     const ftsTokenizer = ensureHistoryIndexSchema(db, { initializeCompletion: true });
     const ftsLayout = getHistoryFtsLayout(db);
+    const schemaVersion = getHistoryIndexSchemaVersion(db) || HISTORY_INDEX_SCHEMA_VERSION;
     try {
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
@@ -792,10 +820,15 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         `INSERT INTO buckets (bucket_ts, topic, blob, count, bytes) VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(bucket_ts, topic) DO UPDATE SET blob=excluded.blob, count=excluded.count, bytes=excluded.bytes`
     );
-    const insertIndexStmt = db.prepare(
-        `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    );
+    const insertIndexStmt = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+        ? db.prepare(
+            `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, payload_offset, payload_len, entry_offset, entry_len)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        : db.prepare(
+            `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
     const insertFtsStmt = ftsTokenizer === 'none' || ftsLayout === 'contentless'
         ? null
         : db.prepare(
@@ -805,11 +838,19 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     const insertDeferredFtsStmt = ftsTokenizer === 'none' || ftsLayout !== 'contentless'
         ? null
         : db.prepare('INSERT INTO history_messages_fts (rowid, search_text) VALUES (?, ?)');
+    const insertPendingFtsStmt = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION && ftsTokenizer !== 'none'
+        ? db.prepare('INSERT OR REPLACE INTO history_fts_pending (id, search_text) VALUES (?, ?)')
+        : null;
+    const deletePendingFtsStmt = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+        ? db.prepare('DELETE FROM history_fts_pending WHERE id IN (SELECT id FROM history_messages WHERE bucket_ts = ? AND topic = ?)')
+        : null;
     const deleteFtsStmt = ftsTokenizer === 'none'
         ? null
-        : ftsLayout === 'contentless'
+        : ftsLayout === 'contentless' && schemaVersion === '5'
             ? db.prepare('DELETE FROM history_messages_fts WHERE rowid IN (SELECT id FROM history_messages WHERE bucket_ts = ? AND topic = ?)')
-            : db.prepare('DELETE FROM history_messages_fts WHERE bucket_ts = ? AND topic = ?');
+            : ftsLayout === 'legacy'
+                ? db.prepare('DELETE FROM history_messages_fts WHERE bucket_ts = ? AND topic = ?')
+                : null;
     const countIndexStmt = db.prepare('SELECT COUNT(*) AS count FROM history_messages WHERE bucket_ts = ? AND topic = ?');
     const insertBackupStmt = db.prepare(
         `INSERT INTO bucket_blob_backups (bucket_ts, topic, saved_at, reason, blob, count, bytes)
@@ -819,12 +860,15 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         key,
         filePath,
         db,
+        schemaVersion,
         ftsLayout,
         getStmt,
         upsertStmt,
         insertIndexStmt,
         insertFtsStmt,
         insertDeferredFtsStmt,
+        insertPendingFtsStmt,
+        deletePendingFtsStmt,
         deleteFtsStmt,
         countIndexStmt,
         insertBackupStmt
@@ -832,12 +876,14 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     logDbCache.set(key, pack);
     reportStorageDiagnostic('[storage] history db opened', {
         key,
+        schemaVersion,
         ftsTokenizer,
         ftsLayout,
         ftsComplete: isHistoryFtsComplete(db),
         ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
         walAutoCheckpointPages: 65536,
-        journalSizeLimitBytes: 268435456
+        journalSizeLimitBytes: 268435456,
+        bucketCompression: 'deflate-raw-level-1'
     });
     if (ftsLayout === 'contentless' && !isHistoryFtsComplete(db)) scheduleDeferredFtsFlush();
     return pack;
@@ -1054,6 +1100,8 @@ function flushStorageLocal(): void {
             let indexFailed = false;
             let indexedMessageDelta = 0;
             let indexedBucketDelta = 0;
+            let dayBucketRawBytes = 0;
+            let dayBucketStoredBytes = 0;
             const txn = pack.db.transaction(() => {
                 for (const g of groups.values()) {
                     const existing = pack.getStmt.get(g.sec, g.topic) as ExistingBucketRow | undefined;
@@ -1113,6 +1161,10 @@ function flushStorageLocal(): void {
                         pack.upsertStmt.run(g.sec, g.topic, blob, g.items.length, blob.length);
                     }
 
+                    if (nextBlob) {
+                        dayBucketRawBytes += bucketUncompressedBytes(nextBlob);
+                        dayBucketStoredBytes += nextBlob.length;
+                    }
                     if (!canAppendIndex || !nextBlob || !indexSchemaVersion) continue;
                     try {
                         const entries = iterateBucketEntries(nextBlob, g.sec, startIndex);
@@ -1137,6 +1189,8 @@ function flushStorageLocal(): void {
             txn();
             storageCommittedEntries += dayEntries;
             storageCommittedBytes += dayBytes;
+            storageBucketRawBytes += dayBucketRawBytes;
+            storageBucketStoredBytes += dayBucketStoredBytes;
         } catch (e) {
             storageFlushErrors++;
             storageRetriedEntries += dayEntries;

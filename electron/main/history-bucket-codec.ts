@@ -1,5 +1,10 @@
 import type { HistoryMessage } from '../../shared/types';
 import { payloadBytes } from './payload-codec';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
+
+const COMPRESSED_BUCKET_MAGIC = Buffer.from('MMZ1');
+const COMPRESSED_BUCKET_HEADER_BYTES = 8;
+const MIN_COMPRESSION_SAVINGS = 16;
 
 export interface BucketItem {
     payload: string;
@@ -32,6 +37,34 @@ export interface BucketEntry {
     entryLen: number;
 }
 
+export function isCompressedBucketBlob(blob: unknown): boolean {
+    return Buffer.isBuffer(blob)
+        && blob.length >= COMPRESSED_BUCKET_HEADER_BYTES
+        && blob.subarray(0, COMPRESSED_BUCKET_MAGIC.length).equals(COMPRESSED_BUCKET_MAGIC);
+}
+
+export function unpackBucketBlob(blob: Buffer): Buffer {
+    if (!isCompressedBucketBlob(blob)) return blob;
+    const expectedLength = blob.readUInt32LE(4);
+    const raw = inflateRawSync(blob.subarray(COMPRESSED_BUCKET_HEADER_BYTES));
+    if (raw.length !== expectedLength) throw new Error(`compressed bucket length mismatch: expected ${expectedLength}, got ${raw.length}`);
+    return raw;
+}
+
+export function bucketUncompressedBytes(blob: Buffer): number {
+    return isCompressedBucketBlob(blob) ? blob.readUInt32LE(4) : blob.length;
+}
+
+export function packBucketBlob(raw: Buffer): Buffer {
+    if (raw.length === 0) return raw;
+    const compressed = deflateRawSync(raw, { level: 1 });
+    if (compressed.length + COMPRESSED_BUCKET_HEADER_BYTES + MIN_COMPRESSION_SAVINGS >= raw.length) return raw;
+    const header = Buffer.allocUnsafe(COMPRESSED_BUCKET_HEADER_BYTES);
+    COMPRESSED_BUCKET_MAGIC.copy(header, 0);
+    header.writeUInt32LE(raw.length, 4);
+    return Buffer.concat([header, compressed], header.length + compressed.length);
+}
+
 /** 编码：[u32 count][u16 offset_ms][u32 payload_len][payload_utf8]... */
 export function encodeBucketEntries(items: BucketItem[], bucketSec: number): Buffer {
     const base = bucketSec * 1000;
@@ -50,24 +83,30 @@ export function encodeBucketEntries(items: BucketItem[], bucketSec: number): Buf
 export function encodeBucket(items: BucketItem[], bucketSec: number): Buffer {
     const head = Buffer.alloc(4);
     head.writeUInt32LE(items.length, 0);
-    return Buffer.concat([head, encodeBucketEntries(items, bucketSec)]);
+    return packBucketBlob(Buffer.concat([head, encodeBucketEntries(items, bucketSec)]));
 }
 
 export function validateBucketBlob(blob: unknown, expectedCount: number, expectedBytes: number): BucketValidationResult {
     if (!Buffer.isBuffer(blob)) return { valid: false, structureValid: false, count: 0, reason: 'blob is not a Buffer' };
-    if (blob.length < 4) return { valid: false, structureValid: false, count: 0, reason: 'blob is shorter than header' };
-    const count = blob.readUInt32LE(0);
+    if (!Number.isSafeInteger(expectedBytes) || expectedBytes !== blob.length) return { valid: false, structureValid: true, count: 0, reason: 'bucket bytes metadata mismatch' };
+    let raw: Buffer;
+    try {
+        raw = unpackBucketBlob(blob);
+    } catch (error) {
+        return { valid: false, structureValid: false, count: 0, reason: (error as Error).message || 'bucket decompression failed' };
+    }
+    if (raw.length < 4) return { valid: false, structureValid: false, count: 0, reason: 'blob is shorter than header' };
+    const count = raw.readUInt32LE(0);
     let p = 4;
     for (let i = 0; i < count; i++) {
-        if (p + 6 > blob.length) return { valid: false, structureValid: false, count, reason: 'truncated entry header' };
+        if (p + 6 > raw.length) return { valid: false, structureValid: false, count, reason: 'truncated entry header' };
         p += 2;
-        const len = blob.readUInt32LE(p); p += 4;
-        if (p + len > blob.length) return { valid: false, structureValid: false, count, reason: 'truncated payload' };
+        const len = raw.readUInt32LE(p); p += 4;
+        if (p + len > raw.length) return { valid: false, structureValid: false, count, reason: 'truncated payload' };
         p += len;
     }
-    if (p !== blob.length) return { valid: false, structureValid: false, count, reason: 'trailing bytes after entries' };
+    if (p !== raw.length) return { valid: false, structureValid: false, count, reason: 'trailing bytes after entries' };
     if (!Number.isSafeInteger(expectedCount) || expectedCount < 0) return { valid: false, structureValid: true, count, reason: 'invalid bucket count metadata' };
-    if (!Number.isSafeInteger(expectedBytes) || expectedBytes !== blob.length) return { valid: false, structureValid: true, count, reason: 'bucket bytes metadata mismatch' };
     if (count !== expectedCount) return { valid: false, structureValid: true, count, reason: 'bucket count metadata mismatch' };
     return { valid: true, structureValid: true, count };
 }
@@ -76,27 +115,31 @@ export function appendEntriesToBucketBlob(existingBlob: Buffer, existingCount: n
     const count = existingCount + newItems.length;
     if (count > 0xFFFFFFFF) throw new Error('bucket message count exceeds uint32 limit');
     const tail = encodeBucketEntries(newItems, bucketSec);
-    const blob = Buffer.concat([existingBlob, tail], existingBlob.length + tail.length);
-    blob.writeUInt32LE(count, 0);
+    const existingRaw = unpackBucketBlob(existingBlob);
+    const raw = Buffer.concat([existingRaw, tail], existingRaw.length + tail.length);
+    raw.writeUInt32LE(count, 0);
+    const blob = packBucketBlob(raw);
     return { blob, count, bytes: blob.length };
 }
 
 export function iterateBucketEntries(blob: Buffer, bucketSec: number, startIndex = 0): BucketEntry[] {
     const out: BucketEntry[] = [];
-    if (!blob || blob.length < 4) return out;
+    if (!blob) return out;
+    const raw = unpackBucketBlob(blob);
+    if (raw.length < 4) return out;
     const base = bucketSec * 1000;
-    const n = blob.readUInt32LE(0);
+    const n = raw.readUInt32LE(0);
     const firstIndex = Math.max(0, startIndex | 0);
     let p = 4;
-    for (let i = 0; i < n && p + 6 <= blob.length; i++) {
+    for (let i = 0; i < n && p + 6 <= raw.length; i++) {
         const entryOffset = p;
-        const off = blob.readUInt16LE(p); p += 2;
-        const payloadLen = blob.readUInt32LE(p); p += 4;
+        const off = raw.readUInt16LE(p); p += 2;
+        const payloadLen = raw.readUInt32LE(p); p += 4;
         const payloadOffset = p;
-        if (payloadOffset + payloadLen > blob.length) break;
+        if (payloadOffset + payloadLen > raw.length) break;
         p += payloadLen;
         if (i < firstIndex) continue;
-        const payload = blob.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
+        const payload = raw.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
         out.push({
             msgIndex: i,
             time: base + off,
@@ -112,6 +155,8 @@ export function iterateBucketEntries(blob: Buffer, bucketSec: number, startIndex
 
 export function readPayloadBytesSlice(blob: Buffer, payloadOffset: number, payloadLen: number): Buffer | null {
     if (!Buffer.isBuffer(blob)) return null;
+    // Compressed buckets are decoded once through the caller's bucket cache.
+    if (isCompressedBucketBlob(blob)) return null;
     if (!Number.isSafeInteger(payloadOffset) || !Number.isSafeInteger(payloadLen)) return null;
     if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > blob.length) return null;
     return blob.subarray(payloadOffset, payloadOffset + payloadLen);

@@ -73,6 +73,9 @@ const SELECTED_TOPIC_HISTORY_CACHE_LIMIT = 20;
 const selectedTopicHistoryIndexStatus = ref<HistoryIndexStatus | null>(null);
 const selectedTopicHistoryIndexStatusConnectionId = ref<string | null>(null);
 const selectedTopicHistoryIndexStatusLoading = ref(false);
+const GLOBAL_HISTORY_FALLBACK_LIMIT = 500;
+const globalHistoryFallbackKeys = new Set<string>();
+let globalHistoryFallbackSeq = 0;
 
 let filterTimer: number | null = null;
 watch(filterConditions, (v) => {
@@ -555,7 +558,15 @@ async function loadMoreSelectedTopicHistory(): Promise<void> {
     const endTime = selectedTopicHistoryLoadedOnce.value
         ? selectedTopicHistoryEndTime.value
         : selectedTopicHistoryRangeEndTime.value;
+    console.info('[message-viewer] history page request', {
+        connectionId: conn.selectedId,
+        topic: selectedTopicView.value.topic,
+        endTime,
+        range: selectedTopicHistoryRange.value,
+        conditions: activeHistoryConditions().length
+    });
     selectedTopicHistoryLoading.value = true;
+    let continueAtEnd = false;
     try {
         const result = await loadSelectedTopicHistoryPage(endTime);
         if (requestSeq !== selectedTopicHistoryRequestSeq || requestKey !== selectedTopicHistoryRequestKey()) return;
@@ -571,6 +582,15 @@ async function loadMoreSelectedTopicHistory(): Promise<void> {
         selectedTopicHistoryRows.value.push(...result.rows);
         selectedTopicHistoryEndTime.value = nextEndTime;
         selectedTopicHistoryLoadedOnce.value = true;
+        continueAtEnd = !result.timedOut && result.rows.length > 0 && selectedTopicHistoryHasMore.value;
+        console.info('[message-viewer] history page complete', {
+            connectionId: conn.selectedId,
+            topic: selectedTopicView.value?.topic,
+            rows: result.rows.length,
+            hasMore: selectedTopicHistoryHasMore.value,
+            nextEndTime,
+            timedOut: Boolean(result.timedOut)
+        });
         if (result.timedOut) {
             if (result.rows.length > 0) {
                 toast.info(`已先加载 ${result.rows.length} 条历史结果，${selectedTopicHistoryRangeLabel.value}查询仍在继续可稍后重试`);
@@ -583,6 +603,71 @@ async function loadMoreSelectedTopicHistory(): Promise<void> {
     } finally {
         if (requestSeq === selectedTopicHistoryRequestSeq) selectedTopicHistoryLoading.value = false;
     }
+    if (continueAtEnd && requestSeq === selectedTopicHistoryRequestSeq) {
+        await nextTick();
+        // 条件结果较稀疏或本页大多与实时缓存重复时，列表可能仍贴着底部；自动续一页。
+        if (viewMode.value === 'topic' && currentVirtual()?.isNearEnd(160)) {
+            void loadMoreSelectedTopicHistory();
+        }
+    }
+}
+
+async function backfillGlobalHistoryWhenRealtimeEmpty(): Promise<void> {
+    const requestSeq = ++globalHistoryFallbackSeq;
+    const connectionId = conn.selectedId;
+    const conditions = activeHistoryConditions();
+    if (!connectionId || conditions.length === 0 || timelineList.value.length > 0) return;
+    const endTime = Date.now();
+    const rangeMs = selectedTopicHistoryRangeMs();
+    const startTime = rangeMs == null ? undefined : Math.max(0, endTime - rangeMs);
+    const key = JSON.stringify({ connectionId, conditions, range: selectedTopicHistoryRange.value });
+    if (globalHistoryFallbackKeys.has(key)) return;
+    globalHistoryFallbackKeys.add(key);
+    while (globalHistoryFallbackKeys.size > 20) {
+        const oldest = globalHistoryFallbackKeys.values().next().value;
+        if (oldest == null) break;
+        globalHistoryFallbackKeys.delete(oldest);
+    }
+    console.info('[message-viewer] global history fallback request', {
+        connectionId,
+        range: selectedTopicHistoryRange.value,
+        conditions: conditions.length
+    });
+    const result = await window.api.historyQuery({
+        connectionId,
+        conditions,
+        startTime,
+        endTime,
+        order: 'desc',
+        limit: GLOBAL_HISTORY_FALLBACK_LIMIT
+    });
+    if (requestSeq !== globalHistoryFallbackSeq || connectionId !== conn.selectedId) return;
+    if (!result.success || !result.data) {
+        globalHistoryFallbackKeys.delete(key);
+        console.warn('[message-viewer] global history fallback failed', {
+            connectionId,
+            reason: result.message || 'unknown'
+        });
+        return;
+    }
+    if (result.data.length === 0) globalHistoryFallbackKeys.delete(key);
+    const existing = new Set(bucket.value.timeline.snapshot().map(messageDedupeKey));
+    const rows = result.data.filter((row) => !existing.has(messageDedupeKey(row)));
+    if (rows.length > 0) {
+        await msg.hydrate(connectionId, rows);
+        await nextTick();
+        const currentTopic = bucket.value.selectedTopic;
+        if (!currentTopic || !liveTopicList.value.some((item) => item.topic === currentTopic)) {
+            const first = liveTopicList.value[0];
+            if (first) msg.selectTopic(connectionId, first.topic);
+        }
+    }
+    console.info('[message-viewer] global history fallback complete', {
+        connectionId,
+        queriedRows: result.data.length,
+        addedRows: rows.length,
+        topics: new Set(rows.map((row) => row.topic)).size
+    });
 }
 
 function setMode(m: ViewMode): void { viewMode.value = m; }
@@ -666,10 +751,12 @@ interface DynamicListHandle {
     getScrollElement: () => HTMLElement | null;
     scrollToTop: (smooth?: boolean) => void;
     resetMeasurements: (scrollTopAfterReset?: boolean) => void;
+    isNearEnd: (threshold?: number) => boolean;
 }
 
 const timelineVirtualRef = ref<DynamicListHandle | null>(null);
 const topicVirtualRef = ref<DynamicListHandle | null>(null);
+let pausedFollowHasLeftStart = false;
 
 const timelineResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value }));
 const topicListResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value, sort: topicSort.value }));
@@ -738,10 +825,16 @@ function unfreezeVisibleOrder(): void {
 }
 
 function onUserScrollIntent(): void {
-    if (!autoFollow.value) return;
-    freezeVisibleOrder();
-    autoFollow.value = false;
-    showJumpBtn.value = true;
+    if (autoFollow.value) {
+        freezeVisibleOrder();
+        autoFollow.value = false;
+        pausedFollowHasLeftStart = false;
+        showJumpBtn.value = true;
+    }
+    // 已经位于底部时继续滚轮不会产生 scroll 事件，必须从用户交互入口继续加载。
+    if (viewMode.value === 'topic' && currentVirtual()?.isNearEnd(160)) {
+        void loadMoreSelectedTopicHistory();
+    }
 }
 
 function onUserScroll(): void {
@@ -749,17 +842,22 @@ function onUserScroll(): void {
     if (!el) return;
     // 用户离开顶部 → 关闭跟随；回到顶部附近 → 恢复跟随
     if (el.scrollTop > 60) {
+        pausedFollowHasLeftStart = true;
         if (autoFollow.value) {
             freezeVisibleOrder();
             autoFollow.value = false;
         }
         showJumpBtn.value = true;
-    } else {
+    } else if (el.scrollTop <= 4 && pausedFollowHasLeftStart) {
         showJumpBtn.value = false;
         if (!autoFollow.value) {
             autoFollow.value = true;
             unfreezeVisibleOrder();
         }
+        pausedFollowHasLeftStart = false;
+    } else if (!autoFollow.value) {
+        // 用户刚从顶部开始向下滚时保留暂停状态，避免 60px 内被自动跟随拉回顶部。
+        showJumpBtn.value = true;
     }
     if (viewMode.value === 'topic' && el.scrollTop + el.clientHeight >= el.scrollHeight - 160) {
         void loadMoreSelectedTopicHistory();
@@ -770,6 +868,7 @@ function scrollToTop(smooth = true): void {
     currentVirtual()?.scrollToTop(smooth);
     autoFollow.value = true;
     showJumpBtn.value = false;
+    pausedFollowHasLeftStart = false;
     unfreezeVisibleOrder();
 }
 
@@ -784,6 +883,7 @@ watch(
         resetSelectedTopicHistory();
         await nextTick();
         topicVirtualRef.value?.resetMeasurements(true);
+        void backfillGlobalHistoryWhenRealtimeEmpty();
     }
 );
 

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 
-export const HISTORY_INDEX_SCHEMA_VERSION = '5';
+export const HISTORY_INDEX_SCHEMA_VERSION = '6';
+export const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '5';
 export type HistoryFtsTokenizer = 'trigram' | 'unicode61' | 'none';
 export type HistoryFtsLayout = 'contentless' | 'legacy';
 
@@ -22,7 +23,11 @@ export function getIndexMeta(db: Database.Database, key: string): string | null 
 
 export function getHistoryIndexSchemaVersion(db: Database.Database): string | null {
     const version = getIndexMeta(db, 'schema_version');
-    return version === HISTORY_INDEX_SCHEMA_VERSION ? version : null;
+    return version === HISTORY_INDEX_SCHEMA_VERSION || version === LEGACY_HISTORY_INDEX_SCHEMA_VERSION ? version : null;
+}
+
+export function isCompactHistoryIndex(db: Database.Database): boolean {
+    return getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION;
 }
 
 export function getHistoryFtsTokenizer(db: Database.Database): HistoryFtsTokenizer {
@@ -77,12 +82,15 @@ function createHistoryFtsTable(
     layout: HistoryFtsLayout
 ): void {
     if (layout === 'contentless') {
+        const compact = getIndexMeta(db, 'schema_version') === HISTORY_INDEX_SCHEMA_VERSION || historyMessagesColumns(db).has('search_text') === false;
+        const contentlessOptions = compact
+            ? 'content=\'\', detail=none, columnsize=0'
+            : 'content=\'\', contentless_delete=1';
         db.exec(`
             CREATE VIRTUAL TABLE IF NOT EXISTS history_messages_fts USING fts5(
                 search_text,
                 tokenize='${tokenizer}',
-                content='',
-                contentless_delete=1
+                ${contentlessOptions}
             );
         `);
         return;
@@ -109,14 +117,21 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
     const version = getIndexMeta(db, 'schema_version');
     const columns = historyMessagesColumns(db);
     const hasTable = columns.size > 0;
+    const hasLegacyV5Columns = ['id', 'bucket_ts', 'topic', 'msg_index', 'time_ms', 'search_text', 'payload_offset', 'payload_len', 'entry_offset', 'entry_len']
+        .every((name) => columns.has(name));
+    // Existing v5 shards stay writable/readable until their hour closes. New shards use v6.
+    if (!options.rebuild && version === LEGACY_HISTORY_INDEX_SCHEMA_VERSION && hasLegacyV5Columns) {
+        return getHistoryFtsTokenizer(db);
+    }
     const hasPayloadColumn = columns.has('payload');
     const hasV4Columns = columns.has('payload_offset') && columns.has('payload_len') && columns.has('entry_offset') && columns.has('entry_len');
-    const resetIndex = options.rebuild || hasPayloadColumn || !hasTable || version !== HISTORY_INDEX_SCHEMA_VERSION || !hasV4Columns;
+    const hasCompactColumns = hasTable && !columns.has('search_text') && columns.has('id') && hasV4Columns;
+    const resetIndex = options.rebuild || hasPayloadColumn || !hasCompactColumns || version !== HISTORY_INDEX_SCHEMA_VERSION;
 
     if (resetIndex) {
-        db.exec('DROP TABLE IF EXISTS history_messages_fts; DROP TABLE IF EXISTS history_messages;');
+        db.exec('DROP TABLE IF EXISTS history_messages_fts; DROP TABLE IF EXISTS history_fts_pending; DROP TABLE IF EXISTS history_messages;');
     }
-    const layout: HistoryFtsLayout = resetIndex || columns.has('id') ? 'contentless' : 'legacy';
+    const layout: HistoryFtsLayout = 'contentless';
     if (layout === 'contentless') {
         db.exec(`
             CREATE TABLE IF NOT EXISTS history_messages (
@@ -125,7 +140,6 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
                 topic TEXT NOT NULL,
                 msg_index INTEGER NOT NULL,
                 time_ms INTEGER NOT NULL,
-                search_text TEXT NOT NULL,
                 payload_offset INTEGER NOT NULL,
                 payload_len INTEGER NOT NULL,
                 entry_offset INTEGER NOT NULL,
@@ -134,6 +148,10 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
             );
             CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
             CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
+            CREATE TABLE IF NOT EXISTS history_fts_pending (
+                id INTEGER PRIMARY KEY,
+                search_text TEXT NOT NULL
+            );
         `);
     } else {
         db.exec(`
@@ -142,11 +160,18 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
         `);
     }
 
+    setIndexMeta(db, 'schema_version', HISTORY_INDEX_SCHEMA_VERSION);
     let tokenizer = detectHistoryFtsTokenizer(db);
     if (tokenizer !== 'none') {
         try {
             createHistoryFtsTable(db, tokenizer, layout);
-        } catch {
+        } catch (error) {
+            console.warn('[history-index] FTS5 table creation failed; keyword queries will use exact scan', {
+                tokenizer,
+                layout,
+                schemaVersion: getIndexMeta(db, 'schema_version'),
+                reason: (error as Error).message || String(error)
+            });
             tokenizer = 'none';
             db.exec('DROP TABLE IF EXISTS history_messages_fts;');
         }
@@ -154,10 +179,10 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
         db.exec('DROP TABLE IF EXISTS history_messages_fts;');
     }
 
-    setIndexMeta(db, 'schema_version', HISTORY_INDEX_SCHEMA_VERSION);
     setIndexMeta(db, 'fts5_enabled', tokenizer === 'none' ? '0' : '1');
     setIndexMeta(db, 'fts5_tokenizer', tokenizer);
     setIndexMeta(db, 'fts_layout', layout);
+    setIndexMeta(db, 'fts_query_mode', tokenizer === 'trigram' ? 'compact-trigram-candidates' : 'scan');
     if (options.initializeCompletion) {
         const complete = getIndexMeta(db, 'index_complete');
         if (resetIndex || !complete) {

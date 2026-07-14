@@ -30,6 +30,55 @@ function queryHistory(logRoot, opts) {
   });
 }
 
+function rebuildHistoryIndex(logRoot) {
+  const workerPath = path.resolve('dist-electron/main/history-index-worker.js');
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath, { workerData: { logRoot, req: {} } });
+    const timer = setTimeout(() => {
+      void worker.terminate();
+      reject(new Error('history index rebuild timed out'));
+    }, 30_000);
+    worker.on('message', (message) => {
+      if (message?.type === 'progress') return;
+      clearTimeout(timer);
+      void worker.terminate();
+      if (message?.type === 'done') resolve(message.result);
+      else reject(new Error(message?.error || 'history index rebuild failed'));
+    });
+    worker.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+function exportHistory(logRoot, targetPath) {
+  const workerPath = path.resolve('dist-electron/main/history-export-worker.js');
+  const req = {
+    format: 'json',
+    query: { connectionId: 'fixture' },
+    conditions: [{ join: 'and', term: 'optimized' }]
+  };
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerPath, { workerData: { logRoot, targetPath, req } });
+    const timer = setTimeout(() => {
+      void worker.terminate();
+      reject(new Error('compressed history export timed out'));
+    }, 30_000);
+    worker.on('message', (message) => {
+      if (message?.type === 'progress') return;
+      clearTimeout(timer);
+      void worker.terminate();
+      if (message?.type === 'done') resolve(message.result);
+      else reject(new Error(message?.error || 'compressed history export failed'));
+    });
+    worker.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
 async function run() {
   const logRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mqttmountain-storage-shard-'));
   const tsMs = new Date(2026, 6, 14, 9, 23, 45, 123).getTime();
@@ -65,7 +114,7 @@ async function run() {
             reject(error);
           }
         } else if (message?.id === 3) {
-          if (!message.ok || message.result?.indexed !== 1 || message.result?.incompleteShards !== 0) {
+          if (!message.ok || ![0, 2].includes(message.result?.indexed) || message.result?.incompleteShards !== 0) {
             clearTimeout(timer);
             reject(new Error(`deferred FTS flush failed: ${JSON.stringify(message)}`));
             return;
@@ -122,7 +171,10 @@ async function run() {
       worker.postMessage({
         id: 1,
         command: 'enqueueBatch',
-        payload: [{ connectionId: 'fixture', topic: 'a/b', payload: '{"status":"optimized"}', tsMs }]
+        payload: [
+          { connectionId: 'fixture', topic: 'a/b', payload: JSON.stringify({ status: 'optimized', repeated: 'mqtt-storage-compression-'.repeat(40) }), tsMs },
+          { connectionId: 'fixture', topic: 'a/b', payload: JSON.stringify({ status: 'opt pti tim imi miz ize zed', repeated: 'mqtt-storage-compression-'.repeat(40) }), tsMs: tsMs + 1 }
+        ]
       });
     });
 
@@ -130,13 +182,24 @@ async function run() {
     const db = new Database(expectedDb, { readonly: true });
     try {
       const row = db.prepare('SELECT COALESCE(SUM(count), 0) AS count FROM buckets').get();
-      if (Number(row?.count) !== 1) throw new Error(`expected 1 committed message, got ${row?.count}`);
-      const meta = Object.fromEntries(db.prepare("SELECT key, value FROM history_index_meta WHERE key IN ('fts_layout', 'fts_index_complete', 'fts_indexed_id')").all().map((item) => [item.key, item.value]));
-      if (meta.fts_layout !== 'contentless' || meta.fts_index_complete !== '1' || Number(meta.fts_indexed_id) !== 1) {
+      if (Number(row?.count) !== 2) throw new Error(`expected 2 committed messages, got ${row?.count}`);
+      const meta = Object.fromEntries(db.prepare("SELECT key, value FROM history_index_meta WHERE key IN ('schema_version', 'fts_layout', 'fts_query_mode', 'fts_index_complete', 'fts_indexed_id')").all().map((item) => [item.key, item.value]));
+      if (meta.schema_version !== '6' || meta.fts_layout !== 'contentless' || meta.fts_query_mode !== 'compact-trigram-candidates' || meta.fts_index_complete !== '1' || Number(meta.fts_indexed_id) !== 2) {
         throw new Error(`unexpected deferred FTS metadata: ${JSON.stringify(meta)}`);
       }
-      const ftsCount = Number(db.prepare('SELECT COUNT(*) AS count FROM history_messages_fts').get()?.count);
-      if (ftsCount !== 1) throw new Error(`expected 1 contentless FTS row, got ${ftsCount}`);
+      const columns = db.prepare('PRAGMA table_info(history_messages)').all().map((item) => item.name);
+      if (columns.includes('search_text')) throw new Error('v6 history_messages unexpectedly retains search_text');
+      const pendingCount = Number(db.prepare('SELECT COUNT(*) AS count FROM history_fts_pending').get()?.count);
+      if (pendingCount !== 0) throw new Error(`expected pending FTS text to be deleted, got ${pendingCount}`);
+      const ftsSql = String(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'history_messages_fts'").get()?.sql || '').toLowerCase();
+      if (!ftsSql.includes('detail=none') || !ftsSql.includes('columnsize=0')) throw new Error(`FTS is not compact: ${ftsSql}`);
+      const bucket = db.prepare('SELECT blob, bytes FROM buckets LIMIT 1').get();
+      if (!Buffer.isBuffer(bucket?.blob) || bucket.blob.subarray(0, 4).toString('ascii') !== 'MMZ1') throw new Error('new bucket was not compressed');
+      if (Number(bucket.bytes) !== bucket.blob.length) throw new Error('compressed bucket bytes metadata mismatch');
+      const rawBytes = bucket.blob.readUInt32LE(4);
+      if (bucket.blob.length / rawBytes >= 0.5) throw new Error(`unexpected bucket compression ratio: ${bucket.blob.length}/${rawBytes}`);
+      const ftsRows = db.prepare(`SELECT rowid FROM history_messages_fts WHERE history_messages_fts MATCH '"opt"'`).all();
+      if (ftsRows.length !== 2) throw new Error(`expected 2 compact FTS candidates for exact filtering, got ${ftsRows.length}`);
       const finalizedAt = Number(db.prepare("SELECT value FROM history_index_meta WHERE key = 'fts_finalized_at'").get()?.value || 0);
       if (finalizedAt <= 0) throw new Error('hour rollover did not finalize the previous shard');
     } finally {
@@ -149,13 +212,17 @@ async function run() {
     const rolloverDb = new Database(rolloverLoadDb, { readonly: true });
     try {
       const messageCount = Number(rolloverDb.prepare('SELECT COUNT(*) AS count FROM history_messages').get()?.count);
-      const ftsCount = Number(rolloverDb.prepare('SELECT COUNT(*) AS count FROM history_messages_fts').get()?.count);
+      const pendingFtsCount = Number(rolloverDb.prepare('SELECT COUNT(*) AS count FROM history_fts_pending').get()?.count);
       const finalizedAt = Number(rolloverDb.prepare("SELECT value FROM history_index_meta WHERE key = 'fts_finalized_at'").get()?.value || 0);
       if (messageCount !== 1500) throw new Error(`expected 1500 rollover load messages, got ${messageCount}`);
-      if (ftsCount >= messageCount) throw new Error('incomplete rollover shard was unexpectedly indexed synchronously');
+      if (pendingFtsCount <= 0) throw new Error('incomplete rollover shard unexpectedly has no deferred FTS rows');
       if (finalizedAt > 0) throw new Error('incomplete rollover shard was unexpectedly finalized synchronously');
     } finally {
       rolloverDb.close();
+    }
+    const rebuild = await rebuildHistoryIndex(logRoot);
+    if (Number(rebuild?.incompleteFiles) !== 0 || Number(rebuild?.indexedFiles) < 3) {
+      throw new Error(`v6 history index rebuild failed: ${JSON.stringify(rebuild)}`);
     }
     fs.copyFileSync(expectedDb, path.join(logRoot, 'fixture', '2026-07-14.db'));
     const rows = await queryHistory(logRoot, {
@@ -167,10 +234,18 @@ async function run() {
     if (!Array.isArray(rows) || rows.length !== 2) {
       throw new Error(`expected daily and hourly files to both be queried, got ${Array.isArray(rows) ? rows.length : 'invalid result'}`);
     }
+    const exportPath = path.join(logRoot, 'compressed-history.json');
+    const exported = await exportHistory(logRoot, exportPath);
+    if (Number(exported?.totalRows) !== 2 || !fs.readFileSync(exportPath, 'utf8').includes('optimized')) {
+      throw new Error(`compressed history export failed: ${JSON.stringify(exported)}`);
+    }
     console.log('✓ storage-hour-shard durable commit');
+    console.log('✓ compressed bucket and v6 compact trigram schema');
     console.log('✓ deferred contentless FTS and incomplete-tail fallback');
     console.log('✓ completed hour rollover WAL truncate');
     console.log('✓ incomplete hour rollover stays bounded and defers FTS catch-up');
+    console.log('✓ v6 index rebuild keeps compact FTS and compressed buckets');
+    console.log('✓ compressed history export compatibility');
     console.log('✓ legacy-daily and hourly query compatibility');
   } finally {
     await worker.terminate().catch(() => undefined);

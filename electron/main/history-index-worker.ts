@@ -3,7 +3,7 @@ import path from 'node:path';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
-import { iterateBucketEntries } from './history-bucket-codec';
+import { isCompressedBucketBlob, iterateBucketEntries, packBucketBlob, unpackBucketBlob } from './history-bucket-codec';
 import { HISTORY_DB_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
 import { ensureHistoryIndexSchema, getHistoryFtsLayout, getIndexMeta, setIndexMeta } from './history-index-schema';
 
@@ -54,19 +54,24 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
         const ftsTokenizer = ensureHistoryIndexSchema(db, { rebuild: true });
         fts5Enabled = ftsTokenizer !== 'none';
         const ftsLayout = getHistoryFtsLayout(db);
+        let compressedBuckets = 0;
+        let rawBucketBytes = 0;
+        let storedBucketBytes = 0;
 
         for (let attempt = 0; attempt < 2; attempt++) {
             processedBuckets = 0;
             processedMessages = 0;
             setIndexMeta(db, 'index_complete', '0');
             setIndexMeta(db, 'index_dirty_at', '0');
-            db.exec(fts5Enabled ? 'DELETE FROM history_messages; DELETE FROM history_messages_fts;' : 'DELETE FROM history_messages;');
+            db.exec(fts5Enabled
+                ? "DELETE FROM history_messages; INSERT INTO history_messages_fts(history_messages_fts) VALUES('delete-all'); DELETE FROM history_fts_pending;"
+                : 'DELETE FROM history_messages; DELETE FROM history_fts_pending;');
 
             const totalRow = db.prepare('SELECT COUNT(*) AS count, COALESCE(SUM(count), 0) AS messages FROM buckets').get() as { count: number; messages: number };
             const totalBuckets = totalRow.count;
             const insertStmt = db.prepare(
-                `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, search_text, payload_offset, payload_len, entry_offset, entry_len)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+                `INSERT INTO history_messages (bucket_ts, topic, msg_index, time_ms, payload_offset, payload_len, entry_offset, entry_len)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
             );
             const insertFtsStmt = fts5Enabled
                 ? ftsLayout === 'contentless'
@@ -82,12 +87,23 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
                  ORDER BY bucket_ts ASC, topic ASC
                  LIMIT ?`
             );
+            const updateBucketStmt = db.prepare('UPDATE buckets SET blob = ?, bytes = ? WHERE bucket_ts = ? AND topic = ?');
             const writeRows = db.transaction((rows: { bucket_ts: number; topic: string; blob: Buffer }[]) => {
                 for (const row of rows) {
                     const entries = iterateBucketEntries(row.blob, row.bucket_ts);
+                    if (!isCompressedBucketBlob(row.blob)) {
+                        const raw = unpackBucketBlob(row.blob);
+                        const packed = packBucketBlob(raw);
+                        rawBucketBytes += raw.length;
+                        storedBucketBytes += packed.length;
+                        if (isCompressedBucketBlob(packed)) {
+                            updateBucketStmt.run(packed, packed.length, row.bucket_ts, row.topic);
+                            compressedBuckets++;
+                        }
+                    }
                     for (const entry of entries) {
                         const searchText = normalizeSearchText(row.topic, entry.payload);
-                        const inserted = insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
+                        const inserted = insertStmt.run(row.bucket_ts, row.topic, entry.msgIndex, entry.time, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
                         if (ftsLayout === 'contentless') insertFtsStmt?.run(Number(inserted.lastInsertRowid), searchText);
                         else insertFtsStmt?.run(searchText, row.bucket_ts, row.topic, entry.msgIndex, entry.time);
                     }
@@ -128,6 +144,10 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
             setIndexMeta(db, 'fts_indexed_id', maxId);
             setIndexMeta(db, 'fts_index_complete', '1');
             setIndexMeta(db, 'last_indexed_at', Date.now());
+            setIndexMeta(db, 'bucket_compression', 'deflate-raw-level-1');
+            setIndexMeta(db, 'compressed_bucket_count', compressedBuckets);
+            setIndexMeta(db, 'compression_raw_bytes', rawBucketBytes);
+            setIndexMeta(db, 'compression_stored_bytes', storedBucketBytes);
             if (getIndexMeta(db, 'index_dirty_at') === '0') {
                 setIndexMeta(db, 'index_complete', '1');
                 return { buckets: processedBuckets, messages: processedMessages, fts5Enabled };
