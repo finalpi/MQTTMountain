@@ -8,8 +8,14 @@ import mqtt, { MqttClient, IClientOptions, IPublishPacket } from 'mqtt';
 import type { BrowserWindow } from 'electron';
 import type { ApiResult, ConnectPayload, MqttMessage, PublishPayload } from '../../shared/types';
 import { MqttIpcQueue } from './mqtt-ipc-queue';
+import { writeDiagnosticLog } from './diagnostics';
 import { decodePayloadView } from './payload-codec';
-import { enqueueMessage } from './storage';
+import {
+    enqueueMessage,
+    getStorageDiagnosticsAsync,
+    isStorageBackpressured,
+    setStoragePressureListener
+} from './storage';
 
 interface QueuedMqttMessage {
     ctx: ConnectionCtx;
@@ -40,10 +46,15 @@ export class MqttService {
     private messageQueue: QueuedMqttMessage[] = [];
     private messageQueueHead = 0;
     private messageQueueTimer: NodeJS.Timeout | null = null;
+    private diagnosticsTimer: NodeJS.Timeout | null = null;
+    private storageBackpressured = false;
+    private storageDiagnosticsInFlight = false;
 
     constructor(getWin: () => BrowserWindow | null) {
         this.getWin = getWin;
         this.ipcQueue = new MqttIpcQueue(getWin);
+        setStoragePressureListener((pressured) => this.setStorageBackpressure(pressured));
+        this.startDiagnostics();
     }
 
     /**
@@ -74,6 +85,12 @@ export class MqttService {
                 if (p.username) opts.username = p.username;
                 if (p.password) opts.password = p.password;
 
+                writeDiagnosticLog('[mqtt] connect request', {
+                    connectionId: p.connectionId,
+                    url,
+                    clientId: p.clientId,
+                    existingConnections: this.conns.size
+                });
                 const client = mqtt.connect(url, opts);
                 const ctx: ConnectionCtx = {
                     id: p.connectionId,
@@ -97,14 +114,25 @@ export class MqttService {
 
                 let initialConnect = true;
                 client.on('connect', () => {
+                    if (this.storageBackpressured) client.stream.pause();
                     this.sendState(p.connectionId, 'connected');
                     if (initialConnect) {
                         initialConnect = false;
                         clearTimeout(hardTimeout);
                         console.log(`[mqtt][${p.connectionId}] CONNECT OK ${url}`);
+                        writeDiagnosticLog('[mqtt] connect ok', {
+                            connectionId: p.connectionId,
+                            url,
+                            activeConnections: this.conns.size
+                        });
                         settle({ success: true });
                     } else {
                         console.log(`[mqtt][${p.connectionId}] RECONNECTED ${url}`);
+                        writeDiagnosticLog('[mqtt] reconnected', {
+                            connectionId: p.connectionId,
+                            url,
+                            activeConnections: this.conns.size
+                        });
                     }
                 });
                 client.on('reconnect', () => this.sendState(p.connectionId, 'reconnecting'));
@@ -120,6 +148,7 @@ export class MqttService {
                         return;
                     }
                     if (ctx.closing) {
+                        writeDiagnosticLog('[mqtt] closed', { connectionId: p.connectionId, activeConnections: this.conns.size });
                         this.sendState(p.connectionId, 'closed');
                         return;
                     }
@@ -148,6 +177,12 @@ export class MqttService {
     disconnect(connectionId: string): ApiResult {
         const ctx = this.conns.get(connectionId);
         if (ctx) {
+            writeDiagnosticLog('[mqtt] disconnect request', {
+                connectionId,
+                connected: ctx.client.connected,
+                queuedMessages: this.queuedMessageCount(),
+                activeConnections: this.conns.size
+            });
             ctx.closing = true;
             try { ctx.client.removeAllListeners(); } catch {}
             try { ctx.client.end(true); } catch {}
@@ -220,7 +255,9 @@ export class MqttService {
         if (this.queuedMessageCount() >= MESSAGE_PROCESS_QUEUE_HARD) {
             const dropped = this.dropQueuedMessages(Math.ceil(MESSAGE_PROCESS_QUEUE_HARD * 0.1));
             ctx.droppedMessages += dropped;
+            const snapshot = this.diagnosticsSnapshot();
             console.warn(`[mqtt][${connectionId}] 入站消息积压超限，已丢弃 ${dropped} 条，避免主进程卡死`);
+            writeDiagnosticLog('[mqtt] message queue overflow', { connectionId, dropped, ...snapshot });
         }
         this.messageQueue.push({ ctx, connectionId, topic, payload: Buffer.from(payload) });
         this.scheduleMessageProcessing();
@@ -259,8 +296,10 @@ export class MqttService {
     }
 
     private processMessageQueue(): void {
+        if (isStorageBackpressured()) return;
         const batchSize = Math.min(MESSAGE_PROCESS_BATCH, this.queuedMessageCount());
         for (let i = 0; i < batchSize; i++) {
+            if (isStorageBackpressured()) break;
             const item = this.messageQueue[this.messageQueueHead++];
             if (!item) break;
             const { ctx, connectionId, topic, payload } = item;
@@ -284,13 +323,66 @@ export class MqttService {
             };
             this.ipcQueue.enqueue(msg);
             ctx.msgCount++;
-            if (ctx.msgCount <= 3 || ctx.msgCount % 500 === 0) {
+            if (ctx.msgCount <= 3 || ctx.msgCount % 5000 === 0) {
                 const dropped = ctx.droppedMessages ? `, dropped=${ctx.droppedMessages}` : '';
                 console.log(`[mqtt][${connectionId}] msg #${ctx.msgCount} ${topic} (${text.length}B${dropped})`);
             }
         }
         this.compactMessageQueueIfNeeded();
-        if (this.queuedMessageCount() > 0) this.scheduleMessageProcessing();
+        if (this.queuedMessageCount() > 0 && !isStorageBackpressured()) this.scheduleMessageProcessing();
+    }
+
+    private setStorageBackpressure(pressured: boolean): void {
+        if (this.storageBackpressured === pressured) return;
+        this.storageBackpressured = pressured;
+        for (const ctx of this.conns.values()) {
+            try {
+                if (pressured) ctx.client.stream.pause();
+                else ctx.client.stream.resume();
+            } catch (error) {
+                writeDiagnosticLog('[storage] mqtt stream backpressure failed', { connectionId: ctx.id, pressured }, error);
+            }
+        }
+        writeDiagnosticLog(pressured ? '[storage] backpressure on' : '[storage] backpressure off', this.diagnosticsSnapshot());
+        if (!pressured && this.queuedMessageCount() > 0) this.scheduleMessageProcessing();
+    }
+
+    private diagnosticsSnapshot(): Record<string, unknown> {
+        const mem = process.memoryUsage();
+        return {
+            activeConnections: this.conns.size,
+            messageQueue: this.queuedMessageCount(),
+            ipcQueue: this.ipcQueue.size(),
+            rssMb: Math.round(mem.rss / 1024 / 1024),
+            heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+            externalMb: Math.round(mem.external / 1024 / 1024),
+            storageBackpressured: this.storageBackpressured,
+            connections: [...this.conns.values()].map((ctx) => ({
+                id: ctx.id,
+                connected: ctx.client.connected,
+                msgCount: ctx.msgCount,
+                droppedMessages: ctx.droppedMessages,
+                disabledTopics: ctx.disabledTopics.size
+            }))
+        };
+    }
+
+    private startDiagnostics(): void {
+        if (this.diagnosticsTimer) return;
+        this.diagnosticsTimer = setInterval(() => {
+            const snapshot = this.diagnosticsSnapshot();
+            if (snapshot.activeConnections || snapshot.messageQueue || snapshot.ipcQueue) {
+                writeDiagnosticLog('[mqtt] runtime snapshot', snapshot);
+                if (!this.storageDiagnosticsInFlight) {
+                    this.storageDiagnosticsInFlight = true;
+                    void getStorageDiagnosticsAsync().then((storage) => {
+                        writeDiagnosticLog('[storage] runtime snapshot', storage);
+                    }).finally(() => {
+                        this.storageDiagnosticsInFlight = false;
+                    });
+                }
+            }
+        }, 60_000);
     }
 
     private sendState(connectionId: string, state: string, message?: string): void {
@@ -305,6 +397,12 @@ export class MqttService {
 
     shutdown(): void {
         this.shuttingDown = true;
+        setStoragePressureListener(null);
+        writeDiagnosticLog('[mqtt] shutdown', this.diagnosticsSnapshot());
+        if (this.diagnosticsTimer) {
+            clearInterval(this.diagnosticsTimer);
+            this.diagnosticsTimer = null;
+        }
         if (this.messageQueueTimer) {
             clearTimeout(this.messageQueueTimer);
             this.messageQueueTimer = null;

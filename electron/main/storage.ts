@@ -1,7 +1,7 @@
 /**
  * 分片存储（B 方案 · 每秒合批）
  * 结构：
- *   <logRoot>/<sanitizedConnectionId>/<YYYY-MM-DD>.db
+ *   <logRoot>/<sanitizedConnectionId>/<YYYY-MM-DD-HH>.db
  *   table buckets:
  *     bucket_ts   INTEGER   -- 秒级时间戳 (second precision)
  *     topic       TEXT
@@ -11,7 +11,7 @@
  *     PRIMARY KEY(bucket_ts, topic)
  *
  * 写入策略：主进程把单条消息入内存合并器 pending，按 (ts_sec, topic) 聚合；
- *   每 STORAGE_FLUSH_MS 或 pending 总 payload 超过 STORAGE_FLUSH_BYTES 后写入对应 day.db。
+ *   每 STORAGE_FLUSH_MS 或 pending 总 payload 超过 STORAGE_FLUSH_BYTES 后写入对应小时分片。
  *   如果同一 (ts_sec, topic) 已存在，保留旧 blob，只追加新条目的编码尾部并修补 header count。
  */
 
@@ -31,8 +31,9 @@ import {
     type ExistingBucketRow
 } from './history-bucket-codec';
 import {
-    DATE_KEY_FILE_RE,
-    dateKeyFromTs,
+    HISTORY_DB_FILE_RE,
+    HISTORY_DB_SIDECAR_FILE_RE,
+    historyFileKeyFromTs,
     dayEndTsFromKey,
     dayStartTsFromKey,
     matchesText,
@@ -50,8 +51,7 @@ import {
     setIndexMeta
 } from './history-index-schema';
 
-const MAX_OPEN_LOG_DBS = 24;
-const DAY_DB_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/u;
+const MAX_OPEN_LOG_DBS = 8;
 
 let LOG_ROOT = '';
 
@@ -73,8 +73,23 @@ let storageWorkerFailure: Error | null = null;
 let storageWorkerFailureLogged = false;
 let storageWorkerShuttingDown = false;
 let storageAcceptingWrites = true;
+let storageWorkerInFlightBatches = 0;
+let storageWorkerInFlightEntries = 0;
+let storageWorkerInFlightBytes = 0;
+let storageWorkerOldestBatchAt = 0;
+let storageWorkerLastAckMs = 0;
+let storageWorkerMaxAckMs = 0;
+let storageWorkerAckedBatches = 0;
+let storageWorkerAckedEntries = 0;
+let storageBackpressured = false;
+let storagePressureListener: ((pressured: boolean) => void) | null = null;
 const storageWorkerRequests = new Map<number, {
     resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+}>();
+const storageWorkerDrainWaiters = new Set<{
+    resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
 }>();
@@ -93,14 +108,32 @@ let maintenancePauseDepth = 0;
 const storageWorkerBatch: PendingEntry[] = [];
 let storageWorkerBatchBytes = 0;
 let storageWorkerBatchTimer: NodeJS.Timeout | null = null;
-const STORAGE_FLUSH_MS = 250;
+let storageEnqueuedEntries = 0;
+let storageEnqueuedBytes = 0;
+let storageFlushCount = 0;
+let storageFlushedEntries = 0;
+let storageFlushedBytes = 0;
+let storageCommittedEntries = 0;
+let storageCommittedBytes = 0;
+let storageRetriedEntries = 0;
+let storageFlushTotalMs = 0;
+let storageFlushLastMs = 0;
+let storageFlushMaxMs = 0;
+let storageFlushErrors = 0;
+const STORAGE_FLUSH_MS = 1000;
 const STORAGE_FLUSH_BYTES = 4 * 1024 * 1024;
 const STORAGE_HARD_ENTRIES = 20_000;
-const STORAGE_WORKER_BATCH_MS = 15;
-const STORAGE_WORKER_BATCH_BYTES = 512 * 1024;
-const STORAGE_WORKER_BATCH_ENTRIES = 1000;
+const STORAGE_WORKER_BATCH_MS = 50;
+const STORAGE_WORKER_BATCH_BYTES = 1024 * 1024;
+const STORAGE_WORKER_BATCH_ENTRIES = 2000;
+const STORAGE_WORKER_MAX_IN_FLIGHT_BATCHES = 4;
+const STORAGE_PRESSURE_HIGH_ENTRIES = 20_000;
+const STORAGE_PRESSURE_LOW_ENTRIES = 5_000;
+const STORAGE_PRESSURE_HIGH_BYTES = 32 * 1024 * 1024;
+const STORAGE_PRESSURE_LOW_BYTES = 8 * 1024 * 1024;
 const STORAGE_WORKER_RPC_TIMEOUT_MS = 30_000;
-const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 8_000;
+const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 5 * 60_000;
+const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 55_000;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
@@ -112,6 +145,93 @@ export function initStorage(logRoot: string): void {
 
 export function getLogRoot(): string {
     return LOG_ROOT;
+}
+
+export function getStorageDiagnostics(): Record<string, unknown> {
+    const mem = process.memoryUsage();
+    const openDbFiles = [...logDbCache.keys()].map((key) => {
+        const pipe = key.lastIndexOf('|');
+        const san = pipe >= 0 ? key.slice(0, pipe) : key;
+        const day = pipe >= 0 ? key.slice(pipe + 1) : '';
+        const dbPath = path.join(LOG_ROOT, san, `${day}.db`);
+        const size = (target: string): number => {
+            try { return fs.statSync(target).size; } catch { return 0; }
+        };
+        return {
+            key,
+            dbBytes: size(dbPath),
+            walBytes: size(`${dbPath}-wal`),
+            shmBytes: size(`${dbPath}-shm`)
+        };
+    });
+    return {
+        logRoot: LOG_ROOT,
+        useStorageWorker: USE_STORAGE_WORKER,
+        pendingEntries: pending.length,
+        pendingBytes,
+        workerBatchEntries: storageWorkerBatch.length,
+        workerBatchBytes: storageWorkerBatchBytes,
+        workerInFlightBatches: storageWorkerInFlightBatches,
+        workerInFlightEntries: storageWorkerInFlightEntries,
+        workerInFlightBytes: storageWorkerInFlightBytes,
+        workerOldestBatchAgeMs: storageWorkerOldestBatchAt ? Date.now() - storageWorkerOldestBatchAt : 0,
+        workerLastAckMs: storageWorkerLastAckMs,
+        workerMaxAckMs: storageWorkerMaxAckMs,
+        workerAckedBatches: storageWorkerAckedBatches,
+        workerAckedEntries: storageWorkerAckedEntries,
+        workerPendingRpc: storageWorkerRequests.size,
+        workerDrainWaiters: storageWorkerDrainWaiters.size,
+        storageBackpressured,
+        enqueuedEntries: storageEnqueuedEntries,
+        enqueuedBytes: storageEnqueuedBytes,
+        flushCount: storageFlushCount,
+        flushedEntries: storageFlushedEntries,
+        flushedBytes: storageFlushedBytes,
+        committedEntries: storageCommittedEntries,
+        committedBytes: storageCommittedBytes,
+        retriedEntries: storageRetriedEntries,
+        flushLastMs: storageFlushLastMs,
+        flushMaxMs: storageFlushMaxMs,
+        flushAvgMs: storageFlushCount ? Math.round(storageFlushTotalMs / storageFlushCount) : 0,
+        flushErrors: storageFlushErrors,
+        openLogDbs: logDbCache.size,
+        openDbFiles,
+        maintenancePauseDepth,
+        rssMb: Math.round(mem.rss / 1024 / 1024),
+        heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        externalMb: Math.round(mem.external / 1024 / 1024),
+        arrayBuffersMb: Math.round(mem.arrayBuffers / 1024 / 1024)
+    };
+}
+
+export function setStoragePressureListener(listener: ((pressured: boolean) => void) | null): void {
+    storagePressureListener = listener;
+    listener?.(storageBackpressured);
+}
+
+export function isStorageBackpressured(): boolean {
+    return storageBackpressured;
+}
+
+function updateStoragePressure(): void {
+    const entries = storageWorkerBatch.length + storageWorkerInFlightEntries;
+    const bytes = storageWorkerBatchBytes + storageWorkerInFlightBytes;
+    const next = storageBackpressured
+        ? entries > STORAGE_PRESSURE_LOW_ENTRIES || bytes > STORAGE_PRESSURE_LOW_BYTES
+        : entries >= STORAGE_PRESSURE_HIGH_ENTRIES || bytes >= STORAGE_PRESSURE_HIGH_BYTES;
+    if (next === storageBackpressured) return;
+    storageBackpressured = next;
+    storagePressureListener?.(next);
+}
+
+export async function getStorageDiagnosticsAsync(): Promise<Record<string, unknown>> {
+    if (!USE_STORAGE_WORKER) return getStorageDiagnostics();
+    const main = getStorageDiagnostics();
+    try {
+        return { main, worker: await callStorageWorker('diagnostics') };
+    } catch (error) {
+        return { main, workerError: (error as Error).message };
+    }
 }
 
 function deleteDayDbFiles(filePath: string): number {
@@ -154,7 +274,7 @@ function purgeNonCurrentHistoryIndexDbs(): number {
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
-        const files = fs.readdirSync(dir).filter((file) => DAY_DB_FILE_RE.test(file));
+        const files = fs.readdirSync(dir).filter((file) => HISTORY_DB_FILE_RE.test(file));
         for (const file of files) {
             const filePath = path.join(dir, file);
             if (isCurrentHistoryIndexDb(filePath)) continue;
@@ -171,6 +291,36 @@ function rejectStorageWorkerRequests(error: Error): void {
         request.reject(error);
     }
     storageWorkerRequests.clear();
+    for (const waiter of storageWorkerDrainWaiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+    }
+    storageWorkerDrainWaiters.clear();
+}
+
+function notifyStorageWorkerDrained(): void {
+    if (storageWorkerBatch.length > 0 || storageWorkerInFlightBatches > 0) return;
+    for (const waiter of storageWorkerDrainWaiters) {
+        clearTimeout(waiter.timer);
+        waiter.resolve();
+    }
+    storageWorkerDrainWaiters.clear();
+}
+
+function waitForStorageWorkerDrain(timeoutMs = STORAGE_WORKER_RPC_TIMEOUT_MS): Promise<void> {
+    flushStorageWorkerBatch();
+    if (storageWorkerBatch.length === 0 && storageWorkerInFlightBatches === 0) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+        const waiter = {
+            resolve,
+            reject,
+            timer: setTimeout(() => {
+                storageWorkerDrainWaiters.delete(waiter);
+                reject(new Error(`storage worker drain timed out after ${timeoutMs}ms`));
+            }, timeoutMs)
+        };
+        storageWorkerDrainWaiters.add(waiter);
+    });
 }
 
 function clearStorageWorkerBatchTimer(): void {
@@ -182,6 +332,10 @@ function clearStorageWorkerBatchTimer(): void {
 function failStorageWorker(error: Error): void {
     if (!storageWorkerFailure) storageWorkerFailure = error;
     clearStorageWorkerBatchTimer();
+    if (!storageBackpressured) {
+        storageBackpressured = true;
+        storagePressureListener?.(true);
+    }
     if (!storageWorkerFailureLogged) {
         storageWorkerFailureLogged = true;
         console.error('[storage] worker failed; history writes are disabled until app restart:', error);
@@ -371,7 +525,11 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         db.pragma('journal_mode = WAL');
         db.pragma('synchronous = NORMAL');
         db.pragma('temp_store = MEMORY');
-        db.pragma('mmap_size = 268435456');
+        // The writer does sequential appends and does not benefit from mapping 256 MB per open day DB.
+        // Keeping mmap disabled prevents native working-set growth when several connections/days are cached.
+        db.pragma('mmap_size = 0');
+        db.pragma('wal_autocheckpoint = 16384');
+        db.pragma('journal_size_limit = 67108864');
     } catch {}
     const getStmt = db.prepare('SELECT blob, count, bytes FROM buckets WHERE bucket_ts = ? AND topic = ?');
     const upsertStmt = db.prepare(
@@ -438,6 +596,7 @@ function enqueueStorageWorkerBatch(entry: PendingEntry, estimatedBytes: number):
     }
     storageWorkerBatch.push(entry);
     storageWorkerBatchBytes += estimatedBytes;
+    updateStoragePressure();
     if (storageWorkerBatch.length >= STORAGE_WORKER_BATCH_ENTRIES || storageWorkerBatchBytes >= STORAGE_WORKER_BATCH_BYTES) {
         flushStorageWorkerBatch();
         return;
@@ -453,10 +612,41 @@ function flushStorageWorkerBatch(): void {
     clearStorageWorkerBatchTimer();
     if (!USE_STORAGE_WORKER || storageWorkerBatch.length === 0) return;
     if (storageWorkerFailure) throw storageWorkerFailure;
-    const batch = storageWorkerBatch.splice(0, storageWorkerBatch.length);
-    storageWorkerBatchBytes = 0;
-    if (!postStorageWorker('enqueueBatch', batch)) {
-        throw storageWorkerUnavailableError();
+    while (storageWorkerBatch.length > 0 && storageWorkerInFlightBatches < STORAGE_WORKER_MAX_IN_FLIGHT_BATCHES) {
+        let batchBytes = 0;
+        let count = 0;
+        while (count < storageWorkerBatch.length && count < STORAGE_WORKER_BATCH_ENTRIES) {
+            const item = storageWorkerBatch[count];
+            const itemBytes = (item.payloadSize ?? item.payloadBytes?.byteLength ?? item.payload.length) + item.topic.length + 16;
+            if (count > 0 && batchBytes + itemBytes > STORAGE_WORKER_BATCH_BYTES) break;
+            batchBytes += itemBytes;
+            count++;
+        }
+        const batch = storageWorkerBatch.splice(0, count);
+        storageWorkerBatchBytes = Math.max(0, storageWorkerBatchBytes - batchBytes);
+        storageWorkerInFlightBatches++;
+        storageWorkerInFlightEntries += batch.length;
+        storageWorkerInFlightBytes += batchBytes;
+        if (!storageWorkerOldestBatchAt) storageWorkerOldestBatchAt = Date.now();
+        const sentAt = Date.now();
+        updateStoragePressure();
+        void callStorageWorker('enqueueBatch', batch, STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS).then(() => {
+            const ackMs = Date.now() - sentAt;
+            storageWorkerLastAckMs = ackMs;
+            storageWorkerMaxAckMs = Math.max(storageWorkerMaxAckMs, ackMs);
+            storageWorkerAckedBatches++;
+            storageWorkerAckedEntries += batch.length;
+        }).catch((error) => {
+            failStorageWorker(error instanceof Error ? error : new Error(String(error)));
+        }).finally(() => {
+            storageWorkerInFlightBatches = Math.max(0, storageWorkerInFlightBatches - 1);
+            storageWorkerInFlightEntries = Math.max(0, storageWorkerInFlightEntries - batch.length);
+            storageWorkerInFlightBytes = Math.max(0, storageWorkerInFlightBytes - batchBytes);
+            if (storageWorkerInFlightBatches === 0) storageWorkerOldestBatchAt = 0;
+            updateStoragePressure();
+            if (storageWorkerBatch.length > 0 && !storageWorkerFailure) flushStorageWorkerBatch();
+            notifyStorageWorkerDrained();
+        });
     }
 }
 
@@ -471,6 +661,8 @@ export function enqueueMessage(connectionId: string, topic: string, payload: str
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
     const entry = { connectionId, topic, payload, tsMs, payloadSize, payloadEncoding: meta.payloadEncoding };
     const estimatedBytes = payloadSize + topic.length + 16;
+    storageEnqueuedEntries++;
+    storageEnqueuedBytes += estimatedBytes;
     if (USE_STORAGE_WORKER) {
         enqueueStorageWorkerBatch(entry, estimatedBytes);
         return;
@@ -504,7 +696,7 @@ function requeueGroups(groups: Map<string, { connectionId: string; sec: number; 
     if (retry.length > 0) pending.unshift(...retry);
 }
 
-/** 按 (san, dk, sec, topic) 聚合 pending，然后对每个 day.db 开一个事务批量 UPSERT */
+/** 按 (san, hour, sec, topic) 聚合 pending，然后对每个小时分片开一个事务批量 UPSERT */
 export function flushStorage(): void {
     if (USE_STORAGE_WORKER) {
         console.warn('[storage] sync flush requested while storage worker is enabled; use flushStorageAsync for a durable barrier');
@@ -515,7 +707,7 @@ export function flushStorage(): void {
 
 export async function flushStorageAsync(): Promise<void> {
     if (USE_STORAGE_WORKER) {
-        flushStorageWorkerBatch();
+        await waitForStorageWorkerDrain();
         await callStorageWorker('flush');
         return;
     }
@@ -526,7 +718,9 @@ function flushStorageLocal(): void {
     if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
     if (pending.length === 0) return;
     const batch = pending.splice(0, pending.length);
+    const batchBytes = pendingBytes;
     pendingBytes = 0;
+    const flushStartedAt = Date.now();
 
     // 分组：dayKey -> (sec|topic -> items[])
     const byDay = new Map<string, Map<string, { connectionId: string; sec: number; topic: string; items: BucketItem[] }>>();
@@ -534,7 +728,7 @@ function flushStorageLocal(): void {
     for (let i = 0; i < batch.length; i++) {
         const e = batch[i];
         const san = sanitizeConnectionId(e.connectionId);
-        const dk = dateKeyFromTs(e.tsMs);
+        const dk = historyFileKeyFromTs(e.tsMs);
         const sec = Math.floor(e.tsMs / 1000);
         const dayKey = `${san}|${dk}`;
         let m = byDay.get(dayKey);
@@ -549,6 +743,15 @@ function flushStorageLocal(): void {
         const pipe = dayKey.indexOf('|');
         const san = dayKey.slice(0, pipe);
         const dk = dayKey.slice(pipe + 1);
+        const dayGroups = [...groups.values()];
+        const dayEntries = dayGroups.reduce((sum, group) => sum + group.items.length, 0);
+        const dayBytes = dayGroups.reduce(
+            (sum, group) => sum + group.items.reduce(
+                (itemSum, item) => itemSum + Buffer.byteLength(item.payload, 'utf8') + group.topic.length + 16,
+                0
+            ),
+            0
+        );
         try {
             const pack = getOrOpenLogDb(san, dk);
             const indexSchemaVersion = getCompleteHistoryIndexVersion(pack.db);
@@ -637,19 +840,30 @@ function flushStorageLocal(): void {
                 }
             });
             txn();
+            storageCommittedEntries += dayEntries;
+            storageCommittedBytes += dayBytes;
         } catch (e) {
+            storageFlushErrors++;
+            storageRetriedEntries += dayEntries;
             requeueGroups(groups);
             scheduleFlush();
             console.error('[storage] flush day', dayKey, e);
         }
     }
+    const elapsed = Date.now() - flushStartedAt;
+    storageFlushCount++;
+    storageFlushedEntries += batch.length;
+    storageFlushedBytes += batchBytes;
+    storageFlushLastMs = elapsed;
+    storageFlushMaxMs = Math.max(storageFlushMaxMs, elapsed);
+    storageFlushTotalMs += elapsed;
 }
 
 // ---------------- read ----------------
 function listDayFiles(san: string, descending: boolean): string[] {
     const dir = path.join(LOG_ROOT, san);
     if (!fs.existsSync(dir)) return [];
-    const keys = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
+    const keys = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
     keys.sort();
     if (descending) keys.reverse();
     return keys.map((k) => path.join(dir, k));
@@ -726,7 +940,7 @@ export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
 
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
-        const dayFiles = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
+        const dayFiles = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
         for (const df of dayFiles) {
             const dk = df.replace('.db', '');
             if (dayEndTsFromKey(dk) < st || dayStartTsFromKey(dk) > et) continue;
@@ -818,7 +1032,7 @@ export function getHistoryIndexStatus(connectionId?: string | null): HistoryInde
         .filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
-        const files = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
+        const files = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
         for (const file of files) {
             status.totalFiles++;
             const db = new Database(path.join(dir, file), { readonly: true });
@@ -852,7 +1066,7 @@ function closeLogDbsForSan(san: string): void {
 
 function countDayDbFiles(dir: string): number {
     if (!fs.existsSync(dir)) return 0;
-    return fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f) || /^\d{4}-\d{2}-\d{2}\.db(?:-wal|-shm)$/u.test(f)).length;
+    return fs.readdirSync(dir).filter((f) => HISTORY_DB_SIDECAR_FILE_RE.test(f)).length;
 }
 
 function closeOldLogDbs(cutoff: number): void {
@@ -876,7 +1090,7 @@ export function closeAllLogDbs(): void {
 
 export async function closeAllLogDbsAsync(): Promise<void> {
     if (USE_STORAGE_WORKER) {
-        flushStorageWorkerBatch();
+        await waitForStorageWorkerDrain();
         await callStorageWorker('closeAll');
         return;
     }
@@ -1042,7 +1256,7 @@ export async function shutdownStorageAsync(): Promise<void> {
         if (storageWorker) {
             storageWorkerShuttingDown = true;
             try {
-                flushStorageWorkerBatch();
+                await waitForStorageWorkerDrain(STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS);
                 await callStorageWorker('shutdown', undefined, STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS).catch((error) => {
                     console.warn('[storage] worker shutdown timed out; forcing terminate:', error);
                 });

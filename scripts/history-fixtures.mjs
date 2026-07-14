@@ -302,7 +302,7 @@ function queryFixture(logRoot, opts) {
   const conditions = normalizeConditions(opts.conditions);
   const terms = conditions.length ? [] : parseKeywordTerms(opts.keywords?.length ? opts.keywords : (opts.keyword ? [opts.keyword] : []));
   const keywordLogic = opts.keywordLogic === 'or' ? 'or' : 'and';
-  const filePath = path.join(logRoot, SAN_CONNECTION_ID, `${DAY}.db`);
+  const filePath = path.join(logRoot, SAN_CONNECTION_ID, `${opts.fixtureFileKey || DAY}.db`);
   const out = [];
   let skipped = 0;
   const db = new Database(filePath, { readonly: true });
@@ -418,12 +418,13 @@ async function main() {
   try {
     const variants = [
       { name: 'v5-complete-index', options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } },
+      { name: 'v5-hourly-complete-index', fileKey: `${DAY}-09`, options: { index: 'complete', schemaVersion: V5_SCHEMA_VERSION } },
       { name: 'v4-complete-index', options: { index: 'complete', schemaVersion: V4_SCHEMA_VERSION } }
     ];
 
     for (const variant of variants) {
       const logRoot = path.join(tempRoot, variant.name);
-      const dbPath = path.join(logRoot, SAN_CONNECTION_ID, `${DAY}.db`);
+      const dbPath = path.join(logRoot, SAN_CONNECTION_ID, `${variant.fileKey || DAY}.db`);
       buildFixtureDb(dbPath, variant.options);
       if (variant.options.metadataMismatch) {
         const db = new Database(dbPath, { readonly: true });
@@ -437,8 +438,9 @@ async function main() {
       }
 
       for (const queryCase of QUERY_CASES) {
-        const expected = normalizeRows(queryFixture(logRoot, { ...queryCase.opts, connectionId: CONNECTION_ID }));
-        const actual = normalizeRows(queryFixture(logRoot, { ...queryCase.opts, connectionId: CONNECTION_ID }));
+        const fixtureOpts = { ...queryCase.opts, connectionId: CONNECTION_ID, fixtureFileKey: variant.fileKey };
+        const expected = normalizeRows(queryFixture(logRoot, fixtureOpts));
+        const actual = normalizeRows(queryFixture(logRoot, fixtureOpts));
         assertDeepEqual(actual, expected, `${variant.name}/${queryCase.name}/reference`);
 
         const workerRows = await runBuiltWorker(logRoot, { ...queryCase.opts, connectionId: CONNECTION_ID });

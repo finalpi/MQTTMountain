@@ -8,6 +8,11 @@ interface PluginSnapshotOptions {
     includeParamSuggestions?: boolean;
 }
 
+interface PluginBridgeStats {
+    calls: number;
+    lastLogAt: number;
+}
+
 declare global {
     interface Window {
         __MM_PLUGIN_HOST_BRIDGE__?: {
@@ -38,6 +43,7 @@ export function installPluginHostBridge(): () => void {
     const conn = useConnectionStore();
     const msg = useMessageStore();
     const paramMem = useParamMemory();
+    const bridgeStats: PluginBridgeStats = { calls: 0, lastLogAt: 0 };
 
     function paramSuggestionsSnapshot(): Record<string, string[]> {
         const out: Record<string, string[]> = {};
@@ -63,12 +69,29 @@ export function installPluginHostBridge(): () => void {
         return out;
     }
 
+    function maybeLogSnapshotRead(messageLimit: number, publishLimit: number): void {
+        bridgeStats.calls++;
+        const now = Date.now();
+        if (now - bridgeStats.lastLogAt < 60_000) return;
+        bridgeStats.lastLogAt = now;
+        const mem = (performance as Performance & { memory?: { usedJSHeapSize?: number } }).memory;
+        console.info(`[plugin-bridge] snapshot reads ${JSON.stringify({
+            calls: bridgeStats.calls,
+            selectedConnectionId: conn.selectedId,
+            messageLimit,
+            publishLimit,
+            rendererHeapMb: mem?.usedJSHeapSize ? Math.round(mem.usedJSHeapSize / 1024 / 1024) : undefined
+        })}`);
+        bridgeStats.calls = 0;
+    }
+
     window.__MM_PLUGIN_HOST_BRIDGE__ = {
         getSnapshot(options = {}) {
             const selectedConnectionId = conn.selectedId;
             const bucket = msg.bucketFor(selectedConnectionId);
             const messageLimit = normalizeLimit(options.messageLimit, bucket.timeline.length, bucket.timeline.length);
             const publishLimit = normalizeLimit(options.publishLimit, bucket.publishHistory.length, bucket.publishHistory.length);
+            maybeLogSnapshotRead(messageLimit, publishLimit);
             return {
                 selectedConnectionId,
                 selectedConnectionState: conn.selectedState,

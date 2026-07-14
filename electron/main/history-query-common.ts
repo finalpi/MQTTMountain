@@ -2,12 +2,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { HistoryKeywordJoin, HistoryQueryOptions } from '../../shared/types';
 
-export const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
+export const HISTORY_DB_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db$/u;
+export const HISTORY_DB_SIDECAR_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db(?:-wal|-shm)?$/u;
+/** @deprecated Use HISTORY_DB_FILE_RE. Kept for compatibility with existing workers. */
+export const DATE_KEY_FILE_RE = HISTORY_DB_FILE_RE;
 
 export interface DayFileEntry {
     path: string;
     dk: string;
     san: string;
+}
+
+export interface HistoryFileRange {
+    start: number;
+    end: number;
 }
 
 export interface NormalizedCondition {
@@ -39,12 +47,11 @@ export function normalizeSearchText(topic: string, payload: string): string {
 }
 
 export function dayStartTsFromKey(dk: string): number {
-    const [y, mo, da] = dk.split('-').map(Number);
-    return new Date(y, mo - 1, da, 0, 0, 0, 0).getTime();
+    return historyFileTimeRangeFromKey(dk)?.start ?? Number.NaN;
 }
 
 export function dayEndTsFromKey(dk: string): number {
-    return dayStartTsFromKey(dk) + 86_400_000 - 1;
+    return historyFileTimeRangeFromKey(dk)?.end ?? Number.NaN;
 }
 
 export function dateKeyFromTs(tsMs: number): string {
@@ -53,6 +60,36 @@ export function dateKeyFromTs(tsMs: number): string {
     const m = String(d.getMonth() + 1).padStart(2, '0');
     const day = String(d.getDate()).padStart(2, '0');
     return `${y}-${m}-${day}`;
+}
+
+export function historyFileKeyFromTs(tsMs: number): string {
+    const d = new Date(tsMs);
+    return `${dateKeyFromTs(tsMs)}-${String(d.getHours()).padStart(2, '0')}`;
+}
+
+export function historyFileKeyFromName(fileName: string): string | null {
+    if (!HISTORY_DB_SIDECAR_FILE_RE.test(fileName)) return null;
+    const dbAt = fileName.indexOf('.db');
+    return dbAt >= 0 ? fileName.slice(0, dbAt) : null;
+}
+
+export function historyFileTimeRangeFromKey(key: string): HistoryFileRange | null {
+    const match = /^(\d{4})-(\d{2})-(\d{2})(?:-(\d{2}))?$/u.exec(key);
+    if (!match) return null;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const hasHour = match[4] != null;
+    const hour = hasHour ? Number(match[4]) : 0;
+    if (month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23) return null;
+    const startDate = new Date(year, month - 1, day, hour, 0, 0, 0);
+    if (startDate.getFullYear() !== year || startDate.getMonth() !== month - 1 || startDate.getDate() !== day || startDate.getHours() !== hour) {
+        return null;
+    }
+    const endExclusive = hasHour
+        ? new Date(year, month - 1, day, hour + 1, 0, 0, 0).getTime()
+        : new Date(year, month - 1, day + 1, 0, 0, 0, 0).getTime();
+    return { start: startDate.getTime(), end: endExclusive - 1 };
 }
 
 export function parseKeywordTerms(input: string | string[]): string[] {
@@ -109,10 +146,11 @@ export function collectDayFiles(logRoot: string, opts: { connectionId?: string |
     const files: DayFileEntry[] = [];
     for (const d of dirs) {
         const dir = path.join(logRoot, d.name);
-        const dayFiles = fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f));
+        const dayFiles = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
         for (const df of dayFiles) {
             const dk = df.replace('.db', '');
-            if (dayEndTsFromKey(dk) < st || dayStartTsFromKey(dk) > et) continue;
+            const range = historyFileTimeRangeFromKey(dk);
+            if (!range || range.end < st || range.start > et) continue;
             files.push({ path: path.join(dir, df), dk, san: d.name });
         }
     }

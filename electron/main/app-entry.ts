@@ -1,5 +1,4 @@
 import { app, BrowserWindow, session } from 'electron';
-import fs from 'node:fs';
 import path from 'node:path';
 import { initIpc } from './ipc';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
@@ -13,6 +12,7 @@ import {
 } from './storage';
 import { initSettings, getCurrentLogDir, readConnections } from './settings';
 import { MqttService } from './mqtt-service';
+import { writeDiagnosticLog } from './diagnostics';
 import { startAutoDeleteScheduler, stopAutoDeleteScheduler } from './auto-delete-scheduler';
 import { pluginManager } from './plugin-manager';
 import './constants';
@@ -23,39 +23,7 @@ export { APP_START_TIME } from './constants';
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const RENDERER_DIST = path.join(process.env.APP_ROOT!, 'dist');
 const STARTUP_MAINTENANCE_DELAY_MS = 5_000;
-const STORAGE_SHUTDOWN_TIMEOUT_MS = 10_000;
-const DIAGNOSTIC_LOG_MAX_BYTES = 2 * 1024 * 1024;
-
-function getDiagnosticLogPath(): string {
-    return path.join(app.getPath('userData'), 'logs', 'main-diagnostics.log');
-}
-
-function formatDiagnosticValue(value: unknown): string {
-    if (value instanceof Error) return `${value.stack || value.message}`;
-    if (typeof value === 'string') return value;
-    try {
-        return JSON.stringify(value);
-    } catch {
-        return String(value);
-    }
-}
-
-function writeDiagnosticLog(label: string, ...values: unknown[]): void {
-    try {
-        const logPath = getDiagnosticLogPath();
-        fs.mkdirSync(path.dirname(logPath), { recursive: true });
-        if (fs.existsSync(logPath) && fs.statSync(logPath).size > DIAGNOSTIC_LOG_MAX_BYTES) {
-            const rotatedPath = `${logPath}.1`;
-            try { fs.rmSync(rotatedPath, { force: true }); } catch {}
-            fs.renameSync(logPath, rotatedPath);
-        }
-        const line = [new Date().toISOString(), label, ...values.map(formatDiagnosticValue)].join(' ') + '\n';
-        fs.appendFileSync(logPath, line, 'utf8');
-    } catch {
-        // Diagnostics must never affect the app lifecycle.
-    }
-}
-
+const STORAGE_SHUTDOWN_TIMEOUT_MS = 120_000;
 function installDiagnosticHandlers(): void {
     process.on('uncaughtException', (error) => {
         writeDiagnosticLog('[process] uncaughtException', error);
@@ -71,6 +39,17 @@ function installDiagnosticHandlers(): void {
     app.on('render-process-gone', (_event, webContents, details) => {
         writeDiagnosticLog('[electron] render-process-gone', { webContentsId: webContents.id, details });
         console.error('[electron] render-process-gone:', details);
+        const mainRendererGone = !!win && !win.isDestroyed() && win.webContents.id === webContents.id;
+        if (mainRendererGone && details.reason !== 'clean-exit' && !isQuitting) {
+            writeDiagnosticLog('[main] quitting after renderer failure', {
+                webContentsId: webContents.id,
+                reason: details.reason,
+                exitCode: details.exitCode
+            });
+            setImmediate(() => {
+                if (!isQuitting) app.quit();
+            });
+        }
     });
     app.on('child-process-gone', (_event, details) => {
         writeDiagnosticLog('[electron] child-process-gone', details);
@@ -241,6 +220,12 @@ async function createWindow() {
     win.on('restore', notifyFocus);
     win.on('show', notifyFocus);
     win.webContents.on('did-finish-load', notifyFocus);
+
+    win.webContents.on('console-message', (_event, _level, message) => {
+        if (message.startsWith('[renderer-diagnostics]') || message.startsWith('[plugin-bridge]')) {
+            writeDiagnosticLog('[renderer] console', message);
+        }
+    });
 
     win.webContents.on('unresponsive', () => {
         writeDiagnosticLog('[window] unresponsive');

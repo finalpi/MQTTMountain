@@ -4,7 +4,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
 import { iterateBucketEntries } from './history-bucket-codec';
-import { DATE_KEY_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
+import { HISTORY_DB_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
 import { ensureHistoryIndexSchema, getIndexMeta, setIndexMeta } from './history-index-schema';
 
 const port = parentPort;
@@ -24,7 +24,7 @@ function collectDayFiles(): { path: string; san: string; dk: string }[] {
     const files: { path: string; san: string; dk: string }[] = [];
     for (const d of dirs) {
         const dir = path.join(logRoot, d.name);
-        for (const file of fs.readdirSync(dir).filter((f) => DATE_KEY_FILE_RE.test(f))) {
+        for (const file of fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f))) {
             files.push({ path: path.join(dir, file), san: d.name, dk: file.replace('.db', '') });
         }
     }

@@ -33,6 +33,7 @@ useFocusFix();
 let teardownPluginHostBridge: (() => void) | null = null;
 let teardownAutoDeleteDone: (() => void) | null = null;
 let teardownStartupMaintenanceDone: (() => void) | null = null;
+let rendererDiagnosticsTimer: number | null = null;
 
 type StaticMainTab = 'messages' | 'history' | 'plugins';
 type MainTab = StaticMainTab | `plugin:${string}`;
@@ -47,6 +48,24 @@ const activePluginView = computed(() => {
     const id = mainTab.value.slice('plugin:'.length);
     return pluginCenterViews.value.find((view) => view.id === id) ?? null;
 });
+
+function logRendererDiagnostics(): void {
+    const selectedId = conn.selectedId;
+    const bucket = msg.bucketFor(selectedId);
+    const memory = (performance as Performance & {
+        memory?: { usedJSHeapSize?: number; totalJSHeapSize?: number; jsHeapSizeLimit?: number };
+    }).memory;
+    console.info(`[renderer-diagnostics] ${JSON.stringify({
+        selectedConnectionId: selectedId,
+        timelineMessages: bucket.timeline.length,
+        topics: bucket.topics.size,
+        publishHistory: bucket.publishHistory.length,
+        pluginCenterViews: pluginCenterViews.value.length,
+        usedHeapMb: memory?.usedJSHeapSize ? Math.round(memory.usedJSHeapSize / 1024 / 1024) : undefined,
+        totalHeapMb: memory?.totalJSHeapSize ? Math.round(memory.totalJSHeapSize / 1024 / 1024) : undefined,
+        heapLimitMb: memory?.jsHeapSizeLimit ? Math.round(memory.jsHeapSizeLimit / 1024 / 1024) : undefined
+    })}`);
+}
 
 onMounted(async () => {
     await Promise.all([conn.load(), settings.load(), plugins.refresh()]);
@@ -66,6 +85,8 @@ onMounted(async () => {
         })
     );
     start();
+    logRendererDiagnostics();
+    rendererDiagnosticsTimer = window.setInterval(logRendererDiagnostics, 60_000);
     teardownPluginHostBridge = installPluginHostBridge();
     void updater.check({ silent: true });
     void plugins.checkUpdates().then((result) => {
@@ -99,6 +120,10 @@ onBeforeUnmount(() => {
     teardownAutoDeleteDone = null;
     teardownStartupMaintenanceDone?.();
     teardownStartupMaintenanceDone = null;
+    if (rendererDiagnosticsTimer != null) {
+        window.clearInterval(rendererDiagnosticsTimer);
+        rendererDiagnosticsTimer = null;
+    }
 });
 </script>
 

@@ -54,6 +54,10 @@ export class MqttIpcQueue {
         this.queue = this.queue.filter((item) => item.connectionId !== connectionId);
     }
 
+    size(): number {
+        return this.queue.length;
+    }
+
     flush(): void {
         if (this.timer) {
             clearTimeout(this.timer);

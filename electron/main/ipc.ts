@@ -40,6 +40,7 @@ import { exportHistoryToFile } from './history-export';
 import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
 import { cancelHistoryQueryStream, queryHistoryAsync, startHistoryQueryStream } from './history-query';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
+import { HISTORY_DB_SIDECAR_FILE_RE } from './history-query-common';
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -63,7 +64,7 @@ function countLogDbFiles(root: string): number {
         for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
             const fp = path.join(dir, item.name);
             if (item.isDirectory()) stack.push(fp);
-            else if (/^\d{4}-\d{2}-\d{2}\.db(?:-wal|-shm)?$/u.test(item.name)) total++;
+            else if (HISTORY_DB_SIDECAR_FILE_RE.test(item.name)) total++;
         }
     }
     return total;
