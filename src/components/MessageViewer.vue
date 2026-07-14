@@ -757,6 +757,7 @@ interface DynamicListHandle {
 const timelineVirtualRef = ref<DynamicListHandle | null>(null);
 const topicVirtualRef = ref<DynamicListHandle | null>(null);
 let pausedFollowHasLeftStart = false;
+let returningToStart = false;
 
 const timelineResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value }));
 const topicListResetKey = computed(() => JSON.stringify({ connectionId: conn.selectedId, filter: activeFilterKey.value, sort: topicSort.value }));
@@ -840,6 +841,11 @@ function onUserScrollIntent(): void {
 function onUserScroll(): void {
     const el = currentScroll();
     if (!el) return;
+    if (returningToStart) {
+        showJumpBtn.value = false;
+        if (el.scrollTop <= 4) returningToStart = false;
+        return;
+    }
     // 用户离开顶部 → 关闭跟随；回到顶部附近 → 恢复跟随
     if (el.scrollTop > 60) {
         pausedFollowHasLeftStart = true;
@@ -864,12 +870,28 @@ function onUserScroll(): void {
     }
 }
 
-function scrollToTop(smooth = true): void {
-    currentVirtual()?.scrollToTop(smooth);
+function scrollToTop(smooth = false): void {
+    console.info('[message-viewer] return to latest', {
+        viewMode: viewMode.value,
+        connectionId: conn.selectedId,
+        topic: bucket.value.selectedTopic,
+        previousScrollTop: currentScroll()?.scrollTop ?? null
+    });
+    returningToStart = true;
     autoFollow.value = true;
     showJumpBtn.value = false;
     pausedFollowHasLeftStart = false;
     unfreezeVisibleOrder();
+    const apply = (useSmooth: boolean) => currentVirtual()?.scrollToTop(useSmooth);
+    apply(smooth);
+    void nextTick(() => {
+        // 解除冻结会触发一次虚拟列表布局重算，布局稳定后再次校准，避免旧锚点覆盖跳顶。
+        apply(false);
+        requestAnimationFrame(() => {
+            apply(false);
+            returningToStart = false;
+        });
+    });
 }
 
 watch(
@@ -1081,7 +1103,7 @@ onUnmounted(() => {
                 </div>
             </div>
 
-            <button v-show="showJumpBtn && !bucket.paused" class="jump-top" @click="scrollToTop()" title="回到顶部查看最新">
+            <button v-show="showJumpBtn && !bucket.paused" class="jump-top" @click="scrollToTop(false)" title="回到顶部查看最新">
                 <span>↑ 新消息</span>
             </button>
 
