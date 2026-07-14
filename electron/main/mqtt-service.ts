@@ -36,6 +36,7 @@ interface ConnectionCtx {
 const MESSAGE_PROCESS_INTERVAL_MS = 8;
 const MESSAGE_PROCESS_BATCH = 1000;
 const MESSAGE_PROCESS_QUEUE_HARD = 100_000;
+const MQTT_OPERATION_TIMEOUT_MS = 10_000;
 
 export class MqttService {
     private conns = new Map<string, ConnectionCtx>();
@@ -105,8 +106,9 @@ export class MqttService {
                 // 硬超时：8 秒内没触发 connect 事件就视作失败，清理现场
                 const hardTimeout = setTimeout(() => {
                     if (!settled) {
+                        ctx.closing = true;
                         try { client.end(true); } catch {}
-                        this.conns.delete(p.connectionId);
+                        if (this.conns.get(p.connectionId) === ctx) this.conns.delete(p.connectionId);
                         this.ipcQueue.dropConnection(p.connectionId);
                         settle({ success: false, message: '连接超时' });
                     }
@@ -114,7 +116,7 @@ export class MqttService {
 
                 let initialConnect = true;
                 client.on('connect', () => {
-                    if (this.storageBackpressured) client.stream.pause();
+                    if (ctx.closing || this.conns.get(p.connectionId) !== ctx) return;
                     this.sendState(p.connectionId, 'connected');
                     if (initialConnect) {
                         initialConnect = false;
@@ -135,9 +137,24 @@ export class MqttService {
                         });
                     }
                 });
-                client.on('reconnect', () => this.sendState(p.connectionId, 'reconnecting'));
-                client.on('offline', () => this.sendState(p.connectionId, 'offline'));
+                client.on('reconnect', () => {
+                    if (!ctx.closing && this.conns.get(p.connectionId) === ctx) this.sendState(p.connectionId, 'reconnecting');
+                });
+                client.on('offline', () => {
+                    if (!ctx.closing && this.conns.get(p.connectionId) === ctx) this.sendState(p.connectionId, 'offline');
+                });
                 client.on('close', () => {
+                    if (ctx.closing) {
+                        clearTimeout(hardTimeout);
+                        if (initialConnect && !settled) settle({ success: false, message: '连接已取消' });
+                        writeDiagnosticLog('[mqtt] closed', { connectionId: p.connectionId, activeConnections: this.conns.size });
+                        if (this.conns.get(p.connectionId) === ctx) {
+                            this.conns.delete(p.connectionId);
+                            this.sendState(p.connectionId, 'closed');
+                        }
+                        return;
+                    }
+                    if (this.conns.get(p.connectionId) !== ctx) return;
                     if (initialConnect && !settled) {
                         // 首次还没连上就关闭（broker 拒绝 / 网络直接断）
                         clearTimeout(hardTimeout);
@@ -147,14 +164,10 @@ export class MqttService {
                         settle({ success: false, message: '连接被关闭' });
                         return;
                     }
-                    if (ctx.closing) {
-                        writeDiagnosticLog('[mqtt] closed', { connectionId: p.connectionId, activeConnections: this.conns.size });
-                        this.sendState(p.connectionId, 'closed');
-                        return;
-                    }
                     this.sendState(p.connectionId, 'reconnecting');
                 });
                 client.on('error', (err) => {
+                    if (ctx.closing || this.conns.get(p.connectionId) !== ctx) return;
                     this.sendState(p.connectionId, 'error', err.message);
                     if (initialConnect && !settled) {
                         clearTimeout(hardTimeout);
@@ -184,7 +197,6 @@ export class MqttService {
                 activeConnections: this.conns.size
             });
             ctx.closing = true;
-            try { ctx.client.removeAllListeners(); } catch {}
             try { ctx.client.end(true); } catch {}
             this.conns.delete(connectionId);
         }
@@ -197,13 +209,24 @@ export class MqttService {
         if (!ctx || !ctx.client.connected) return Promise.resolve({ success: false, message: '未连接' });
         const normalized = topic.trim().replace(/＋/g, '+');
         return new Promise((resolve) => {
+            let settled = false;
+            const finish = (result: ApiResult) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const timer = setTimeout(() => {
+                writeDiagnosticLog('[mqtt] subscribe timeout', { connectionId, topic: normalized, timeoutMs: MQTT_OPERATION_TIMEOUT_MS });
+                finish({ success: false, message: '订阅超时' });
+            }, MQTT_OPERATION_TIMEOUT_MS);
             ctx.client.subscribe(normalized, { qos }, (err, granted) => {
                 if (err) {
                     console.log(`[mqtt][${connectionId}] sub FAIL:`, normalized, err.message);
-                    resolve({ success: false, message: err.message });
+                    finish({ success: false, message: err.message });
                 } else {
                     console.log(`[mqtt][${connectionId}] sub OK:`, granted?.map((g) => `${g.topic}@qos${g.qos}`).join(','));
-                    resolve({ success: true });
+                    finish({ success: true });
                 }
             });
         });
@@ -214,9 +237,20 @@ export class MqttService {
         if (!ctx || !ctx.client.connected) return Promise.resolve({ success: false, message: '未连接' });
         const normalized = topic.trim().replace(/＋/g, '+');
         return new Promise((resolve) => {
+            let settled = false;
+            const finish = (result: ApiResult) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const timer = setTimeout(() => {
+                writeDiagnosticLog('[mqtt] unsubscribe timeout', { connectionId, topic: normalized, timeoutMs: MQTT_OPERATION_TIMEOUT_MS });
+                finish({ success: false, message: '取消订阅超时' });
+            }, MQTT_OPERATION_TIMEOUT_MS);
             ctx.client.unsubscribe(normalized, (err) => {
-                if (err) resolve({ success: false, message: err.message });
-                else resolve({ success: true });
+                if (err) finish({ success: false, message: err.message });
+                else finish({ success: true });
             });
         });
     }
@@ -252,6 +286,17 @@ export class MqttService {
 
     private enqueueIncomingMessage(ctx: ConnectionCtx, connectionId: string, topic: string, payload: Buffer): void {
         if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) return;
+        if (this.storageBackpressured) {
+            ctx.droppedMessages++;
+            if (ctx.droppedMessages === 1 || ctx.droppedMessages % 5000 === 0) {
+                writeDiagnosticLog('[storage] mqtt message skipped during backpressure', {
+                    connectionId,
+                    droppedMessages: ctx.droppedMessages,
+                    topic
+                });
+            }
+            return;
+        }
         if (this.queuedMessageCount() >= MESSAGE_PROCESS_QUEUE_HARD) {
             const dropped = this.dropQueuedMessages(Math.ceil(MESSAGE_PROCESS_QUEUE_HARD * 0.1));
             ctx.droppedMessages += dropped;
@@ -335,14 +380,6 @@ export class MqttService {
     private setStorageBackpressure(pressured: boolean): void {
         if (this.storageBackpressured === pressured) return;
         this.storageBackpressured = pressured;
-        for (const ctx of this.conns.values()) {
-            try {
-                if (pressured) ctx.client.stream.pause();
-                else ctx.client.stream.resume();
-            } catch (error) {
-                writeDiagnosticLog('[storage] mqtt stream backpressure failed', { connectionId: ctx.id, pressured }, error);
-            }
-        }
         writeDiagnosticLog(pressured ? '[storage] backpressure on' : '[storage] backpressure off', this.diagnosticsSnapshot());
         if (!pressured && this.queuedMessageCount() > 0) this.scheduleMessageProcessing();
     }

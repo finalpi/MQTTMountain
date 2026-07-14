@@ -93,7 +93,7 @@ let storagePressureListener: ((pressured: boolean) => void) | null = null;
 const storageWorkerRequests = new Map<number, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
-    timer: NodeJS.Timeout;
+    timer: NodeJS.Timeout | null;
 }>();
 const storageWorkerDrainWaiters = new Set<{
     resolve: () => void;
@@ -149,10 +149,14 @@ const STORAGE_PRESSURE_LOW_ENTRIES = 5_000;
 const STORAGE_PRESSURE_HIGH_BYTES = 32 * 1024 * 1024;
 const STORAGE_PRESSURE_LOW_BYTES = 8 * 1024 * 1024;
 const STORAGE_WORKER_RPC_TIMEOUT_MS = 30_000;
-const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 5 * 60_000;
+// Durable enqueue requests intentionally have no wall-clock timeout. A large SQLite
+// checkpoint can make the worker unresponsive for minutes even though it is still
+// healthy and will eventually commit the batch. Worker error/exit events remain the
+// authoritative failure signal.
+const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 0;
 const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 55_000;
 const DEFERRED_FTS_INTERVAL_MS = 30_000;
-const DEFERRED_FTS_BATCH_ENTRIES = 5_000;
+const DEFERRED_FTS_BATCH_ENTRIES = 1_000;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
@@ -326,7 +330,7 @@ function purgeNonCurrentHistoryIndexDbs(): number {
 
 function rejectStorageWorkerRequests(error: Error): void {
     for (const request of storageWorkerRequests.values()) {
-        clearTimeout(request.timer);
+        if (request.timer) clearTimeout(request.timer);
         request.reject(error);
     }
     storageWorkerRequests.clear();
@@ -378,6 +382,12 @@ function failStorageWorker(error: Error): void {
     if (!storageWorkerFailureLogged) {
         storageWorkerFailureLogged = true;
         console.error('[storage] worker failed; history writes are disabled until app restart:', error);
+        reportStorageDiagnostic('[storage] worker failed', {
+            pendingBatchEntries: storageWorkerBatch.length,
+            pendingBatchBytes: storageWorkerBatchBytes,
+            inFlightBatches: storageWorkerInFlightBatches,
+            inFlightEntries: storageWorkerInFlightEntries
+        }, error);
     }
     rejectStorageWorkerRequests(error);
 }
@@ -397,7 +407,7 @@ function ensureStorageWorker(): Worker | null {
         const request = storageWorkerRequests.get(msg.id);
         if (!request) return;
         storageWorkerRequests.delete(msg.id);
-        clearTimeout(request.timer);
+        if (request.timer) clearTimeout(request.timer);
         if (msg.ok) request.resolve(msg.result);
         else request.reject(new Error(msg.error || 'storage worker error'));
     });
@@ -424,16 +434,18 @@ function callStorageWorker(command: string, payload?: unknown, timeoutMs = STORA
     if (!worker) return Promise.reject(storageWorkerUnavailableError());
     const id = ++storageWorkerSeq;
     return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            storageWorkerRequests.delete(id);
-            reject(new Error(`storage worker ${command} timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
+        const timer = timeoutMs > 0
+            ? setTimeout(() => {
+                storageWorkerRequests.delete(id);
+                reject(new Error(`storage worker ${command} timed out after ${timeoutMs}ms`));
+            }, timeoutMs)
+            : null;
         storageWorkerRequests.set(id, { resolve, reject, timer });
         try {
             worker.postMessage({ id, command, payload });
         } catch (error) {
             storageWorkerRequests.delete(id);
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
             const err = error instanceof Error ? error : new Error(String(error));
             failStorageWorker(err);
             reject(err);
@@ -590,7 +602,10 @@ function scheduleDeferredFtsFlush(): void {
     if (deferredFtsTimer) return;
     deferredFtsTimer = setTimeout(() => {
         deferredFtsTimer = null;
-        flushDeferredHistoryFts(false, 'timer');
+        const pack = [...logDbCache.values()].find(
+            (candidate) => candidate.ftsLayout === 'contentless' && !isHistoryFtsComplete(candidate.db)
+        );
+        if (pack) flushDeferredFtsForPack(pack, false, 'timer');
         if (hasDeferredFtsWork()) scheduleDeferredFtsFlush();
     }, DEFERRED_FTS_INTERVAL_MS);
     deferredFtsTimer.unref();
@@ -607,10 +622,17 @@ function finalizeShard(pack: LogDbPack, reason: string): boolean {
     };
     const before = { dbBytes: size(pack.filePath), walBytes: size(`${pack.filePath}-wal`) };
     try {
-        const indexed = flushDeferredFtsForPack(pack, true, reason);
-        if (pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
-            pack.db.exec("INSERT INTO history_messages_fts(history_messages_fts) VALUES('optimize')");
+        if (pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db)) {
+            reportStorageDiagnostic('[storage] shard finalization deferred', {
+                key: pack.key,
+                reason,
+                ftsIndexedId: deferredFtsCursor(pack)
+            });
+            return false;
         }
+        // FTS5 optimize may rewrite multiple gigabytes and block the realtime writer
+        // for several minutes. A completed contentless index is already queryable;
+        // keep rollover bounded to metadata + WAL checkpoint only.
         setIndexMeta(pack.db, 'fts_finalized_at', Date.now());
         const checkpoint = pack.db.pragma('wal_checkpoint(TRUNCATE)');
         const after = { dbBytes: size(pack.filePath), walBytes: size(`${pack.filePath}-wal`) };
@@ -618,7 +640,7 @@ function finalizeShard(pack: LogDbPack, reason: string): boolean {
         reportStorageDiagnostic('[storage] shard finalized', {
             key: pack.key,
             reason,
-            indexed,
+            indexed: 0,
             elapsedMs: Date.now() - startedAt,
             before,
             after,
@@ -638,9 +660,10 @@ function finalizeClosedHourShards(currentKey: string): void {
         const pipe = key.lastIndexOf('|');
         const shardKey = pipe >= 0 ? key.slice(pipe + 1) : '';
         if (!isHourlyShardKey(shardKey) || shardKey >= currentKey) continue;
-        if (!finalizeShard(pack, 'hour-rollover')) continue;
+        const finalized = finalizeShard(pack, 'hour-rollover');
         try { pack.db.close(); } catch {}
         logDbCache.delete(key);
+        if (!finalized) scheduleStaleShardFinalization();
     }
 }
 
@@ -684,13 +707,15 @@ function runStaleShardFinalization(): void {
         currentKey,
         candidates: candidates.length
     });
-    for (const candidate of candidates.slice(0, 2)) {
+    let incomplete = candidates.length > 1;
+    for (const candidate of candidates.slice(0, 1)) {
         const pack = getOrOpenLogDb(candidate.san, candidate.key);
-        if (!finalizeShard(pack, 'startup-catchup')) continue;
+        flushDeferredFtsForPack(pack, false, 'closed-shard-catchup');
+        if (!finalizeShard(pack, 'startup-catchup')) incomplete = true;
         try { pack.db.close(); } catch {}
         logDbCache.delete(pack.key);
     }
-    if (candidates.length > 2) scheduleStaleShardFinalization();
+    if (incomplete) scheduleStaleShardFinalization();
 }
 
 function scheduleStaleShardFinalization(): void {
@@ -889,6 +914,16 @@ function flushStorageWorkerBatch(): void {
         if (!storageWorkerOldestBatchAt) storageWorkerOldestBatchAt = Date.now();
         const sentAt = Date.now();
         updateStoragePressure();
+        const slowAckTimer = setTimeout(() => {
+            reportStorageDiagnostic('[storage] durable ack slow', {
+                entries: batch.length,
+                bytes: batchBytes,
+                ageMs: Date.now() - sentAt,
+                inFlightBatches: storageWorkerInFlightBatches,
+                queuedEntries: storageWorkerBatch.length,
+                backpressured: storageBackpressured
+            });
+        }, 60_000);
         void callStorageWorker('enqueueBatch', batch, STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS).then(() => {
             const ackMs = Date.now() - sentAt;
             storageWorkerLastAckMs = ackMs;
@@ -898,6 +933,7 @@ function flushStorageWorkerBatch(): void {
         }).catch((error) => {
             failStorageWorker(error instanceof Error ? error : new Error(String(error)));
         }).finally(() => {
+            clearTimeout(slowAckTimer);
             storageWorkerInFlightBatches = Math.max(0, storageWorkerInFlightBatches - 1);
             storageWorkerInFlightEntries = Math.max(0, storageWorkerInFlightEntries - batch.length);
             storageWorkerInFlightBytes = Math.max(0, storageWorkerInFlightBytes - batchBytes);

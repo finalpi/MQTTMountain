@@ -16,6 +16,7 @@ const showPassword = ref(false);
 const connecting = ref(false);
 const fileInput = ref<HTMLInputElement | null>(null);
 let recentHydrateToken = 0;
+let connectAttemptToken = 0;
 
 const selected = computed(() => conn.selected);
 const isConnected = computed(() => conn.selectedState === 'connected' || conn.selectedState === 'reconnecting');
@@ -55,6 +56,7 @@ async function doConnect(): Promise<void> {
     if (!c.port) { toast.error('请填写端口'); return; }
     if (connecting.value) return;
 
+    const attemptToken = ++connectAttemptToken;
     connecting.value = true;
     const label = c.name || `${c.host}:${c.port}`;
     const wasDirty = conn.dirty;
@@ -77,6 +79,7 @@ async function doConnect(): Promise<void> {
             clientId: c.clientId,
             disabledTopics: [...c.disabledTopics]
         });
+        if (attemptToken !== connectAttemptToken) return;
         if (!r.success) {
             toast.error(`连接失败（${label}）：${r.message || '未知错误'}`);
             conn.setState(c.id, 'error', r.message);
@@ -84,12 +87,19 @@ async function doConnect(): Promise<void> {
         }
         resetSubs(c.id);
         await syncSubs(c, true);
+        if (attemptToken !== connectAttemptToken) return;
 
         // 为该连接的 bucket 预填历史（不影响其他连接）
         void hydrateRecentMessages(c.id);
         toast.success(wasDirty ? `已连接：${label}（配置已自动保存）` : `已连接：${label}`);
+    } catch (error) {
+        if (attemptToken === connectAttemptToken) {
+            const message = error instanceof Error ? error.message : String(error);
+            conn.setState(c.id, 'error', message);
+            toast.error(`连接失败（${label}）：${message}`);
+        }
     } finally {
-        connecting.value = false;
+        if (attemptToken === connectAttemptToken) connecting.value = false;
     }
 }
 
@@ -105,6 +115,8 @@ async function hydrateRecentMessages(connectionId: string): Promise<void> {
 async function doDisconnect(): Promise<void> {
     const c = selected.value;
     if (!c) return;
+    connectAttemptToken++;
+    connecting.value = false;
     recentHydrateToken++;
     const label = c.name || `${c.host}:${c.port}`;
     await window.api.mqttDisconnect(c.id);
