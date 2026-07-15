@@ -87,11 +87,18 @@ let storageAcceptingWrites = true;
 let storageWorkerInFlightBatches = 0;
 let storageWorkerInFlightEntries = 0;
 let storageWorkerInFlightBytes = 0;
-let storageWorkerOldestBatchAt = 0;
+let storageWorkerAcceptedSequence = 0;
+let storageWorkerCommittedSequence = 0;
+const storageWorkerCompletedRanges = new Map<number, number>();
+const storageWorkerInFlightRanges = new Map<number, { endSequence: number; sentAt: number }>();
 let storageWorkerLastAckMs = 0;
 let storageWorkerMaxAckMs = 0;
 let storageWorkerAckedBatches = 0;
 let storageWorkerAckedEntries = 0;
+let storageWorkerWatermarkWaits = 0;
+let storageWorkerWatermarkTimeouts = 0;
+let storageWorkerWatermarkLastMs = 0;
+let storageWorkerWatermarkMaxMs = 0;
 let storageBackpressured = false;
 let storagePressureListener: ((pressured: boolean) => void) | null = null;
 const storageWorkerRequests = new Map<number, {
@@ -100,6 +107,8 @@ const storageWorkerRequests = new Map<number, {
     timer: NodeJS.Timeout | null;
 }>();
 const storageWorkerDrainWaiters = new Set<{
+    targetSequence: number;
+    startedAt: number;
     resolve: () => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
@@ -110,6 +119,7 @@ const autoDeleteWorkers = new Set<Worker>();
 interface PendingEntry extends BucketItem {
     connectionId: string;
     topic: string;
+    storageSequence: number;
 }
 
 const pending: PendingEntry[] = [];
@@ -190,8 +200,25 @@ export function getLogRoot(): string {
     return LOG_ROOT;
 }
 
+function storageWorkerOldestBatchAt(): number {
+    let oldest = 0;
+    for (const range of storageWorkerInFlightRanges.values()) {
+        if (!oldest || range.sentAt < oldest) oldest = range.sentAt;
+    }
+    return oldest;
+}
+
+function activeStorageWorkerWatermark(): number {
+    let watermark = storageWorkerCommittedSequence;
+    const queued = storageWorkerBatch[storageWorkerBatch.length - 1];
+    if (queued) watermark = Math.max(watermark, queued.storageSequence);
+    for (const range of storageWorkerInFlightRanges.values()) watermark = Math.max(watermark, range.endSequence);
+    return watermark;
+}
+
 export function getStorageDiagnostics(): Record<string, unknown> {
     const mem = process.memoryUsage();
+    const oldestBatchAt = storageWorkerOldestBatchAt();
     const openDbFiles = [...logDbCache.entries()].map(([key, pack]) => {
         const pipe = key.lastIndexOf('|');
         const san = pipe >= 0 ? key.slice(0, pipe) : key;
@@ -222,11 +249,18 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         workerInFlightBatches: storageWorkerInFlightBatches,
         workerInFlightEntries: storageWorkerInFlightEntries,
         workerInFlightBytes: storageWorkerInFlightBytes,
-        workerOldestBatchAgeMs: storageWorkerOldestBatchAt ? Date.now() - storageWorkerOldestBatchAt : 0,
+        workerOldestBatchAgeMs: oldestBatchAt ? Date.now() - oldestBatchAt : 0,
         workerLastAckMs: storageWorkerLastAckMs,
         workerMaxAckMs: storageWorkerMaxAckMs,
         workerAckedBatches: storageWorkerAckedBatches,
         workerAckedEntries: storageWorkerAckedEntries,
+        workerAcceptedSequence: storageWorkerAcceptedSequence,
+        workerCommittedSequence: storageWorkerCommittedSequence,
+        workerDurableWatermarkLag: storageWorkerAcceptedSequence - storageWorkerCommittedSequence,
+        workerWatermarkWaits: storageWorkerWatermarkWaits,
+        workerWatermarkTimeouts: storageWorkerWatermarkTimeouts,
+        workerWatermarkLastMs: storageWorkerWatermarkLastMs,
+        workerWatermarkMaxMs: storageWorkerWatermarkMaxMs,
         workerPendingRpc: storageWorkerRequests.size,
         workerDrainWaiters: storageWorkerDrainWaiters.size,
         storageBackpressured,
@@ -376,26 +410,54 @@ function rejectStorageWorkerRequests(error: Error): void {
     storageWorkerDrainWaiters.clear();
 }
 
-function notifyStorageWorkerDrained(): void {
-    if (storageWorkerBatch.length > 0 || storageWorkerInFlightBatches > 0) return;
-    for (const waiter of storageWorkerDrainWaiters) {
+function notifyStorageWorkerWatermarks(): void {
+    for (const waiter of [...storageWorkerDrainWaiters]) {
+        if (storageWorkerCommittedSequence < waiter.targetSequence) continue;
+        storageWorkerDrainWaiters.delete(waiter);
         clearTimeout(waiter.timer);
+        const elapsed = Date.now() - waiter.startedAt;
+        storageWorkerWatermarkLastMs = elapsed;
+        storageWorkerWatermarkMaxMs = Math.max(storageWorkerWatermarkMaxMs, elapsed);
         waiter.resolve();
     }
-    storageWorkerDrainWaiters.clear();
+}
+
+function markStorageWorkerRangeCommitted(startSequence: number, endSequence: number): void {
+    storageWorkerCompletedRanges.set(startSequence, endSequence);
+    while (true) {
+        const nextStart = storageWorkerCommittedSequence + 1;
+        const nextEnd = storageWorkerCompletedRanges.get(nextStart);
+        if (nextEnd == null) break;
+        storageWorkerCompletedRanges.delete(nextStart);
+        storageWorkerCommittedSequence = nextEnd;
+    }
+    notifyStorageWorkerWatermarks();
 }
 
 function waitForStorageWorkerDrain(timeoutMs = STORAGE_WORKER_RPC_TIMEOUT_MS): Promise<void> {
     flushStorageWorkerBatch();
-    if (storageWorkerBatch.length === 0 && storageWorkerInFlightBatches === 0) return Promise.resolve();
+    const targetSequence = activeStorageWorkerWatermark();
+    if (storageWorkerCommittedSequence >= targetSequence) return Promise.resolve();
+    storageWorkerWatermarkWaits++;
     return new Promise((resolve, reject) => {
+        const startedAt = Date.now();
         const waiter = {
+            targetSequence,
+            startedAt,
             resolve,
             reject,
             timer: setTimeout(() => {
                 storageWorkerDrainWaiters.delete(waiter);
+                const elapsed = Date.now() - startedAt;
+                storageWorkerWatermarkTimeouts++;
+                storageWorkerWatermarkLastMs = elapsed;
+                storageWorkerWatermarkMaxMs = Math.max(storageWorkerWatermarkMaxMs, elapsed);
+                const oldestBatchAt = storageWorkerOldestBatchAt();
                 reportStorageDiagnostic('[storage] worker drain timeout', {
                     timeoutMs,
+                    targetSequence,
+                    committedSequence: storageWorkerCommittedSequence,
+                    remainingSequenceCount: Math.max(0, targetSequence - storageWorkerCommittedSequence),
                     queuedEntries: storageWorkerBatch.length,
                     queuedBytes: storageWorkerBatchBytes,
                     deferredEntries: storageWorkerMaintenanceDeferredBatch.length,
@@ -403,7 +465,7 @@ function waitForStorageWorkerDrain(timeoutMs = STORAGE_WORKER_RPC_TIMEOUT_MS): P
                     inFlightBatches: storageWorkerInFlightBatches,
                     inFlightEntries: storageWorkerInFlightEntries,
                     inFlightBytes: storageWorkerInFlightBytes,
-                    oldestBatchAgeMs: storageWorkerOldestBatchAt ? Date.now() - storageWorkerOldestBatchAt : 0,
+                    oldestBatchAgeMs: oldestBatchAt ? Date.now() - oldestBatchAt : 0,
                     pendingRpc: storageWorkerRequests.size,
                     maintenancePauseDepth
                 });
@@ -1085,11 +1147,13 @@ function flushStorageWorkerBatch(): void {
         }
         const batch = storageWorkerBatch.splice(0, count);
         storageWorkerBatchBytes = Math.max(0, storageWorkerBatchBytes - batchBytes);
+        const startSequence = batch[0].storageSequence;
+        const endSequence = batch[batch.length - 1].storageSequence;
         storageWorkerInFlightBatches++;
         storageWorkerInFlightEntries += batch.length;
         storageWorkerInFlightBytes += batchBytes;
-        if (!storageWorkerOldestBatchAt) storageWorkerOldestBatchAt = Date.now();
         const sentAt = Date.now();
+        storageWorkerInFlightRanges.set(startSequence, { endSequence, sentAt });
         updateStoragePressure();
         const slowAckTimer = setTimeout(() => {
             reportStorageDiagnostic('[storage] durable ack slow', {
@@ -1107,6 +1171,7 @@ function flushStorageWorkerBatch(): void {
             storageWorkerMaxAckMs = Math.max(storageWorkerMaxAckMs, ackMs);
             storageWorkerAckedBatches++;
             storageWorkerAckedEntries += batch.length;
+            markStorageWorkerRangeCommitted(startSequence, endSequence);
         }).catch((error) => {
             failStorageWorker(error instanceof Error ? error : new Error(String(error)));
         }).finally(() => {
@@ -1114,10 +1179,10 @@ function flushStorageWorkerBatch(): void {
             storageWorkerInFlightBatches = Math.max(0, storageWorkerInFlightBatches - 1);
             storageWorkerInFlightEntries = Math.max(0, storageWorkerInFlightEntries - batch.length);
             storageWorkerInFlightBytes = Math.max(0, storageWorkerInFlightBytes - batchBytes);
-            if (storageWorkerInFlightBatches === 0) storageWorkerOldestBatchAt = 0;
+            storageWorkerInFlightRanges.delete(startSequence);
             updateStoragePressure();
             if (storageWorkerBatch.length > 0 && !storageWorkerFailure) flushStorageWorkerBatch();
-            notifyStorageWorkerDrained();
+            notifyStorageWorkerWatermarks();
         });
     }
 }
@@ -1131,7 +1196,15 @@ export function stopAcceptingStorageWrites(): void {
 export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
     if (!storageAcceptingWrites || !connectionId) return;
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
-    const entry = { connectionId, topic, payload, tsMs, payloadSize, payloadEncoding: meta.payloadEncoding };
+    const entry = {
+        connectionId,
+        topic,
+        payload,
+        tsMs,
+        payloadSize,
+        payloadEncoding: meta.payloadEncoding,
+        storageSequence: USE_STORAGE_WORKER ? ++storageWorkerAcceptedSequence : 0
+    };
     const estimatedBytes = payloadSize + topic.length + 16;
     storageEnqueuedEntries++;
     storageEnqueuedBytes += estimatedBytes;
@@ -1161,7 +1234,7 @@ function requeueGroups(groups: Map<string, { connectionId: string; sec: number; 
     const retry: PendingEntry[] = [];
     for (const g of groups.values()) {
         for (const item of g.items) {
-            retry.push({ connectionId: g.connectionId, topic: g.topic, ...item });
+            retry.push({ connectionId: g.connectionId, topic: g.topic, storageSequence: 0, ...item });
             pendingBytes += (item.payloadSize ?? item.payloadBytes?.byteLength ?? item.payload.length) + g.topic.length + 16;
         }
     }
