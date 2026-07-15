@@ -96,7 +96,9 @@ const hasActiveFilter = computed(() => normalizedFilterConditions.value.length >
 const activeFilterKey = computed(() => JSON.stringify(activeHistoryConditions()));
 const filterMatchCache = new Map<string, { key: string; value: boolean }>();
 const highlightCache = new Map<string, { key: string; value: string }>();
+const FILTER_MATCH_CACHE_LIMIT = 5000;
 const HIGHLIGHT_CACHE_LIMIT = 1000;
+let lastFilterCacheEvictionLogAt = 0;
 
 function activeHistoryConditions(): HistoryKeywordCondition[] {
     return activeFilterConditions.value
@@ -131,6 +133,17 @@ function matchesFilterConditions(src: string): boolean {
         if (item.join === 'or') result = result || hit;
         else if (item.join === 'not') result = result && !hit;
         else result = result && hit;
+    }
+    if (filterMatchCache.size >= FILTER_MATCH_CACHE_LIMIT) {
+        filterMatchCache.clear();
+        const now = Date.now();
+        if (now - lastFilterCacheEvictionLogAt >= 60_000) {
+            lastFilterCacheEvictionLogAt = now;
+            console.info(`[renderer-diagnostics] ${JSON.stringify({
+                event: 'filter-match-cache-evicted',
+                limit: FILTER_MATCH_CACHE_LIMIT
+            })}`);
+        }
     }
     filterMatchCache.set(src, { key, value: result });
     return result;

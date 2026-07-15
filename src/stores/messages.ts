@@ -95,11 +95,21 @@ export const useMessageStore = defineStore('messages', () => {
         maxMemoryMessages = Math.max(100, total);
         maxPerTopic = Math.max(50, perTopic);
         for (const b of buckets.values()) {
-            b.timeline.setCapacity(maxMemoryMessages);
+            const removed = b.timeline.setCapacity(maxMemoryMessages);
+            for (const row of removed) detachTimelineRow(b, row);
             for (const v of b.topics.values()) v.buf.setCapacity(maxPerTopic);
             b.timelineVersion++;
             b.topicsVersion++;
         }
+    }
+
+    function detachTimelineRow(b: MsgBucket, row: MsgRow): void {
+        b.topics.get(row.topic)?.buf.shiftIf(row);
+    }
+
+    function pushTimelineRow(b: MsgBucket, row: MsgRow): void {
+        const evicted = b.timeline.push(row);
+        if (evicted) detachTimelineRow(b, evicted);
     }
 
     function ensureTopic(b: MsgBucket, topic: string): TopicView {
@@ -137,7 +147,7 @@ export const useMessageStore = defineStore('messages', () => {
                 decoded: decodedBatch?.[i] ?? null
             };
             rows.push(row);
-            b.timeline.push(row);
+            pushTimelineRow(b, row);
             const existing = b.topics.get(m.topic);
             if (existing) {
                 existing.buf.push(row);
@@ -174,7 +184,10 @@ export const useMessageStore = defineStore('messages', () => {
         for (let i = 0; i < rows.length; i++) {
             const decoded = decodedBatch[i] ?? null;
             if (!decoded) continue;
-            rows[i].decoded = decoded;
+            // The formatter decodes the selected message again when it opens. Keeping the
+            // plugin's full tree/replyBlocks on every buffered row retained gigabytes of
+            // renderer heap; reply correlation only needs the small meta object.
+            rows[i].decoded = decoded.meta ? { meta: decoded.meta } : null;
             changed = true;
         }
         if (!changed) return;
@@ -298,7 +311,7 @@ export const useMessageStore = defineStore('messages', () => {
                 seq: nextSeq(),
                 decoded: decodedByKey.get(`${r.time}:${r.topic}:${r.payload}`) ?? null
             };
-            b.timeline.push(row);
+            pushTimelineRow(b, row);
             const v = ensureTopic(b, r.topic);
             v.buf.push(row);
             v.total++;

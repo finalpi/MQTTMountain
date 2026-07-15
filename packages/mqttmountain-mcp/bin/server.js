@@ -7,18 +7,18 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.db$/;
+const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db$/;
 const MAX_LIMIT = 5000;
 const INDEX_QUERY_CHUNK_SIZE = 1000;
 const BUCKET_QUERY_CHUNK_SIZE = 256;
-const HISTORY_INDEX_SCHEMA_VERSION = '5';
-const OFFSET_INDEX_SCHEMA_VERSIONS = new Set(['3', '4', '5']);
+const HISTORY_INDEX_SCHEMA_VERSION = '6';
+const OFFSET_INDEX_SCHEMA_VERSIONS = new Set(['3', '4', '5', '6']);
 const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '2';
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
 const DEFAULT_PAYLOAD_PREVIEW_CHARS = 300;
-const PACKAGE_VERSION = '0.1.4';
+const PACKAGE_VERSION = '0.1.5';
 
 function printHelp() {
   process.stdout.write(`mqttmountain-mcp ${PACKAGE_VERSION}
@@ -717,11 +717,11 @@ function acceptHistoryMessage(state, message, searchText) {
   return state.out.length >= state.limit;
 }
 
-function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache) {
+function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache, verifyPayloadMatch = false) {
   const base = { connectionId, topic: row.topic, time: row.time_ms };
   const hasOffsets = hasOffsetIndexSchema(schemaVersion);
   const payloadLen = hasOffsets ? row.payload_len : undefined;
-  if (hasOffsets && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
+  if (!verifyPayloadMatch && hasOffsets && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
     state.out.push(formatHistoryMessage(base, state, { payloadSize: payloadLen }));
     return state.out.length >= state.limit;
   }
@@ -743,11 +743,23 @@ function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, buck
     payload = decoded[row.msg_index]?.payload ?? null;
   }
   if (!payloadBytes && payload == null) return false;
-  state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText: payload, payloadSize: payloadLen }));
+  const payloadText = payload ?? payloadBytes?.toString('utf8') ?? '';
+  if (verifyPayloadMatch) {
+    const searchText = normalizeKeyword(String(base.topic || '') + payloadText);
+    if (!matchesSearchText(searchText, state.conditions, state.terms, state.keywordLogic)) return false;
+    if (state.skipped < state.offset) {
+      state.skipped += 1;
+      return false;
+    }
+  }
+  state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText, payloadSize: payloadLen }));
   return state.out.length >= state.limit;
 }
 
 function queryFtsIndexedFile(db, connectionId, state, schemaVersion) {
+  // v6 stores compact trigram candidates without search_text. Exact verification
+  // requires reading payload slices, so use the time/topic index path below.
+  if (schemaVersion === '6') return false;
   const match = buildFtsMatch(state.conditions, state.terms, state.keywordLogic);
   if (!match || !canUseFts(db, state)) return false;
   const hasOffsets = hasOffsetIndexSchema(schemaVersion);
@@ -804,7 +816,11 @@ function queryFtsIndexedFile(db, connectionId, state, schemaVersion) {
 
 function queryIndexedFile(db, connectionId, state, schemaVersion) {
   const hasOffsets = hasOffsetIndexSchema(schemaVersion);
-  let sql = hasOffsets
+  const compact = schemaVersion === '6';
+  const verifyPayloadMatch = compact && (state.conditions.length > 0 || state.terms.length > 0);
+  let sql = compact
+    ? 'SELECT bucket_ts, time_ms, topic, msg_index, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
+    : hasOffsets
     ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
     : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
   const params = [state.startTime, state.endTime];
@@ -824,12 +840,12 @@ function queryIndexedFile(db, connectionId, state, schemaVersion) {
     const rows = db.prepare(sql).all(...params, INDEX_QUERY_CHUNK_SIZE, offset);
     if (!rows.length) break;
     for (const row of rows) {
-      if (!matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
-      if (state.skipped < state.offset) {
+      if (!compact && !matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
+      if (!verifyPayloadMatch && state.skipped < state.offset) {
         state.skipped += 1;
         continue;
       }
-      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache)) return;
+      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache, verifyPayloadMatch)) return;
     }
     offset += rows.length;
     if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;

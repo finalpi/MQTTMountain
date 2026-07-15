@@ -24,28 +24,43 @@ export class RingBuffer<T> {
         return this.cap;
     }
 
-    setCapacity(capacity: number): void {
+    setCapacity(capacity: number): T[] {
         const cap = Math.max(1, capacity | 0);
-        if (cap === this.cap) return;
+        if (cap === this.cap) return [];
         const snap = this.snapshot();
+        const removed = snap.slice(0, Math.max(0, snap.length - cap));
         this.cap = cap;
         this.buf = new Array(cap);
         this.head = 0;
         this.size = 0;
         const start = Math.max(0, snap.length - cap);
         for (let i = start; i < snap.length; i++) this.push(snap[i]);
+        return removed;
     }
 
-    push(v: T): void {
+    push(v: T): T | undefined {
+        let evicted: T | undefined;
         if (this.size < this.cap) {
             this.buf[(this.head + this.size) % this.cap] = v;
             this.size++;
         } else {
+            evicted = this.buf[this.head];
             this.buf[this.head] = v;
             this.head = (this.head + 1) % this.cap;
         }
         this.total++;
         this.version++;
+        return evicted;
+    }
+
+    /** 仅当给定对象仍是最旧元素时移除；用于同步多个共享同一对象的环形缓存。 */
+    shiftIf(v: T): boolean {
+        if (this.size === 0 || this.buf[this.head] !== v) return false;
+        this.buf[this.head] = undefined;
+        this.head = (this.head + 1) % this.cap;
+        this.size--;
+        this.version++;
+        return true;
     }
 
     clear(): void {

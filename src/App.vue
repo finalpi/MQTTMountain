@@ -55,9 +55,20 @@ function logRendererDiagnostics(): void {
     const memory = (performance as Performance & {
         memory?: { usedJSHeapSize?: number; totalJSHeapSize?: number; jsHeapSizeLimit?: number };
     }).memory;
+    let topicBufferedMessages = 0;
+    let decodedMessages = 0;
+    let retainedPayloadChars = 0;
+    for (const topic of bucket.topics.values()) topicBufferedMessages += topic.buf.length;
+    bucket.timeline.forEachReverse((row) => {
+        retainedPayloadChars += row.payload.length;
+        if (row.decoded) decodedMessages++;
+    });
     console.info(`[renderer-diagnostics] ${JSON.stringify({
         selectedConnectionId: selectedId,
         timelineMessages: bucket.timeline.length,
+        topicBufferedMessages,
+        decodedMessages,
+        retainedPayloadMbApprox: Math.round(retainedPayloadChars * 2 / 1024 / 1024),
         topics: bucket.topics.size,
         publishHistory: bucket.publishHistory.length,
         pluginCenterViews: pluginCenterViews.value.length,

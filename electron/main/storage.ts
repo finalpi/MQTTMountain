@@ -649,7 +649,7 @@ function finalizeShard(pack: LogDbPack, reason: string): boolean {
     };
     const before = { dbBytes: size(pack.filePath), walBytes: size(`${pack.filePath}-wal`) };
     try {
-        if (pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db)) {
+        if (pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db) && pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
             reportStorageDiagnostic('[storage] shard finalization deferred', {
                 key: pack.key,
                 reason,
@@ -709,6 +709,9 @@ function findStaleShardCandidates(currentKey: string): Array<{ san: string; key:
             try {
                 db = new Database(filePath, { readonly: true });
                 if (getIndexMeta(db, 'fts_layout') !== 'contentless') continue;
+                // v5 files are immutable compatibility archives. They remain queryable,
+                // but realtime storage maintenance must never reopen or modify them.
+                if (getIndexMeta(db, 'schema_version') !== HISTORY_INDEX_SCHEMA_VERSION) continue;
                 if (getIndexMeta(db, 'fts_finalized_at')) continue;
                 candidates.push({ san: dirEntry.name, key, path: filePath });
             } catch (error) {
@@ -737,7 +740,9 @@ function runStaleShardFinalization(): void {
     let incomplete = candidates.length > 1;
     for (const candidate of candidates.slice(0, 1)) {
         const pack = getOrOpenLogDb(candidate.san, candidate.key);
-        flushDeferredFtsForPack(pack, false, 'closed-shard-catchup');
+        if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+            flushDeferredFtsForPack(pack, false, 'closed-shard-catchup');
+        }
         if (!finalizeShard(pack, 'startup-catchup')) incomplete = true;
         try { pack.db.close(); } catch {}
         logDbCache.delete(pack.key);
