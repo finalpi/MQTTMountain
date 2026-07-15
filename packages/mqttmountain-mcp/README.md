@@ -48,6 +48,8 @@ If MQTTMountain uses a custom log directory, pass it explicitly:
 
 `mqttmountain_query_history` uses MQTTMountain's per-day `history_messages` index when a day database has a complete index. If an index is missing or incomplete, the tool automatically falls back to decoding the original `buckets` table, so old logs still work.
 
+Version 0.1.6 supports both legacy uncompressed buckets and the v6 `MMZ1` compressed bucket format used by current hourly shards.
+
 Time values use Unix timestamps in milliseconds:
 
 ```json

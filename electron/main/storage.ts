@@ -133,10 +133,14 @@ let storageBucketStoredBytes = 0;
 let storageRetriedEntries = 0;
 let storageFlushTotalMs = 0;
 let storageFlushLastMs = 0;
+let storageFlushCompletedAt = 0;
 let storageFlushMaxMs = 0;
 let storageFlushErrors = 0;
-let deferredFtsTimer: NodeJS.Timeout | null = null;
 let staleShardFinalizeTimer: NodeJS.Timeout | null = null;
+let staleShardCandidates: Array<{ san: string; key: string; path: string }> | null = null;
+let closedFtsBatchEntries = 10_000;
+let closedFtsDeferredForRealtime = 0;
+let closedFtsCandidateScans = 0;
 let deferredFtsRuns = 0;
 let deferredFtsIndexedEntries = 0;
 let deferredFtsLastMs = 0;
@@ -163,14 +167,21 @@ const STORAGE_WORKER_RPC_TIMEOUT_MS = 30_000;
 // authoritative failure signal.
 const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 0;
 const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 55_000;
-const DEFERRED_FTS_INTERVAL_MS = 30_000;
 const DEFERRED_FTS_BATCH_ENTRIES = 1_000;
+const CLOSED_FTS_INTERVAL_MS = Math.max(50, Number(process.env.MQTTMOUNTAIN_CLOSED_FTS_INTERVAL_MS) || 15_000);
+const CLOSED_FTS_INITIAL_BATCH_ENTRIES = Math.max(1, Number(process.env.MQTTMOUNTAIN_CLOSED_FTS_BATCH_ENTRIES) || 10_000);
+const CLOSED_FTS_MIN_BATCH_ENTRIES = Math.min(1_000, CLOSED_FTS_INITIAL_BATCH_ENTRIES);
+const CLOSED_FTS_MAX_BATCH_ENTRIES = Math.max(CLOSED_FTS_INITIAL_BATCH_ENTRIES, 20_000);
+const CLOSED_FTS_TARGET_BATCH_MS = 750;
+const CLOSED_FTS_REALTIME_FLUSH_BUDGET_MS = 500;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
 
 export function initStorage(logRoot: string): void {
     LOG_ROOT = logRoot;
     storageAcceptingWrites = true;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
+    closedFtsBatchEntries = CLOSED_FTS_INITIAL_BATCH_ENTRIES;
+    staleShardCandidates = null;
     if (USE_STORAGE_WORKER) ensureStorageWorker();
     else scheduleStaleShardFinalization();
 }
@@ -233,6 +244,7 @@ export function getStorageDiagnostics(): Record<string, unknown> {
             : 1,
         retriedEntries: storageRetriedEntries,
         flushLastMs: storageFlushLastMs,
+        flushCompletedAt: storageFlushCompletedAt,
         flushMaxMs: storageFlushMaxMs,
         flushAvgMs: storageFlushCount ? Math.round(storageFlushTotalMs / storageFlushCount) : 0,
         flushErrors: storageFlushErrors,
@@ -241,7 +253,12 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         deferredFtsLastMs,
         deferredFtsMaxMs,
         deferredFtsErrors,
-        deferredFtsScheduled: deferredFtsTimer != null,
+        deferredFtsScheduled: false,
+        closedFtsScheduled: staleShardFinalizeTimer != null,
+        closedFtsBatchEntries,
+        closedFtsDeferredForRealtime,
+        closedFtsCandidateScans,
+        closedFtsCandidateCount: staleShardCandidates?.length ?? null,
         finalizedShards,
         finalizedShardErrors,
         openLogDbs: logDbCache.size,
@@ -555,7 +572,6 @@ function appendBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, en
     if (entries.length > 0 && pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
         setIndexMeta(pack.db, 'fts_index_complete', '0');
         setIndexMeta(pack.db, 'fts_finalized_at', '');
-        scheduleDeferredFtsFlush();
     }
 }
 
@@ -572,36 +588,65 @@ function deferredFtsCursor(pack: LogDbPack): number {
     return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
-function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string): number {
+function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string, batchEntries = DEFERRED_FTS_BATCH_ENTRIES): number {
     if (pack.ftsLayout !== 'contentless' || !pack.insertDeferredFtsStmt) return 0;
     const startedAt = Date.now();
     let indexed = 0;
     try {
         let cursor = deferredFtsCursor(pack);
         while (true) {
-            const rows = (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
-                ? pack.db.prepare('SELECT id, search_text FROM history_fts_pending ORDER BY id ASC LIMIT ?').all(DEFERRED_FTS_BATCH_ENTRIES)
-                : pack.db.prepare('SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?').all(cursor, DEFERRED_FTS_BATCH_ENTRIES)
-            ) as Array<{ id: number; search_text: string }>;
-            if (rows.length === 0) {
-                setIndexMeta(pack.db, 'fts_index_complete', '1');
-                break;
-            }
-            const writeBatch = pack.db.transaction(() => {
-                for (const row of rows) pack.insertDeferredFtsStmt!.run(row.id, row.search_text);
-                cursor = rows[rows.length - 1].id;
-                if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-                    pack.db.prepare('DELETE FROM history_fts_pending WHERE id <= ?').run(cursor);
+            let batchCount = 0;
+            if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
+                // Keep the transient search text in memory while deleting the durable
+                // pending rows first. SQLite can then reuse those freed pages for FTS,
+                // avoiding the old insert-then-delete file growth pattern.
+                pack.db.pragma('temp_store = MEMORY');
+                pack.db.exec('CREATE TEMP TABLE IF NOT EXISTS temp_history_fts_batch (id INTEGER PRIMARY KEY, search_text TEXT NOT NULL)');
+                const writeBatch = pack.db.transaction(() => {
+                    pack.db.exec('DELETE FROM temp_history_fts_batch');
+                    pack.db.prepare(`
+                        INSERT INTO temp_history_fts_batch(id, search_text)
+                        SELECT id, search_text FROM history_fts_pending ORDER BY id ASC LIMIT ?
+                    `).run(batchEntries);
+                    const batch = pack.db.prepare('SELECT COUNT(*) AS count, MAX(id) AS maxId FROM temp_history_fts_batch').get() as {
+                        count: number;
+                        maxId: number | null;
+                    };
+                    batchCount = Number(batch.count) || 0;
+                    if (batchCount === 0 || batch.maxId == null) {
+                        setIndexMeta(pack.db, 'fts_index_complete', '1');
+                        return;
+                    }
+                    cursor = Number(batch.maxId);
+                    pack.db.prepare('DELETE FROM history_fts_pending WHERE id IN (SELECT id FROM temp_history_fts_batch)').run();
+                    pack.db.exec(`
+                        INSERT INTO history_messages_fts(rowid, search_text)
+                        SELECT id, search_text FROM temp_history_fts_batch ORDER BY id ASC
+                    `);
+                    setIndexMeta(pack.db, 'fts_indexed_id', cursor);
+                    const hasMore = Boolean(pack.db.prepare('SELECT 1 FROM history_fts_pending LIMIT 1').get());
+                    setIndexMeta(pack.db, 'fts_index_complete', hasMore ? '0' : '1');
+                });
+                writeBatch();
+            } else {
+                const rows = pack.db.prepare(
+                    'SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?'
+                ).all(cursor, batchEntries) as Array<{ id: number; search_text: string }>;
+                batchCount = rows.length;
+                if (batchCount === 0) {
+                    setIndexMeta(pack.db, 'fts_index_complete', '1');
+                    break;
                 }
-                setIndexMeta(pack.db, 'fts_indexed_id', cursor);
-                const hasMore = pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
-                    ? Boolean(pack.db.prepare('SELECT 1 FROM history_fts_pending LIMIT 1').get())
-                    : rows.length >= DEFERRED_FTS_BATCH_ENTRIES;
-                setIndexMeta(pack.db, 'fts_index_complete', hasMore ? '0' : '1');
-            });
-            writeBatch();
-            indexed += rows.length;
-            if (!force || rows.length < DEFERRED_FTS_BATCH_ENTRIES) break;
+                const writeBatch = pack.db.transaction(() => {
+                    for (const row of rows) pack.insertDeferredFtsStmt!.run(row.id, row.search_text);
+                    cursor = rows[rows.length - 1].id;
+                    setIndexMeta(pack.db, 'fts_indexed_id', cursor);
+                    setIndexMeta(pack.db, 'fts_index_complete', rows.length >= batchEntries ? '0' : '1');
+                });
+                writeBatch();
+            }
+            indexed += batchCount;
+            if (batchCount === 0 || !force || batchCount < batchEntries) break;
         }
         const elapsed = Date.now() - startedAt;
         deferredFtsRuns++;
@@ -627,10 +672,6 @@ function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string
     }
 }
 
-function hasDeferredFtsWork(): boolean {
-    return [...logDbCache.values()].some((pack) => pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db));
-}
-
 export function flushDeferredHistoryFts(force = false, reason = 'manual'): { indexed: number; incompleteShards: number } {
     let indexed = 0;
     for (const pack of logDbCache.values()) indexed += flushDeferredFtsForPack(pack, force, reason);
@@ -640,19 +681,6 @@ export function flushDeferredHistoryFts(force = false, reason = 'manual'): { ind
             (pack) => pack.ftsLayout === 'contentless' && !isHistoryFtsComplete(pack.db)
         ).length
     };
-}
-
-function scheduleDeferredFtsFlush(): void {
-    if (deferredFtsTimer) return;
-    deferredFtsTimer = setTimeout(() => {
-        deferredFtsTimer = null;
-        const pack = [...logDbCache.values()].find(
-            (candidate) => candidate.ftsLayout === 'contentless' && !isHistoryFtsComplete(candidate.db)
-        );
-        if (pack) flushDeferredFtsForPack(pack, false, 'timer');
-        if (hasDeferredFtsWork()) scheduleDeferredFtsFlush();
-    }, DEFERRED_FTS_INTERVAL_MS);
-    deferredFtsTimer.unref();
 }
 
 function isHourlyShardKey(key: string): boolean {
@@ -707,11 +735,15 @@ function finalizeClosedHourShards(currentKey: string): void {
         const finalized = finalizeShard(pack, 'hour-rollover');
         try { pack.db.close(); } catch {}
         logDbCache.delete(key);
-        if (!finalized) scheduleStaleShardFinalization();
+        if (!finalized) {
+            staleShardCandidates = null;
+            scheduleStaleShardFinalization();
+        }
     }
 }
 
 function findStaleShardCandidates(currentKey: string): Array<{ san: string; key: string; path: string }> {
+    closedFtsCandidateScans++;
     if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return [];
     const candidates: Array<{ san: string; key: string; path: string }> = [];
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
@@ -744,32 +776,74 @@ function findStaleShardCandidates(currentKey: string): Array<{ san: string; key:
 function runStaleShardFinalization(): void {
     staleShardFinalizeTimer = null;
     if (maintenancePauseDepth > 0) {
+        closedFtsDeferredForRealtime++;
+        scheduleStaleShardFinalization();
+        return;
+    }
+    if (pending.length > 0) flushStorageLocal();
+    const realtimeFlushCooldownMs = CLOSED_FTS_INTERVAL_MS * 2;
+    const realtimeFlushAgeMs = storageFlushCompletedAt ? Date.now() - storageFlushCompletedAt : Number.POSITIVE_INFINITY;
+    if (storageFlushLastMs > CLOSED_FTS_REALTIME_FLUSH_BUDGET_MS && realtimeFlushAgeMs < realtimeFlushCooldownMs) {
+        closedFtsDeferredForRealtime++;
+        reportStorageDiagnostic('[storage] closed FTS catchup deferred for realtime writes', {
+            flushLastMs: storageFlushLastMs,
+            flushAgeMs: realtimeFlushAgeMs,
+            flushBudgetMs: CLOSED_FTS_REALTIME_FLUSH_BUDGET_MS,
+            pendingEntries: pending.length,
+            nextRetryMs: CLOSED_FTS_INTERVAL_MS
+        });
         scheduleStaleShardFinalization();
         return;
     }
     const currentKey = historyFileKeyFromTs(Date.now());
-    const candidates = findStaleShardCandidates(currentKey);
-    if (candidates.length === 0) return;
-    reportStorageDiagnostic('[storage] stale shard finalization scan', {
-        currentKey,
-        candidates: candidates.length
+    if (staleShardCandidates == null) {
+        staleShardCandidates = findStaleShardCandidates(currentKey);
+        reportStorageDiagnostic('[storage] stale shard finalization scan', {
+            currentKey,
+            candidates: staleShardCandidates.length,
+            cached: true
+        });
+    }
+    const candidate = staleShardCandidates[0];
+    if (!candidate) return;
+    if (!fs.existsSync(candidate.path)) {
+        staleShardCandidates = null;
+        scheduleStaleShardFinalization(50);
+        return;
+    }
+    const pack = getOrOpenLogDb(candidate.san, candidate.key);
+    const requestedBatchEntries = closedFtsBatchEntries;
+    const cycleStartedAt = Date.now();
+    const indexed = pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+        ? flushDeferredFtsForPack(pack, false, 'closed-shard-catchup', requestedBatchEntries)
+        : 0;
+    const elapsedMs = Date.now() - cycleStartedAt;
+    if (indexed >= requestedBatchEntries && elapsedMs > 0) {
+        const factor = Math.max(0.5, Math.min(2, CLOSED_FTS_TARGET_BATCH_MS / elapsedMs));
+        const adjusted = Math.round((requestedBatchEntries * factor) / 500) * 500;
+        closedFtsBatchEntries = Math.max(CLOSED_FTS_MIN_BATCH_ENTRIES, Math.min(CLOSED_FTS_MAX_BATCH_ENTRIES, adjusted));
+    }
+    const finalized = finalizeShard(pack, 'background-catchup');
+    reportStorageDiagnostic('[storage] closed FTS catchup cycle', {
+        key: pack.key,
+        indexed,
+        requestedBatchEntries,
+        nextBatchEntries: closedFtsBatchEntries,
+        elapsedMs,
+        finalized,
+        remainingCandidates: staleShardCandidates.length
     });
-    let incomplete = candidates.length > 1;
-    for (const candidate of candidates.slice(0, 1)) {
-        const pack = getOrOpenLogDb(candidate.san, candidate.key);
-        if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-            flushDeferredFtsForPack(pack, false, 'closed-shard-catchup');
-        }
-        if (!finalizeShard(pack, 'startup-catchup')) incomplete = true;
+    if (finalized) {
         try { pack.db.close(); } catch {}
         logDbCache.delete(pack.key);
+        staleShardCandidates.shift();
     }
-    if (incomplete) scheduleStaleShardFinalization();
+    if (staleShardCandidates.length > 0 || !finalized) scheduleStaleShardFinalization();
 }
 
-function scheduleStaleShardFinalization(): void {
+function scheduleStaleShardFinalization(delayMs = CLOSED_FTS_INTERVAL_MS): void {
     if (staleShardFinalizeTimer) return;
-    staleShardFinalizeTimer = setTimeout(runStaleShardFinalization, 10_000);
+    staleShardFinalizeTimer = setTimeout(runStaleShardFinalization, delayMs);
     staleShardFinalizeTimer.unref();
 }
 
@@ -907,7 +981,6 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         journalSizeLimitBytes: 268435456,
         bucketCompression: 'deflate-raw-level-1'
     });
-    if (ftsLayout === 'contentless' && !isHistoryFtsComplete(db)) scheduleDeferredFtsFlush();
     return pack;
 }
 
@@ -958,6 +1031,7 @@ export function resumeStorageWrites(reason = 'maintenance'): void {
         });
     }
     if (maintenancePauseDepth === 0 && pending.length > 0) scheduleFlush();
+    if (!USE_STORAGE_WORKER && maintenancePauseDepth === 0) scheduleStaleShardFinalization();
 }
 
 export function withStorageMaintenance<T>(fn: () => T): T {
@@ -1261,6 +1335,7 @@ function flushStorageLocal(): void {
     storageFlushedEntries += batch.length;
     storageFlushedBytes += batchBytes;
     storageFlushLastMs = elapsed;
+    storageFlushCompletedAt = Date.now();
     storageFlushMaxMs = Math.max(storageFlushMaxMs, elapsed);
     storageFlushTotalMs += elapsed;
 }
@@ -1490,14 +1565,11 @@ function closeOldLogDbs(cutoff: number): void {
 
 export function closeAllLogDbs(): void {
     flushStorageLocal();
-    if (deferredFtsTimer) {
-        clearTimeout(deferredFtsTimer);
-        deferredFtsTimer = null;
-    }
     if (staleShardFinalizeTimer) {
         clearTimeout(staleShardFinalizeTimer);
         staleShardFinalizeTimer = null;
     }
+    staleShardCandidates = null;
     for (const [, v] of logDbCache) { try { v.db.close(); } catch {} }
     logDbCache.clear();
 }

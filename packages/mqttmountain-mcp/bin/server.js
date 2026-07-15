@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { inflateRawSync } from 'node:zlib';
 import Database from 'better-sqlite3';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -14,11 +15,13 @@ const BUCKET_QUERY_CHUNK_SIZE = 256;
 const HISTORY_INDEX_SCHEMA_VERSION = '6';
 const OFFSET_INDEX_SCHEMA_VERSIONS = new Set(['3', '4', '5', '6']);
 const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '2';
+const COMPRESSED_BUCKET_MAGIC = Buffer.from('MMZ1');
+const COMPRESSED_BUCKET_HEADER_BYTES = 8;
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
 const DEFAULT_PAYLOAD_PREVIEW_CHARS = 300;
-const PACKAGE_VERSION = '0.1.5';
+const PACKAGE_VERSION = '0.1.6';
 
 function printHelp() {
   process.stdout.write(`mqttmountain-mcp ${PACKAGE_VERSION}
@@ -131,11 +134,29 @@ function dayEndTsFromKey(dayKey) {
   return dayStartTsFromKey(dayKey) + 86_400_000 - 1;
 }
 
-function readPayloadBytesSlice(blob, payloadOffset, payloadLen) {
+function isCompressedBucketBlob(blob) {
+  return Buffer.isBuffer(blob)
+    && blob.length >= COMPRESSED_BUCKET_HEADER_BYTES
+    && blob.subarray(0, COMPRESSED_BUCKET_MAGIC.length).equals(COMPRESSED_BUCKET_MAGIC);
+}
+
+function unpackBucketBlob(blob) {
   if (!Buffer.isBuffer(blob)) return null;
+  if (!isCompressedBucketBlob(blob)) return blob;
+  const expectedLength = blob.readUInt32LE(4);
+  const raw = inflateRawSync(blob.subarray(COMPRESSED_BUCKET_HEADER_BYTES));
+  if (raw.length !== expectedLength) {
+    throw new Error(`compressed bucket length mismatch: expected ${expectedLength}, got ${raw.length}`);
+  }
+  return raw;
+}
+
+function readPayloadBytesSlice(blob, payloadOffset, payloadLen) {
+  const raw = unpackBucketBlob(blob);
+  if (!raw) return null;
   if (!Number.isSafeInteger(payloadOffset) || !Number.isSafeInteger(payloadLen)) return null;
-  if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > blob.length) return null;
-  return blob.subarray(payloadOffset, payloadOffset + payloadLen);
+  if (payloadOffset < 4 || payloadLen < 0 || payloadOffset + payloadLen > raw.length) return null;
+  return raw.subarray(payloadOffset, payloadOffset + payloadLen);
 }
 
 function decodePreview(bytes, maxChars) {
@@ -189,17 +210,18 @@ function formatHistoryMessage(base, state, payloadSource = {}) {
 
 function decodeBucket(blob, bucketSec, topic, connectionId) {
   const out = [];
-  if (!Buffer.isBuffer(blob) || blob.length < 4) return out;
+  const raw = unpackBucketBlob(blob);
+  if (!raw || raw.length < 4) return out;
   const base = bucketSec * 1000;
-  const count = blob.readUInt32LE(0);
+  const count = raw.readUInt32LE(0);
   let cursor = 4;
-  for (let i = 0; i < count && cursor + 6 <= blob.length; i++) {
-    const offset = blob.readUInt16LE(cursor);
+  for (let i = 0; i < count && cursor + 6 <= raw.length; i++) {
+    const offset = raw.readUInt16LE(cursor);
     cursor += 2;
-    const length = blob.readUInt32LE(cursor);
+    const length = raw.readUInt32LE(cursor);
     cursor += 4;
-    if (cursor + length > blob.length) break;
-    const payload = blob.subarray(cursor, cursor + length).toString('utf8');
+    if (cursor + length > raw.length) break;
+    const payload = raw.subarray(cursor, cursor + length).toString('utf8');
     cursor += length;
     out.push({ connectionId, topic, payload, time: base + offset });
   }
@@ -727,20 +749,21 @@ function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, buck
   }
   const bucket = bucketStmt.get(row.bucket_ts, row.topic);
   if (!bucket) return false;
+  const cacheKey = `${row.bucket_ts}|${row.topic}`;
+  let cached = bucketCache.get(cacheKey);
+  if (!cached) {
+    cached = { raw: unpackBucketBlob(bucket.blob), decoded: null };
+    bucketCache.set(cacheKey, cached);
+  }
   let payloadBytes = null;
   let payload = null;
   if (hasOffsets) {
-    payloadBytes = readPayloadBytesSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
+    payloadBytes = readPayloadBytesSlice(cached.raw, row.payload_offset ?? -1, row.payload_len ?? -1);
     if (state.payloadMode === 'full' && payloadBytes) payload = payloadBytes.toString('utf8');
   }
   if (!payloadBytes && payload == null) {
-    const cacheKey = `${row.bucket_ts}|${row.topic}`;
-    let decoded = bucketCache.get(cacheKey);
-    if (!decoded) {
-      decoded = decodeBucket(bucket.blob, row.bucket_ts, row.topic, connectionId);
-      bucketCache.set(cacheKey, decoded);
-    }
-    payload = decoded[row.msg_index]?.payload ?? null;
+    if (!cached.decoded) cached.decoded = decodeBucket(cached.raw, row.bucket_ts, row.topic, connectionId);
+    payload = cached.decoded[row.msg_index]?.payload ?? null;
   }
   if (!payloadBytes && payload == null) return false;
   const payloadText = payload ?? payloadBytes?.toString('utf8') ?? '';
