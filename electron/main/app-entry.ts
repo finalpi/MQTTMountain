@@ -1,7 +1,6 @@
 import { app, BrowserWindow, session } from 'electron';
 import path from 'node:path';
 import { initIpc } from './ipc';
-import { scheduleHeavyJob } from './heavy-job-scheduler';
 import {
     clearLogsWithoutConnectionsAsync,
     initStorage,
@@ -17,13 +16,11 @@ import { writeDiagnosticLog } from './diagnostics';
 import { startAutoDeleteScheduler, stopAutoDeleteScheduler } from './auto-delete-scheduler';
 import { pluginManager } from './plugin-manager';
 import './constants';
-import type { StartupMaintenanceDone } from '../../shared/types';
 
 export { APP_START_TIME } from './constants';
 
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const RENDERER_DIST = path.join(process.env.APP_ROOT!, 'dist');
-const STARTUP_MAINTENANCE_DELAY_MS = 5_000;
 const STORAGE_SHUTDOWN_TIMEOUT_MS = 120_000;
 function installDiagnosticHandlers(): void {
     process.on('uncaughtException', (error) => {
@@ -74,7 +71,6 @@ let win: BrowserWindow | null = null;
 let mqttService: MqttService | null = null;
 let quitAfterStorageShutdown = false;
 let quitShutdownPromise: Promise<void> | null = null;
-let startupMaintenanceTimer: ReturnType<typeof setTimeout> | null = null;
 let isQuitting = false;
 
 function focusExistingWindow(): void {
@@ -83,11 +79,6 @@ function focusExistingWindow(): void {
     if (!win.isVisible()) win.show();
     win.focus();
     win.webContents.focus();
-}
-
-function notifyStartupMaintenanceDone(payload: StartupMaintenanceDone): void {
-    if (!win || win.isDestroyed()) return;
-    win.webContents.send('app:startupMaintenanceDone', payload);
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -106,53 +97,23 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
     });
 }
 
-function scheduleStartupMaintenance(): void {
-    if (startupMaintenanceTimer) clearTimeout(startupMaintenanceTimer);
-    startupMaintenanceTimer = setTimeout(() => {
-        startupMaintenanceTimer = null;
-        void runStartupMaintenance();
-    }, STARTUP_MAINTENANCE_DELAY_MS);
-}
-
-async function purgeOldHistoryBeforeUse(): Promise<void> {
+async function runStartupMaintenanceBeforeConnections(): Promise<void> {
     try {
         const result = await purgeNonCurrentHistoryIndexDbsAsync();
+        writeDiagnosticLog('[main] pre-connection history maintenance complete', result);
         if (result.deletedFiles > 0) {
             console.info(`[main] deleted ${result.deletedFiles} old history db files before startup; history index schema changed`);
         }
     } catch (error) {
         console.error('[main] pre-window old history purge failed:', error);
     }
-}
-
-async function runStartupMaintenance(): Promise<void> {
-    await Promise.all([
-        scheduleHeavyJob(
-            { kind: 'exclusive', label: 'startup-purge-old-history-indexes', priority: 34 },
-            () => purgeNonCurrentHistoryIndexDbsAsync()
-        ).promise.then(
-            (result) => notifyStartupMaintenanceDone({ kind: 'oldHistoryIndexes', success: true, deletedFiles: result.deletedFiles }),
-            (error) => {
-                console.error('[main] startup old history index purge failed:', error);
-                notifyStartupMaintenanceDone({ kind: 'oldHistoryIndexes', success: false, message: (error as Error).message });
-            }
-        ),
-        scheduleHeavyJob(
-            { kind: 'exclusive', label: 'startup-clear-stale-logs', priority: 35 },
-            () => clearLogsWithoutConnectionsAsync(readConnections().connections.map((c) => c.id))
-        ).promise.then(
-            (result) => notifyStartupMaintenanceDone({
-                kind: 'staleLogs',
-                success: true,
-                deletedDirs: result.deletedDirs,
-                deletedFiles: result.deletedFiles
-            }),
-            (error) => {
-                console.error('[main] startup stale log cleanup failed:', error);
-                notifyStartupMaintenanceDone({ kind: 'staleLogs', success: false, message: (error as Error).message });
-            }
-        )
-    ]);
+    try {
+        const result = await clearLogsWithoutConnectionsAsync(readConnections().connections.map((c) => c.id));
+        writeDiagnosticLog('[main] pre-connection stale log cleanup complete', result);
+    } catch (error) {
+        writeDiagnosticLog('[main] pre-connection stale log cleanup failed', error);
+        console.error('[main] pre-window stale log cleanup failed:', error);
+    }
 }
 
 function shutdownForQuit(): Promise<void> {
@@ -161,10 +122,6 @@ function shutdownForQuit(): Promise<void> {
     stopAcceptingStorageWrites();
     if (quitShutdownPromise) return quitShutdownPromise;
     quitShutdownPromise = (async () => {
-        if (startupMaintenanceTimer) {
-            clearTimeout(startupMaintenanceTimer);
-            startupMaintenanceTimer = null;
-        }
         stopAutoDeleteScheduler();
         await stopAutoDeleteWorkers();
         mqttService?.shutdown();
@@ -266,7 +223,7 @@ app.whenReady().then(async () => {
     });
     initSettings();
     initStorage(getCurrentLogDir());
-    await purgeOldHistoryBeforeUse();
+    await runStartupMaintenanceBeforeConnections();
     await pluginManager.init().catch((e) => {
         writeDiagnosticLog('[plugin] init failed', e);
         console.error('[plugin] init:', e);
@@ -274,7 +231,6 @@ app.whenReady().then(async () => {
     mqttService = new MqttService(() => win);
     initIpc(mqttService);
     await createWindow();
-    scheduleStartupMaintenance();
     startAutoDeleteScheduler(() => win);
 }).catch((error) => {
     writeDiagnosticLog('[main] app ready failed', error);

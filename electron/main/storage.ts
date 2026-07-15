@@ -118,6 +118,8 @@ let flushTimer: NodeJS.Timeout | null = null;
 let maintenancePauseDepth = 0;
 const storageWorkerBatch: PendingEntry[] = [];
 let storageWorkerBatchBytes = 0;
+const storageWorkerMaintenanceDeferredBatch: PendingEntry[] = [];
+let storageWorkerMaintenanceDeferredBytes = 0;
 let storageWorkerBatchTimer: NodeJS.Timeout | null = null;
 let storageEnqueuedEntries = 0;
 let storageEnqueuedBytes = 0;
@@ -204,6 +206,8 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         pendingBytes,
         workerBatchEntries: storageWorkerBatch.length,
         workerBatchBytes: storageWorkerBatchBytes,
+        workerMaintenanceDeferredEntries: storageWorkerMaintenanceDeferredBatch.length,
+        workerMaintenanceDeferredBytes: storageWorkerMaintenanceDeferredBytes,
         workerInFlightBatches: storageWorkerInFlightBatches,
         workerInFlightEntries: storageWorkerInFlightEntries,
         workerInFlightBytes: storageWorkerInFlightBytes,
@@ -268,8 +272,8 @@ export function isStorageBackpressured(): boolean {
 }
 
 function updateStoragePressure(): void {
-    const entries = storageWorkerBatch.length + storageWorkerInFlightEntries;
-    const bytes = storageWorkerBatchBytes + storageWorkerInFlightBytes;
+    const entries = storageWorkerBatch.length + storageWorkerMaintenanceDeferredBatch.length + storageWorkerInFlightEntries;
+    const bytes = storageWorkerBatchBytes + storageWorkerMaintenanceDeferredBytes + storageWorkerInFlightBytes;
     const next = storageBackpressured
         ? entries > STORAGE_PRESSURE_LOW_ENTRIES || bytes > STORAGE_PRESSURE_LOW_BYTES
         : entries >= STORAGE_PRESSURE_HIGH_ENTRIES || bytes >= STORAGE_PRESSURE_HIGH_BYTES;
@@ -373,6 +377,19 @@ function waitForStorageWorkerDrain(timeoutMs = STORAGE_WORKER_RPC_TIMEOUT_MS): P
             reject,
             timer: setTimeout(() => {
                 storageWorkerDrainWaiters.delete(waiter);
+                reportStorageDiagnostic('[storage] worker drain timeout', {
+                    timeoutMs,
+                    queuedEntries: storageWorkerBatch.length,
+                    queuedBytes: storageWorkerBatchBytes,
+                    deferredEntries: storageWorkerMaintenanceDeferredBatch.length,
+                    deferredBytes: storageWorkerMaintenanceDeferredBytes,
+                    inFlightBatches: storageWorkerInFlightBatches,
+                    inFlightEntries: storageWorkerInFlightEntries,
+                    inFlightBytes: storageWorkerInFlightBytes,
+                    oldestBatchAgeMs: storageWorkerOldestBatchAt ? Date.now() - storageWorkerOldestBatchAt : 0,
+                    pendingRpc: storageWorkerRequests.size,
+                    maintenancePauseDepth
+                });
                 reject(new Error(`storage worker drain timed out after ${timeoutMs}ms`));
             }, timeoutMs)
         };
@@ -896,9 +913,15 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
 
 // ---------------- lifecycle ----------------
 export function pauseStorageWrites(reason = 'maintenance'): void {
-    if (USE_STORAGE_WORKER) {
+    if (USE_STORAGE_WORKER && maintenancePauseDepth === 0) {
         flushStorageWorkerBatch();
         postStorageWorker('pause', { reason });
+        reportStorageDiagnostic('[storage] maintenance pause started', {
+            reason,
+            queuedEntries: storageWorkerBatch.length,
+            inFlightBatches: storageWorkerInFlightBatches,
+            inFlightEntries: storageWorkerInFlightEntries
+        });
     }
     maintenancePauseDepth++;
     if (flushTimer) {
@@ -910,7 +933,30 @@ export function pauseStorageWrites(reason = 'maintenance'): void {
 
 export function resumeStorageWrites(reason = 'maintenance'): void {
     if (maintenancePauseDepth > 0) maintenancePauseDepth--;
-    if (USE_STORAGE_WORKER) postStorageWorker('resume', { reason });
+    if (USE_STORAGE_WORKER && maintenancePauseDepth === 0) {
+        postStorageWorker('resume', { reason });
+        const deferredEntries = storageWorkerMaintenanceDeferredBatch.length;
+        const deferredBytes = storageWorkerMaintenanceDeferredBytes;
+        if (storageWorkerMaintenanceDeferredBatch.length > 0) {
+            storageWorkerBatch.push(...storageWorkerMaintenanceDeferredBatch.splice(0));
+            storageWorkerBatchBytes += storageWorkerMaintenanceDeferredBytes;
+            storageWorkerMaintenanceDeferredBytes = 0;
+            reportStorageDiagnostic('[storage] maintenance deferred writes resumed', {
+                reason,
+                entries: storageWorkerBatch.length,
+                bytes: storageWorkerBatchBytes
+            });
+            updateStoragePressure();
+            flushStorageWorkerBatch();
+        }
+        reportStorageDiagnostic('[storage] maintenance pause ended', {
+            reason,
+            deferredEntries,
+            deferredBytes,
+            queuedEntries: storageWorkerBatch.length,
+            inFlightBatches: storageWorkerInFlightBatches
+        });
+    }
     if (maintenancePauseDepth === 0 && pending.length > 0) scheduleFlush();
 }
 
@@ -927,6 +973,12 @@ export function withStorageMaintenance<T>(fn: () => T): T {
 function enqueueStorageWorkerBatch(entry: PendingEntry, estimatedBytes: number): void {
     if (storageWorkerFailure) {
         if (!storageWorkerFailureLogged) failStorageWorker(storageWorkerFailure);
+        return;
+    }
+    if (maintenancePauseDepth > 0) {
+        storageWorkerMaintenanceDeferredBatch.push(entry);
+        storageWorkerMaintenanceDeferredBytes += estimatedBytes;
+        updateStoragePressure();
         return;
     }
     storageWorkerBatch.push(entry);
@@ -1610,9 +1662,22 @@ export async function shutdownStorageAsync(): Promise<void> {
     storageAcceptingWrites = false;
     if (USE_STORAGE_WORKER) {
         clearStorageWorkerBatchTimer();
+        if (maintenancePauseDepth > 0) {
+            maintenancePauseDepth = 0;
+            postStorageWorker('resume', { reason: 'shutdown' });
+        }
+        if (storageWorkerMaintenanceDeferredBatch.length > 0) {
+            storageWorkerBatch.push(...storageWorkerMaintenanceDeferredBatch.splice(0));
+            storageWorkerBatchBytes += storageWorkerMaintenanceDeferredBytes;
+            storageWorkerMaintenanceDeferredBytes = 0;
+            updateStoragePressure();
+            flushStorageWorkerBatch();
+        }
         if (storageWorkerFailure) {
             storageWorkerBatch.splice(0, storageWorkerBatch.length);
             storageWorkerBatchBytes = 0;
+            storageWorkerMaintenanceDeferredBatch.splice(0);
+            storageWorkerMaintenanceDeferredBytes = 0;
             return;
         }
         if (storageWorker) {
@@ -1627,6 +1692,8 @@ export async function shutdownStorageAsync(): Promise<void> {
                 storageWorker = null;
                 storageWorkerBatch.splice(0, storageWorkerBatch.length);
                 storageWorkerBatchBytes = 0;
+                storageWorkerMaintenanceDeferredBatch.splice(0);
+                storageWorkerMaintenanceDeferredBytes = 0;
                 await worker?.terminate().catch(() => undefined);
                 rejectStorageWorkerRequests(new Error('storage worker shutdown'));
                 storageWorkerShuttingDown = false;

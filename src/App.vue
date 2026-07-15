@@ -32,7 +32,6 @@ const updater = useUpdater();
 useFocusFix();
 let teardownPluginHostBridge: (() => void) | null = null;
 let teardownAutoDeleteDone: (() => void) | null = null;
-let teardownStartupMaintenanceDone: (() => void) | null = null;
 let rendererDiagnosticsTimer: number | null = null;
 
 type StaticMainTab = 'messages' | 'history' | 'plugins';
@@ -109,18 +108,6 @@ onMounted(async () => {
     teardownAutoDeleteDone = window.api.onAutoDeleteDone((files) => {
         if (files > 0) toast.info(`已自动清理 ${files} 个过期日志文件`);
     });
-    teardownStartupMaintenanceDone = window.api.onStartupMaintenanceDone((result) => {
-        if (!result.success) {
-            toast.warning(result.message ? `后台维护失败：${result.message}` : '后台维护失败');
-            return;
-        }
-        if (result.kind === 'staleLogs' && (result.deletedDirs || result.deletedFiles)) {
-            toast.info(`已清理无效连接日志：${result.deletedDirs ?? 0} 个目录`);
-        }
-        if (result.kind === 'oldHistoryIndexes' && result.deletedFiles) {
-            toast.info(`已清理 ${result.deletedFiles} 个旧版历史索引文件`);
-        }
-    });
 });
 
 onBeforeUnmount(() => {
@@ -129,8 +116,6 @@ onBeforeUnmount(() => {
     teardownPluginHostBridge = null;
     teardownAutoDeleteDone?.();
     teardownAutoDeleteDone = null;
-    teardownStartupMaintenanceDone?.();
-    teardownStartupMaintenanceDone = null;
     if (rendererDiagnosticsTimer != null) {
         window.clearInterval(rendererDiagnosticsTimer);
         rendererDiagnosticsTimer = null;

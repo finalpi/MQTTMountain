@@ -1,6 +1,6 @@
 {
   "name": "mqttmountain",
-  "version": "1.0.42",
+  "version": "1.0.43",
   "description": "高性能 MQTT 客户端（Electron + Vue 3 + TS）",
   "main": "dist-electron/main/index.js",
   "author": "",
@@ -11,6 +11,7 @@
     "build:dir": "vue-tsc --noEmit && vite build && electron-builder --dir",
     "typecheck": "vue-tsc --noEmit",
     "test:history-fixtures": "electron scripts/history-fixtures.mjs",
+    "test:storage-maintenance": "electron scripts/storage-maintenance-race.mjs",
     "test:storage-shard": "electron scripts/storage-shard-smoke.mjs",
     "postinstall": "electron-builder install-app-deps",
     "rebuild": "electron-builder install-app-deps",
