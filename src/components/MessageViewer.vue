@@ -1094,7 +1094,7 @@ onUnmounted(() => {
                     >
                         <template #default="{ item: m }">
                             <div
-                                class="msg-card cv-auto"
+                                class="msg-card"
                                 @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                             >
                                 <div class="msg-head">
@@ -1563,11 +1563,6 @@ onUnmounted(() => {
         border: 1px solid var(--border);
         border-radius: 10px;
     }
-}
-
-.cv-auto {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 80px;
 }
 
 .history-footer {

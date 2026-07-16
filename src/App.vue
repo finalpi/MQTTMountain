@@ -58,6 +58,7 @@ function logRendererDiagnostics(): void {
     let decodedMessages = 0;
     let retainedPayloadChars = 0;
     for (const topic of bucket.topics.values()) topicBufferedMessages += topic.buf.length;
+    const selectedTopicView = bucket.selectedTopic ? bucket.topics.get(bucket.selectedTopic) : null;
     bucket.timeline.forEachReverse((row) => {
         retainedPayloadChars += row.payload.length;
         if (row.decoded) decodedMessages++;
@@ -66,6 +67,11 @@ function logRendererDiagnostics(): void {
         selectedConnectionId: selectedId,
         timelineMessages: bucket.timeline.length,
         topicBufferedMessages,
+        selectedTopic: bucket.selectedTopic,
+        selectedTopicBufferedMessages: selectedTopicView?.buf.length ?? 0,
+        selectedTopicLastTime: selectedTopicView?.lastTime ?? 0,
+        selectedTopicLastSeq: selectedTopicView?.lastSeq ?? 0,
+        topicsVersion: bucket.topicsVersion,
         decodedMessages,
         retainedPayloadMbApprox: Math.round(retainedPayloadChars * 2 / 1024 / 1024),
         topics: bucket.topics.size,

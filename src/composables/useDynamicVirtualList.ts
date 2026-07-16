@@ -277,6 +277,14 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     function handleItemsChanged(): void {
         const anchor = opts.stickToStart.value ? null : captureAnchorFrom(snapshotKeys, snapshotPrefix);
         pruneMeasurements();
+        if (opts.stickToStart.value) {
+            // Realtime lists can change again before the next animation frame.
+            // Updating the viewport/snapshot synchronously prevents a continuous
+            // message stream from indefinitely cancelling the pending restore.
+            updateViewport();
+            syncSnapshot();
+            return;
+        }
         scheduleRestore(anchor);
     }
 
