@@ -7,6 +7,7 @@ import { useFormatViewer } from '@/composables/useFormatViewer';
 import { useUiPrefs } from '@/composables/useUiPrefs';
 import DynamicVirtualList from '@/components/DynamicVirtualList.vue';
 import { highlight, normalize, type SearchLogic } from '@/utils/filter';
+import { isTextInputBusy, textInputBusyRemainingMs } from '@/utils/textInputActivity';
 import { formatTime, shortTime } from '@/utils/format';
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
 import type { HistoryIndexStatus, HistoryKeywordCondition, HistoryMessage, HistoryQueryDone } from '@shared/types';
@@ -78,13 +79,21 @@ const globalHistoryFallbackKeys = new Set<string>();
 let globalHistoryFallbackSeq = 0;
 
 let filterTimer: number | null = null;
-watch(filterConditions, (v) => {
+function scheduleFilterApply(): void {
     if (filterTimer != null) clearTimeout(filterTimer);
     filterTimer = window.setTimeout(() => {
-        activeFilterConditions.value = v.map((item) => ({ term: item.term, join: item.join }));
+        const busyRemaining = textInputBusyRemainingMs();
+        if (busyRemaining > 0) {
+            scheduleFilterApply();
+            return;
+        }
+        activeFilterConditions.value = filterConditions.value.map((item) => ({ term: item.term, join: item.join }));
         filterMatchCache.clear();
         highlightCache.clear();
-    }, 260);
+    }, 650);
+}
+watch(filterConditions, () => {
+    scheduleFilterApply();
 }, { deep: true });
 onUnmounted(() => { if (filterTimer != null) clearTimeout(filterTimer); });
 
@@ -926,8 +935,9 @@ watch(
 watch(
     () => [bucket.value.timelineVersion, bucket.value.topicsVersion, bucket.value.selectedTopic, viewMode.value, conn.selectedId] as const,
     async () => {
-        if (!autoFollow.value) return;
+        if (!autoFollow.value || isTextInputBusy()) return;
         await nextTick();
+        if (isTextInputBusy()) return;
         currentVirtual()?.scrollToTop(false);
     }
 );

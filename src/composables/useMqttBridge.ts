@@ -3,6 +3,12 @@ import { useConnectionStore, type ConnState } from '@/stores/connection';
 import { useMessageStore, type MsgRow } from '@/stores/messages';
 import { usePluginStore } from '@/stores/plugins';
 import { useParamMemory } from './useParamMemory';
+import {
+    installTextInputActivityTracking,
+    isTextInputBusy,
+    isTextInputFocused,
+    textInputBusyRemainingMs
+} from '@/utils/textInputActivity';
 import type { MqttMessage } from '@shared/types';
 import type { DecodedResult } from '@shared/plugin';
 
@@ -15,6 +21,7 @@ export function useMqttBridge() {
     let unsubState: (() => void) | null = null;
     let stopWatch: (() => void) | null = null;
     let stopActiveWatch: (() => void) | null = null;
+    let stopInputActivityTracking: (() => void) | null = null;
 
     const pending: MqttMessage[] = [];
     const decodePending: { connectionId: string; topic: string; row: MsgRow }[] = [];
@@ -27,26 +34,45 @@ export function useMqttBridge() {
     let activeHydrateToken = 0;
     let renderCostEma = 0;
     const RENDER_BATCH_LIMIT = 1000;
-    const RENDER_INPUT_BATCH_LIMIT = 300;
+    const RENDER_INPUT_BATCH_LIMIT = 120;
     const RENDER_BACKLOG_BATCH_LIMIT = 1600;
-    const RENDER_INPUT_DELAY_MS = 50;
+    const RENDER_INPUT_DELAY_MS = 120;
     const RENDER_SLOW_DELAY_MS = 50;
     const RENDER_BACKLOG_DELAY_MS = 80;
     const RENDER_PENDING_LIMIT = 12000;
     const DECODE_BATCH_LIMIT = 300;
-    const DECODE_INPUT_BATCH_LIMIT = 50;
-    const DECODE_INPUT_DELAY_MS = 80;
+    const DECODE_INPUT_BATCH_LIMIT = 30;
+    const DECODE_INPUT_DELAY_MS = 160;
     const DECODE_QUEUE_LIMIT = 3000;
-
-    function isTextInputActive(): boolean {
-        const el = document.activeElement;
-        if (!el) return false;
-        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
-        return el instanceof HTMLElement && el.isContentEditable;
-    }
+    let inputDeferredAt = 0;
+    let inputDeferredRenderCount = 0;
+    let lastInputProtectionLogAt = 0;
 
     function yieldToInput(): Promise<void> {
-        return new Promise((resolve) => window.setTimeout(resolve, isTextInputActive() ? 16 : 0));
+        return new Promise((resolve) => window.setTimeout(resolve, isTextInputFocused() ? 16 : 0));
+    }
+
+    function noteInputDeferral(): void {
+        inputDeferredRenderCount++;
+        if (inputDeferredAt === 0) inputDeferredAt = performance.now();
+    }
+
+    function logCompletedInputDeferral(): void {
+        if (inputDeferredAt === 0) return;
+        const now = performance.now();
+        const durationMs = Math.round(now - inputDeferredAt);
+        if (durationMs >= 300 && now - lastInputProtectionLogAt >= 30_000) {
+            lastInputProtectionLogAt = now;
+            console.info(`[renderer-diagnostics] ${JSON.stringify({
+                event: 'text-input-protection',
+                durationMs,
+                deferredRenderPasses: inputDeferredRenderCount,
+                pendingMessages: pending.length,
+                pendingDecodes: decodePending.length
+            })}`);
+        }
+        inputDeferredAt = 0;
+        inputDeferredRenderCount = 0;
     }
 
     function topicMatchesPattern(topic: string, pattern: string): boolean {
@@ -72,14 +98,16 @@ export function useMqttBridge() {
     }
 
     function adaptiveRenderDelay(): number {
-        if (isTextInputActive()) return RENDER_INPUT_DELAY_MS;
+        const busyRemaining = textInputBusyRemainingMs();
+        if (busyRemaining > 0) return Math.max(RENDER_INPUT_DELAY_MS, Math.ceil(busyRemaining));
+        if (isTextInputFocused()) return RENDER_INPUT_DELAY_MS;
         if (pending.length > RENDER_BATCH_LIMIT * 4) return RENDER_BACKLOG_DELAY_MS;
         if (renderCostEma > 12) return RENDER_SLOW_DELAY_MS;
         return 0;
     }
 
     function adaptiveRenderLimit(): number {
-        if (isTextInputActive()) return RENDER_INPUT_BATCH_LIMIT;
+        if (isTextInputFocused()) return RENDER_INPUT_BATCH_LIMIT;
         if (pending.length > RENDER_BATCH_LIMIT * 4) return RENDER_BACKLOG_BATCH_LIMIT;
         return RENDER_BATCH_LIMIT;
     }
@@ -123,24 +151,32 @@ export function useMqttBridge() {
 
     function scheduleDecode(): void {
         if (decoding || decodeTimer != null || decodePending.length === 0) return;
+        const busyRemaining = textInputBusyRemainingMs();
         decodeTimer = window.setTimeout(() => {
             decodeTimer = null;
             void runDecodeQueue();
-        }, isTextInputActive() ? DECODE_INPUT_DELAY_MS : 0);
+        }, busyRemaining > 0
+            ? Math.max(DECODE_INPUT_DELAY_MS, Math.ceil(busyRemaining))
+            : isTextInputFocused() ? DECODE_INPUT_DELAY_MS : 0);
     }
 
     async function runDecodeQueue(): Promise<void> {
         if (decoding || decodePending.length === 0) return;
+        if (isTextInputBusy()) {
+            scheduleDecode();
+            return;
+        }
         decoding = true;
         const generation = decodeGeneration;
         try {
             while (decodePending.length > 0 && generation === decodeGeneration) {
+                if (isTextInputBusy()) break;
                 const selectedConnection = conn.selectedId;
                 if (!selectedConnection) {
                     decodePending.length = 0;
                     return;
                 }
-                const decodeLimit = isTextInputActive() ? DECODE_INPUT_BATCH_LIMIT : DECODE_BATCH_LIMIT;
+                const decodeLimit = isTextInputFocused() ? DECODE_INPUT_BATCH_LIMIT : DECODE_BATCH_LIMIT;
                 const batch = decodePending
                     .splice(0, decodeLimit)
                     .filter((item) => item.connectionId === selectedConnection);
@@ -165,6 +201,12 @@ export function useMqttBridge() {
 
     async function flush(): Promise<void> {
         if (flushing || pending.length === 0) return;
+        if (isTextInputBusy()) {
+            noteInputDeferral();
+            schedule();
+            return;
+        }
+        logCompletedInputDeferral();
         const startedAt = performance.now();
         flushing = true;
         try {
@@ -201,6 +243,11 @@ export function useMqttBridge() {
         if (delay > 0) {
             renderTimer = window.setTimeout(() => {
                 renderTimer = null;
+                if (isTextInputBusy()) {
+                    noteInputDeferral();
+                    schedule();
+                    return;
+                }
                 rafId = requestAnimationFrame(async () => {
                     rafId = null;
                     await flush();
@@ -215,6 +262,7 @@ export function useMqttBridge() {
     }
 
     function start(): void {
+        stopInputActivityTracking = installTextInputActivityTracking();
         unsubMsg = window.api.onMqttMessages((batch) => {
             if (!batch.length) return;
             if (import.meta.env.DEV) {
@@ -275,6 +323,8 @@ export function useMqttBridge() {
         stopWatch = null;
         stopActiveWatch?.();
         stopActiveWatch = null;
+        stopInputActivityTracking?.();
+        stopInputActivityTracking = null;
         window.api.mqttSetActiveConnection({ connectionId: null });
         activeHydrateToken++;
         decodeGeneration++;
