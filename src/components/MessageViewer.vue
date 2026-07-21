@@ -847,7 +847,11 @@ function unfreezeVisibleOrder(): void {
     unfreezeSelectedMessageOrder();
 }
 
-function onUserScrollIntent(): void {
+function onUserScrollIntent(intent: 'toward-start' | 'toward-end' | 'direct'): void {
+    const el = currentScroll();
+    // 消息按新到旧排列，顶部就是最新位置。在顶部继续向上滚不代表用户
+    // 想离开实时消息，保持跟随可避免按钮错误切换成“已暂停”。
+    if (intent === 'toward-start' && (el?.scrollTop ?? 0) <= 4) return;
     if (autoFollow.value) {
         freezeVisibleOrder();
         autoFollow.value = false;

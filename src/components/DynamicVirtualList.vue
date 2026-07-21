@@ -23,7 +23,7 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
     scroll: [metrics: { scrollTop: number; clientHeight: number; scrollHeight: number }];
-    userInteraction: [];
+    userInteraction: [intent: 'toward-start' | 'toward-end' | 'direct'];
 }>();
 
 const containerRef = ref<HTMLElement | null>(null);
@@ -70,8 +70,13 @@ function onScroll(): void {
     scheduleEmitScroll();
 }
 
-function onUserInteraction(): void {
-    emit('userInteraction');
+function onWheel(event: WheelEvent): void {
+    if (event.deltaY < 0) emit('userInteraction', 'toward-start');
+    else if (event.deltaY > 0) emit('userInteraction', 'toward-end');
+}
+
+function onDirectUserInteraction(): void {
+    emit('userInteraction', 'direct');
 }
 
 function rowStyle(row: DynamicVirtualRow<T>): Record<string, string> {
@@ -183,9 +188,9 @@ defineExpose({
         ref="containerRef"
         class="dynamic-virtual-list"
         @scroll.passive="onScroll"
-        @wheel.passive="onUserInteraction"
-        @pointerdown="onUserInteraction"
-        @touchstart.passive="onUserInteraction"
+        @wheel.passive="onWheel"
+        @pointerdown="onDirectUserInteraction"
+        @touchstart.passive="onDirectUserInteraction"
     >
         <div v-if="items.length === 0 && empty" class="empty">{{ empty }}</div>
         <div class="dynamic-virtual-spacer" :style="{ height: virtual.totalHeight.value + verticalPadding * 2 + 'px' }">
