@@ -102,6 +102,7 @@ const normalizedFilterConditions = computed(() => activeFilterConditions.value
     .map((item) => ({ join: item.join, term: normalize(item.term.trim()) }))
     .filter((item) => item.term));
 const hasActiveFilter = computed(() => normalizedFilterConditions.value.length > 0);
+const hasNegativeFilter = computed(() => normalizedFilterConditions.value.some((item) => item.join === 'not'));
 const activeFilterKey = computed(() => JSON.stringify(activeHistoryConditions()));
 const filterMatchCache = new Map<string, { key: string; value: boolean }>();
 const highlightCache = new Map<string, { key: string; value: string }>();
@@ -195,7 +196,10 @@ const liveTopicList = computed<TopicView[]>(() => {
     const all: TopicView[] = [];
     for (const v of b.topics.values()) {
         if (hasActiveFilter.value) {
-            let hit = matchesFilterConditions(v.topic);
+            // 左侧主题和右侧消息必须使用同一套最终命中语义。没有缓存消息的
+            // 主题不展示；存在“非”条件时，主题名命中也不能证明消息内容未被排除。
+            if (v.buf.length === 0) continue;
+            let hit = !hasNegativeFilter.value && matchesFilterConditions(v.topic);
             if (!hit) {
                 v.buf.forEachReverse((m) => {
                     if (matchesFilterConditions(m.topic + m.payload)) {
@@ -303,23 +307,18 @@ const liveSelectedTopicMessages = computed<MsgRow[]>(() => {
     return rows;
 });
 
-const frozenSelectedMessageOrder = ref<string[]>([]);
+const frozenSelectedMessages = ref<MsgRow[] | null>(null);
 const selectedTopicMessages = computed<MsgRow[]>(() => {
     const live = liveSelectedTopicMessages.value;
-    if (autoFollow.value || frozenSelectedMessageOrder.value.length === 0) return live;
-    const byKey = new Map(live.map((item, index) => [messageRenderKey(item), { item, index }]));
-    const out: MsgRow[] = [];
-    for (const key of frozenSelectedMessageOrder.value) {
-        const hit = byKey.get(key);
-        if (!hit) continue;
-        out.push(hit.item);
-        byKey.delete(key);
+    const frozen = frozenSelectedMessages.value;
+    if (autoFollow.value || frozen == null) return live;
+    // 暂停时保留行引用而不是只保留 key，避免环形缓冲淘汰旧行后右侧逐渐变空。
+    const out = frozen.slice();
+    const seen = new Set(out.map(messageDedupeKey));
+    for (const item of live) {
+        if (item.seq >= 0 || seen.has(messageDedupeKey(item))) continue;
+        out.push(item);
     }
-    const loadedHistory = [...byKey.values()]
-        .filter((hit) => hit.item.seq < 0)
-        .sort((a, b) => a.index - b.index)
-        .map((hit) => hit.item);
-    out.push(...loadedHistory);
     return out;
 });
 
@@ -826,7 +825,7 @@ function freezeTopicOrder(): void {
 }
 
 function freezeSelectedMessageOrder(): void {
-    frozenSelectedMessageOrder.value = liveSelectedTopicMessages.value.map(messageRenderKey);
+    frozenSelectedMessages.value = liveSelectedTopicMessages.value.slice();
 }
 
 function freezeVisibleOrder(): void {
@@ -839,7 +838,7 @@ function unfreezeTopicOrder(): void {
 }
 
 function unfreezeSelectedMessageOrder(): void {
-    frozenSelectedMessageOrder.value = [];
+    frozenSelectedMessages.value = null;
 }
 
 function unfreezeVisibleOrder(): void {
@@ -929,6 +928,8 @@ watch(
             selectedTopicHistoryIndexStatusConnectionId.value = conn.selectedId;
         }
         resetSelectedTopicHistory();
+        // 暂停状态下切换主题或筛选条件时，旧主题的冻结快照不能继续复用。
+        if (!autoFollow.value) freezeSelectedMessageOrder();
         await nextTick();
         topicVirtualRef.value?.resetMeasurements(true);
         void backfillGlobalHistoryWhenRealtimeEmpty();
