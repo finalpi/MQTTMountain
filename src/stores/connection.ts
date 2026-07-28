@@ -35,13 +35,6 @@ function normalizeDisabledTopics(disabledTopics: unknown): string[] {
     return result;
 }
 
-function connectionEndpointKey(raw: Pick<ConnectionConfig, 'username' | 'host' | 'port'>): string {
-    const username = String(raw.username ?? '').trim().toLowerCase();
-    const host = String(raw.host ?? '').trim().toLowerCase();
-    const port = Number(raw.port) || 0;
-    return `${username}@${host}:${port}`;
-}
-
 export function normalizeConnectionConfig(raw: Partial<ConnectionConfig>): ConnectionConfig {
     return {
         id: String(raw.id ?? randomId()),
@@ -61,33 +54,21 @@ export function normalizeConnectionConfig(raw: Partial<ConnectionConfig>): Conne
 }
 
 function normalizeConnectionList(connections: ConnectionConfig[]): ConnectionConfig[] {
-    const merged = new Map<string, ConnectionConfig>();
+    const seenIds = new Set<string>();
+    const normalized: ConnectionConfig[] = [];
     for (const item of connections) {
         const current = normalizeConnectionConfig(item);
-        const key = connectionEndpointKey(current);
-        const existing = merged.get(key);
-        if (!existing) {
-            merged.set(key, current);
-            continue;
+        let id = current.id.trim();
+        if (!id || seenIds.has(id)) {
+            do {
+                id = randomId();
+            } while (seenIds.has(id));
+            current.id = id;
         }
-
-        merged.set(key, {
-            ...existing,
-            name: existing.name || current.name,
-            protocol: existing.protocol || current.protocol,
-            host: existing.host || current.host,
-            port: existing.port || current.port,
-            path: existing.path || current.path,
-            username: existing.username || current.username,
-            password: existing.password || current.password,
-            clientId: existing.clientId || current.clientId,
-            subscriptions: normalizeSubscriptions([...existing.subscriptions, ...current.subscriptions]),
-            disabledTopics: normalizeDisabledTopics([...existing.disabledTopics, ...current.disabledTopics]),
-            createdAt: Math.min(existing.createdAt, current.createdAt),
-            updatedAt: Math.max(existing.updatedAt, current.updatedAt)
-        });
+        seenIds.add(id);
+        normalized.push(current);
     }
-    return [...merged.values()];
+    return normalized;
 }
 
 export const useConnectionStore = defineStore('connection', () => {
@@ -160,20 +141,34 @@ export const useConnectionStore = defineStore('connection', () => {
         persist();
     }
 
-    function duplicate(id: string): ConnectionConfig | null {
+    async function duplicate(id: string): Promise<ConnectionConfig | null> {
         const src = list.value.find((c) => c.id === id);
         if (!src) return null;
+        const previousSelectedId = selectedId.value;
+        const previousDirty = dirty.value;
         const copy: ConnectionConfig = {
             ...src,
             id: randomId(),
             name: src.name + ' · 副本',
+            clientId: randomClientId(),
+            subscriptions: src.subscriptions.map((subscription) => ({ ...subscription })),
+            disabledTopics: [...src.disabledTopics],
             createdAt: Date.now(),
             updatedAt: Date.now()
         };
         list.value.push(copy);
         selectedId.value = copy.id;
-        persist();
-        return copy;
+        dirty.value = true;
+        try {
+            await persist();
+            return copy;
+        } catch (error) {
+            const copyIndex = list.value.findIndex((connection) => connection.id === copy.id);
+            if (copyIndex >= 0) list.value.splice(copyIndex, 1);
+            selectedId.value = previousSelectedId;
+            dirty.value = previousDirty;
+            throw error;
+        }
     }
 
     function update(id: string, patch: Partial<ConnectionConfig>): void {

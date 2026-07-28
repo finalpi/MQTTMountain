@@ -143,9 +143,14 @@ function removeConn(id: string): void {
     conn.remove(id);
 }
 
-function duplicateConn(id: string): void {
-    const c = conn.duplicate(id);
-    if (c) toast.success('已复制连接：' + c.name);
+async function duplicateConn(id: string): Promise<void> {
+    try {
+        const c = await conn.duplicate(id);
+        if (c) toast.success('已复制连接：' + c.name);
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toast.error('复制连接失败：' + message);
+    }
 }
 
 async function exportConfigs(): Promise<void> {
