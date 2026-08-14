@@ -231,6 +231,21 @@ const liveTopicList = computed<TopicView[]>(() => {
     return all;
 });
 
+let retainedConnectionId: string | null = null;
+watchEffect(() => {
+    const connectionId = conn.selectedId;
+    if (retainedConnectionId && retainedConnectionId !== connectionId) {
+        msg.setRetainedTopics(retainedConnectionId, []);
+    }
+    retainedConnectionId = connectionId;
+    if (!connectionId) return;
+    const topics = hasActiveFilter.value ? liveTopicList.value.map((item) => item.topic) : [];
+    msg.setRetainedTopics(connectionId, topics);
+});
+onUnmounted(() => {
+    if (retainedConnectionId) msg.setRetainedTopics(retainedConnectionId, []);
+});
+
 const frozenTopicOrder = ref<string[]>([]);
 const topicList = computed<TopicView[]>(() => {
     const live = liveTopicList.value;

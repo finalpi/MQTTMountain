@@ -37,6 +37,9 @@ const MESSAGE_PROCESS_INTERVAL_MS = 8;
 const MESSAGE_PROCESS_BATCH = 1000;
 const MESSAGE_PROCESS_QUEUE_HARD = 100_000;
 const MQTT_OPERATION_TIMEOUT_MS = 10_000;
+// 部分现场 Broker/四层代理约 20 秒未收到客户端上行包就会断链。
+// MQTT.js 默认 60 秒保活会导致连接周期性进入 reconnecting，缩短后提前发送 PINGREQ。
+const MQTT_KEEPALIVE_SECONDS = 10;
 
 export class MqttService {
     private conns = new Map<string, ConnectionCtx>();
@@ -79,6 +82,7 @@ export class MqttService {
                 const opts: IClientOptions = {
                     clientId: p.clientId,
                     clean: true,
+                    keepalive: MQTT_KEEPALIVE_SECONDS,
                     connectTimeout: 5000,
                     reconnectPeriod: 4000,
                     protocolVersion: 4

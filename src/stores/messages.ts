@@ -45,6 +45,8 @@ export interface MsgBucket {
     topicsVersion: number;
     topicOrder: string[];
     selectedTopic: string | null;
+    /** 当前过滤结果需要优先保留的主题；选中主题始终自动保留。 */
+    retainedTopics: Set<string>;
     paused: boolean;
     receiveCount: number;
     publishCount: number;
@@ -68,6 +70,7 @@ export const useMessageStore = defineStore('messages', () => {
             topicsVersion: 0,
             topicOrder: [],
             selectedTopic: null,
+            retainedTopics: markRaw(new Set<string>()),
             paused: false,
             receiveCount: 0,
             publishCount: 0,
@@ -104,7 +107,21 @@ export const useMessageStore = defineStore('messages', () => {
     }
 
     function detachTimelineRow(b: MsgBucket, row: MsgRow): void {
+        if (b.selectedTopic === row.topic || b.retainedTopics.has(row.topic)) return;
         b.topics.get(row.topic)?.buf.shiftIf(row);
+    }
+
+    function rebuildTopicFromTimeline(b: MsgBucket, topic: string): void {
+        const v = b.topics.get(topic);
+        if (!v) return;
+        const rows: MsgRow[] = [];
+        b.timeline.forEachReverse((row) => {
+            if (row.topic !== topic) return;
+            rows.push(row);
+            if (rows.length >= maxPerTopic) return false;
+        });
+        v.buf.clear();
+        for (let i = rows.length - 1; i >= 0; i--) v.buf.push(rows[i]);
     }
 
     function pushTimelineRow(b: MsgBucket, row: MsgRow): void {
@@ -203,6 +220,7 @@ export const useMessageStore = defineStore('messages', () => {
         b.topicsVersion++;
         b.receiveCount = 0;
         b.selectedTopic = null;
+        b.retainedTopics.clear();
     }
 
     function clearTopic(connectionId: string, topic: string): void {
@@ -220,12 +238,41 @@ export const useMessageStore = defineStore('messages', () => {
         if (!b) return;
         if (b.topics.delete(topic)) b.topicsVersion++;
         b.topicOrder = b.topicOrder.filter((item) => item !== topic);
+        b.retainedTopics.delete(topic);
         if (b.selectedTopic === topic) b.selectedTopic = null;
     }
 
     function selectTopic(connectionId: string, topic: string | null): void {
         const b = bucketFor(connectionId);
+        const previous = b.selectedTopic;
         b.selectedTopic = topic;
+        if (previous && previous !== topic && !b.retainedTopics.has(previous)) {
+            rebuildTopicFromTimeline(b, previous);
+            b.topicsVersion++;
+        }
+    }
+
+    function setRetainedTopics(connectionId: string, topics: Iterable<string>): void {
+        const b = bucketFor(connectionId);
+        const next = new Set(topics);
+        let changed = next.size !== b.retainedTopics.size;
+        if (!changed) {
+            for (const topic of next) {
+                if (!b.retainedTopics.has(topic)) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!changed) return;
+
+        const removed = [...b.retainedTopics].filter((topic) => !next.has(topic));
+        b.retainedTopics.clear();
+        for (const topic of next) b.retainedTopics.add(topic);
+        for (const topic of removed) {
+            if (topic !== b.selectedTopic) rebuildTopicFromTimeline(b, topic);
+        }
+        if (removed.length > 0) b.topicsVersion++;
     }
 
     function setTopicDisabled(connectionId: string, topic: string, disabled: boolean): void {
@@ -354,6 +401,7 @@ export const useMessageStore = defineStore('messages', () => {
         clearTopic,
         removeTopic,
         selectTopic,
+        setRetainedTopics,
         setTopicDisabled,
         reorderTopic,
         setTopicPinned,
