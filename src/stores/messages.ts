@@ -59,6 +59,7 @@ export const useMessageStore = defineStore('messages', () => {
     let maxPerTopic = 500;
     let localSeqGen = 0;
     const nextSeq = (): number => ++localSeqGen;
+    const displayClearTimes = new Map<string, number>();
 
     const buckets = reactive(new Map<string, MsgBucket>()) as Map<string, MsgBucket>;
 
@@ -223,6 +224,12 @@ export const useMessageStore = defineStore('messages', () => {
         b.retainedTopics.clear();
     }
 
+    /** 用户清屏只建立显示基线，本地历史仍可在历史查询中访问。 */
+    function clearDisplay(connectionId: string): void {
+        clearAll(connectionId);
+        displayClearTimes.set(connectionId, Date.now());
+    }
+
     function clearTopic(connectionId: string, topic: string): void {
         const b = buckets.get(connectionId);
         if (!b) return;
@@ -372,8 +379,11 @@ export const useMessageStore = defineStore('messages', () => {
 
     async function hydrate(connectionId: string, rows: { topic: string; payload: string; time: number }[], decodedBatch?: (DecodedResult | null)[]): Promise<void> {
         if (!connectionId || !rows.length) return;
+        const clearedAt = displayClearTimes.get(connectionId) ?? 0;
+        const visibleRows = clearedAt > 0 ? rows.filter((row) => row.time > clearedAt) : rows;
+        if (!visibleRows.length) return;
         const b = bucketFor(connectionId);
-        const ordered = rows.slice().sort((a, b2) => a.time - b2.time);
+        const ordered = visibleRows.slice().sort((a, b2) => a.time - b2.time);
         const decodedByKey = buildDecodedByKey(rows, decodedBatch);
         const chunkSize = 100;
         for (let i = 0; i < ordered.length; i += chunkSize) {
@@ -384,9 +394,10 @@ export const useMessageStore = defineStore('messages', () => {
         }
     }
 
-    /** 关闭连接（或删除配置）时清掉桶 */
-    function dropBucket(connectionId: string): void {
+    /** 删除连接配置时清掉 bucket；普通断开保留离线查看和暂停状态。 */
+    function dropBucket(connectionId: string, forgetDisplayClear = false): void {
         buckets.delete(connectionId);
+        if (forgetDisplayClear) displayClearTimes.delete(connectionId);
     }
 
     return {
@@ -398,6 +409,7 @@ export const useMessageStore = defineStore('messages', () => {
         applyDecodedRows,
         hydrate,
         clearAll,
+        clearDisplay,
         clearTopic,
         removeTopic,
         selectTopic,

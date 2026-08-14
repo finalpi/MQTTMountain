@@ -21,10 +21,8 @@ const { prefs } = useUiPrefs();
 /** 当前 selected 的连接对应的 bucket（每个连接独立） */
 const bucket = computed(() => msg.bucketFor(conn.selectedId));
 
-/** 是否展示消息视图：当前 selected 的连接已 connected（或有历史缓存） */
-const hasActiveBucket = computed(() => !!conn.selectedId && msg.hasBucket(conn.selectedId));
-const isConnected = computed(() => conn.selectedState === 'connected' || conn.selectedState === 'reconnecting');
-const showView = computed(() => isConnected.value || hasActiveBucket.value);
+/** 只要选中了连接配置，离线时也允许查看消息并切换暂停/恢复。 */
+const showView = computed(() => !!conn.selectedId);
 
 const placeholderTip = computed(() => {
     if (!conn.selectedId) return { emoji: '🔌', title: '还没有选择连接', desc: '请在「📡 连接管理」中选择或新建一个连接' };
@@ -718,7 +716,7 @@ function clearAll(): void {
     const cid = conn.selectedId;
     if (!cid) return;
     if (!confirm('清空当前连接当前显示的 MQTT 消息？本地历史日志不会删除。')) return;
-    msg.clearAll(cid);
+    msg.clearDisplay(cid);
     resetSelectedTopicHistory();
     toast.success('已清屏');
 }
@@ -727,7 +725,7 @@ async function clearLocalLogs(): Promise<void> {
     const cid = conn.selectedId;
     if (!cid) return;
     if (!confirm('删除当前连接的本地历史日志？当前显示也会清空，删除后无法从历史查询找回。')) return;
-    msg.clearAll(cid);
+    msg.clearDisplay(cid);
     resetSelectedTopicHistory();
     await window.api.mqttClearLogs(cid);
     toast.success('已删除本地历史日志');

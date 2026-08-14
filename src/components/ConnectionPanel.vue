@@ -85,6 +85,8 @@ async function doConnect(): Promise<void> {
             conn.setState(c.id, 'error', r.message);
             return;
         }
+        const displayPaused = msg.bucketFor(c.id).paused;
+        await window.api.mqttSetDisplayPaused({ connectionId: c.id, paused: displayPaused });
         resetSubs(c.id);
         await syncSubs(c, true);
         if (attemptToken !== connectAttemptToken) return;
@@ -105,9 +107,10 @@ async function doConnect(): Promise<void> {
 
 async function hydrateRecentMessages(connectionId: string): Promise<void> {
     const token = ++recentHydrateToken;
-    msg.clearAll(connectionId);
+    if (msg.bucketFor(connectionId).paused) return;
     const recent = await window.api.mqttReadRecent({ connectionId, limit: 300 });
-    if (token !== recentHydrateToken || conn.selectedId !== connectionId) return;
+    if (token !== recentHydrateToken || conn.selectedId !== connectionId || msg.bucketFor(connectionId).paused) return;
+    msg.clearAll(connectionId);
     if (!recent.success || !recent.data?.length) return;
     await msg.hydrate(connectionId, recent.data);
 }
@@ -122,7 +125,6 @@ async function doDisconnect(): Promise<void> {
     await window.api.mqttDisconnect(c.id);
     conn.setState(c.id, 'closed');
     resetSubs(c.id);
-    msg.dropBucket(c.id);
     toast.info(`已断开：${label}`);
 }
 
@@ -139,7 +141,7 @@ function selectConn(id: string): void {
 function removeConn(id: string): void {
     if (!confirm('确定删除这个连接配置？')) return;
     window.api.mqttDisconnect(id);
-    msg.dropBucket(id);
+    msg.dropBucket(id, true);
     conn.remove(id);
 }
 
