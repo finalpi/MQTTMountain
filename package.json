@@ -1,6 +1,6 @@
 {
   "name": "mqttmountain",
-  "version": "1.0.50",
+  "version": "1.0.51",
   "description": "高性能 MQTT 客户端（Electron + Vue 3 + TS）",
   "main": "dist-electron/main/index.js",
   "author": "",
@@ -64,7 +64,8 @@
         {
           "target": "nsis",
           "arch": [
-            "x64"
+            "x64",
+            "ia32"
           ]
         }
       ],

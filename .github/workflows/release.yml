@@ -94,7 +94,7 @@ jobs:
               shell: bash
               run: |
                   for i in 1 2 3; do
-                    npx electron-builder --win --publish never && exit 0
+                    npx electron-builder --win --x64 --ia32 --publish never && exit 0
                     echo "Package attempt $i failed; retrying..."
                     sleep 20
                   done
