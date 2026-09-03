@@ -48,7 +48,7 @@ If MQTTMountain uses a custom log directory, pass it explicitly:
 
 `mqttmountain_query_history` uses MQTTMountain's per-day `history_messages` index when a day database has a complete index. If an index is missing or incomplete, the tool automatically falls back to decoding the original `buckets` table, so old logs still work.
 
-Version 0.1.6 supports both legacy uncompressed buckets and the v6 `MMZ1` compressed bucket format used by current hourly shards.
+Version 0.1.7 supports both legacy uncompressed buckets and the v6 `MMZ1` compressed bucket format used by current hourly shards.
 
 Time values use Unix timestamps in milliseconds:
 
@@ -89,8 +89,21 @@ Advanced conditions take precedence over `keyword` and `keywords`:
 }
 ```
 
-Use `offset` with `limit` for pagination. `order` can be `desc` or `asc`.
+Use `offset` with `limit` for pagination. `order` can be `desc` or `asc`. When no connection is selected,
+results are merged across connections before global ordering and pagination. The merge keeps one streaming
+candidate per connection, so deep offsets are traversed once and do not allocate
+`connections × (offset + limit)` result arrays. Indexed rows skipped by pagination do not load payload blobs.
+
+History-reading tools also accept `timeoutMs` (100–120000; default 15000, or 60000 for exact status aggregation). Reads reuse one idle worker to
+avoid paying the SQLite/SDK startup cost on every call; overlapping reads use isolated workers. A timed-out
+or client-cancelled request terminates only its worker instead of blocking the MCP stdio server.
 
 ## Recent status and samples
 
 `mqttmountain_message_status` and `mqttmountain_payload_samples` accept `startTime` and `endTime`. If `startTime` is omitted, they use `minutes` as a lookback window ending at `endTime` or now. Their `keyword` search also ignores whitespace and is case-insensitive.
+
+Without a payload `keyword`, `mqttmountain_message_status` keeps exact window counts. Fully covered closed
+shards use `history_topic_stats` when its completion marker is present; boundary ranges and older databases
+fall back to the covering history index or bucket counts. Payload-keyword status searches use `scanLimit`
+(default 200, maximum 5000); their `total` and per-topic counts cover the newest scanned matches, and
+`truncated: true` means more matches may exist.

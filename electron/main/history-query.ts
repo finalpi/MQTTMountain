@@ -37,6 +37,10 @@ function shouldFlushForQuery(opts: HistoryQueryOptions): boolean {
 
 async function flushStorageForQuery(opts: HistoryQueryOptions): Promise<void> {
     if (!shouldFlushForQuery(opts)) return;
+    if (opts.freshness === 'strict') {
+        await flushStorageAsync();
+        return;
+    }
     let timeoutId: NodeJS.Timeout | null = null;
     try {
         await Promise.race([
@@ -61,8 +65,12 @@ function stopStream(requestId: string): void {
 
 function sendIfAlive(sender: WebContents, channel: string, payload: unknown): boolean {
     if (sender.isDestroyed()) return false;
-    sender.send(channel, payload);
-    return true;
+    try {
+        sender.send(channel, payload);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<HistoryMessage[]> {
@@ -102,9 +110,11 @@ export async function queryHistoryAsync(opts: HistoryQueryOptions): Promise<Hist
             });
 
             worker.once('exit', (code) => {
-                if (!settled && code !== 0) {
-                    reject(new Error(`查询任务异常退出（${code}）`));
-                }
+                if (settled) return;
+                settled = true;
+                reject(new Error(code === 0
+                    ? '查询任务已退出但未返回结果'
+                    : `查询任务异常退出（${code}）`));
             });
         }).finally(() => {
             void worker.terminate().catch(() => {});
@@ -118,6 +128,8 @@ async function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStrea
 
     const opts = req.opts || {};
     await flushStorageForQuery(opts);
+    const currentAfterFlush = activeStreams.get(req.requestId);
+    if (!currentAfterFlush || currentAfterFlush !== active || currentAfterFlush.cancelled) return;
 
     return await new Promise<void>((resolve, reject) => {
         const workerPath = path.join(__dirname, 'history-query-worker.js');
@@ -191,8 +203,9 @@ async function runHistoryQueryStream(sender: WebContents, req: HistoryQueryStrea
                 sendError(error.message);
                 reject(error);
             } else {
-                cleanup();
-                resolve();
+                const error = new Error('查询任务已退出但未返回结果');
+                sendError(error.message);
+                reject(error);
             }
         });
     });

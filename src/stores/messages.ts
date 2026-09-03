@@ -1,6 +1,8 @@
 import { defineStore } from 'pinia';
 import { markRaw, reactive } from 'vue';
 import { RingBuffer } from '@/utils/ringBuffer';
+import { filterRowsAfterClear, isRowAfterClear } from '@/utils/messageVisibility';
+import { recordRendererPerf } from '@/utils/rendererPerf';
 import type { MqttMessage } from '@shared/types';
 import type { DecodedResult } from '@shared/plugin';
 
@@ -41,12 +43,19 @@ export interface PublishHistoryItem {
 export interface MsgBucket {
     timeline: RingBuffer<MsgRow>;
     timelineVersion: number;
+    timelineRowsVersion: number;
+    /** 非追加式变化版本；供插件增量快照判断是否必须全量重置。 */
+    messageEpoch: number;
     topics: Map<string, TopicView>;
     topicsVersion: number;
     topicOrder: string[];
     selectedTopic: string | null;
     /** 当前过滤结果需要优先保留的主题；选中主题始终自动保留。 */
     retainedTopics: Set<string>;
+    /** 从连接配置恢复的禁用主题集合。 */
+    configuredDisabledTopics: Set<string>;
+    /** 单主题清屏基线，避免后续 hydration 把旧消息重新带回。 */
+    topicClearTimes: Map<string, number>;
     paused: boolean;
     receiveCount: number;
     publishCount: number;
@@ -67,11 +76,15 @@ export const useMessageStore = defineStore('messages', () => {
         return {
             timeline: markRaw(new RingBuffer<MsgRow>(maxMemoryMessages)),
             timelineVersion: 0,
+            timelineRowsVersion: 0,
+            messageEpoch: 0,
             topics: markRaw(new Map<string, TopicView>()),
             topicsVersion: 0,
             topicOrder: [],
             selectedTopic: null,
             retainedTopics: markRaw(new Set<string>()),
+            configuredDisabledTopics: markRaw(new Set<string>()),
+            topicClearTimes: markRaw(new Map<string, number>()),
             paused: false,
             receiveCount: 0,
             publishCount: 0,
@@ -96,20 +109,75 @@ export const useMessageStore = defineStore('messages', () => {
     }
 
     function setLimits(total: number, perTopic: number): void {
-        maxMemoryMessages = Math.max(100, total);
-        maxPerTopic = Math.max(50, perTopic);
+        maxMemoryMessages = Math.min(1_000_000, Math.max(100, Math.trunc(Number(total) || 100)));
+        maxPerTopic = Math.min(100_000, Math.max(50, Math.trunc(Number(perTopic) || 50)));
         for (const b of buckets.values()) {
+            const previousTimelineCapacity = b.timeline.capacity;
             const removed = b.timeline.setCapacity(maxMemoryMessages);
             for (const row of removed) detachTimelineRow(b, row);
             for (const v of b.topics.values()) v.buf.setCapacity(maxPerTopic);
+            capRetainedTopics(b);
+            pruneTopicMetadata(b);
             b.timelineVersion++;
+            b.timelineRowsVersion++;
+            if (previousTimelineCapacity !== b.timeline.capacity) b.messageEpoch++;
             b.topicsVersion++;
         }
     }
 
+    function retainedTopicLimit(): number {
+        // 被保护主题的行可能已经离开全局 timeline。限制保护集合后，额外保留的
+        // MsgRow 引用/载荷总量最多约等于一份全局 timeline。
+        return Math.max(1, Math.floor(maxMemoryMessages / Math.max(1, maxPerTopic)));
+    }
+
+    function capRetainedTopics(b: MsgBucket): void {
+        const limit = retainedTopicLimit();
+        if (b.retainedTopics.size <= limit) return;
+        const keep = [...b.retainedTopics]
+            .sort((a, b2) => (b.topics.get(b2)?.lastSeq ?? 0) - (b.topics.get(a)?.lastSeq ?? 0))
+            .slice(0, limit);
+        const keepSet = new Set(keep);
+        const removed = [...b.retainedTopics].filter((topic) => !keepSet.has(topic));
+        b.retainedTopics.clear();
+        for (const topic of keep) b.retainedTopics.add(topic);
+        for (const topic of removed) {
+            if (topic !== b.selectedTopic) rebuildTopicFromTimeline(b, topic);
+        }
+    }
+
+    function removeTopicMetadata(b: MsgBucket, topic: string): void {
+        b.topics.delete(topic);
+        b.topicOrder = b.topicOrder.filter((item) => item !== topic);
+    }
+
+    function recordTopicClear(b: MsgBucket, topic: string): void {
+        b.topicClearTimes.delete(topic);
+        b.topicClearTimes.set(topic, Date.now());
+        const limit = Math.max(1_000, Math.min(10_000, maxMemoryMessages));
+        while (b.topicClearTimes.size > limit) {
+            const oldest = b.topicClearTimes.keys().next().value;
+            if (oldest == null) break;
+            b.topicClearTimes.delete(oldest);
+        }
+    }
+
+    function pruneTopicMetadata(b: MsgBucket): void {
+        const removed = new Set<string>();
+        for (const [topic, view] of b.topics) {
+            if (view.buf.length > 0 || topic === b.selectedTopic || b.retainedTopics.has(topic) || view.pinned || view.disabled) continue;
+            b.topics.delete(topic);
+            removed.add(topic);
+        }
+        if (removed.size === 0) return;
+        b.topicOrder = b.topicOrder.filter((topic) => !removed.has(topic));
+        b.topicsVersion++;
+    }
+
     function detachTimelineRow(b: MsgBucket, row: MsgRow): void {
         if (b.selectedTopic === row.topic || b.retainedTopics.has(row.topic)) return;
-        b.topics.get(row.topic)?.buf.shiftIf(row);
+        const view = b.topics.get(row.topic);
+        view?.buf.shiftIf(row);
     }
 
     function rebuildTopicFromTimeline(b: MsgBucket, topic: string): void {
@@ -139,7 +207,7 @@ export const useMessageStore = defineStore('messages', () => {
                 total: 0,
                 lastTime: 0,
                 lastSeq: 0,
-                disabled: false,
+                disabled: b.configuredDisabledTopics.has(topic),
                 pinned: false,
                 normTopic: topic.toLowerCase().replace(/\s+/gu, '')
             });
@@ -154,9 +222,11 @@ export const useMessageStore = defineStore('messages', () => {
         if (!connectionId || batch.length === 0) return [];
         const b = bucketFor(connectionId);
         if (b.paused) return []; // 该连接单独暂停显示
+        const displayClearedAt = displayClearTimes.get(connectionId) ?? 0;
         const rows: MsgRow[] = [];
         for (let i = 0; i < batch.length; i++) {
             const m = batch[i];
+            if (!isRowAfterClear(m, displayClearedAt, b.topicClearTimes.get(m.topic) ?? 0)) continue;
             const row: MsgRow = {
                 topic: m.topic,
                 payload: m.payload,
@@ -179,7 +249,7 @@ export const useMessageStore = defineStore('messages', () => {
                     total: 1,
                     lastTime: m.time,
                     lastSeq: row.seq,
-                    disabled: false,
+                    disabled: b.configuredDisabledTopics.has(m.topic),
                     pinned: false,
                     normTopic: m.topic.toLowerCase().replace(/\s+/gu, '')
                 });
@@ -188,8 +258,12 @@ export const useMessageStore = defineStore('messages', () => {
                 b.topicOrder.push(m.topic);
             }
         }
-        b.receiveCount += batch.length;
+        b.receiveCount += rows.length;
+        capRetainedTopics(b);
+        pruneTopicMetadata(b);
+        if (rows.length === 0) return rows;
         b.timelineVersion++;
+        b.timelineRowsVersion++;
         b.topicsVersion++;
         return rows;
     }
@@ -201,23 +275,27 @@ export const useMessageStore = defineStore('messages', () => {
         let changed = false;
         for (let i = 0; i < rows.length; i++) {
             const decoded = decodedBatch[i] ?? null;
-            if (!decoded) continue;
+            if (!decoded?.meta) continue;
             // The formatter decodes the selected message again when it opens. Keeping the
             // plugin's full tree/replyBlocks on every buffered row retained gigabytes of
             // renderer heap; reply correlation only needs the small meta object.
-            rows[i].decoded = decoded.meta ? { meta: decoded.meta } : null;
+            rows[i].decoded = { meta: decoded.meta };
             changed = true;
         }
         if (!changed) return;
+        // MsgRow 存在 markRaw 的环形缓冲中，必须显式触发依赖它的回执/详情计算。
+        b.timelineVersion++;
     }
 
     function clearAll(connectionId: string): void {
         const b = buckets.get(connectionId);
         if (!b) return;
         b.timeline.clear();
+        b.messageEpoch++;
         b.topics.clear();
         b.topicOrder = [];
         b.timelineVersion++;
+        b.timelineRowsVersion++;
         b.topicsVersion++;
         b.receiveCount = 0;
         b.selectedTopic = null;
@@ -228,25 +306,45 @@ export const useMessageStore = defineStore('messages', () => {
     function clearDisplay(connectionId: string): void {
         clearAll(connectionId);
         displayClearTimes.set(connectionId, Date.now());
+        const b = buckets.get(connectionId);
+        b?.topicClearTimes.clear();
     }
 
     function clearTopic(connectionId: string, topic: string): void {
         const b = buckets.get(connectionId);
         if (!b) return;
+        recordTopicClear(b, topic);
+        const removed = b.timeline.removeWhere((row) => row.topic === topic);
         const v = b.topics.get(topic);
-        if (!v) return;
-        v.buf.clear();
-        v.total = 0;
+        if (v) {
+            v.buf.clear();
+            v.total = 0;
+            v.lastTime = 0;
+            v.lastSeq = 0;
+        }
+        if (removed.length > 0) {
+            b.timelineVersion++;
+            b.timelineRowsVersion++;
+            b.messageEpoch++;
+        }
         b.topicsVersion++;
     }
 
     function removeTopic(connectionId: string, topic: string): void {
         const b = buckets.get(connectionId);
         if (!b) return;
-        if (b.topics.delete(topic)) b.topicsVersion++;
-        b.topicOrder = b.topicOrder.filter((item) => item !== topic);
+        recordTopicClear(b, topic);
+        const removed = b.timeline.removeWhere((row) => row.topic === topic);
+        const existed = b.topics.has(topic);
+        removeTopicMetadata(b, topic);
         b.retainedTopics.delete(topic);
         if (b.selectedTopic === topic) b.selectedTopic = null;
+        if (removed.length > 0) {
+            b.timelineVersion++;
+            b.timelineRowsVersion++;
+            b.messageEpoch++;
+        }
+        if (existed || removed.length > 0) b.topicsVersion++;
     }
 
     function selectTopic(connectionId: string, topic: string | null): void {
@@ -261,7 +359,10 @@ export const useMessageStore = defineStore('messages', () => {
 
     function setRetainedTopics(connectionId: string, topics: Iterable<string>): void {
         const b = bucketFor(connectionId);
-        const next = new Set(topics);
+        const candidates = [...new Set(topics)]
+            .filter((topic) => b.topics.has(topic))
+            .sort((a, b2) => (b.topics.get(b2)?.lastSeq ?? 0) - (b.topics.get(a)?.lastSeq ?? 0));
+        const next = new Set(candidates.slice(0, retainedTopicLimit()));
         let changed = next.size !== b.retainedTopics.size;
         if (!changed) {
             for (const topic of next) {
@@ -282,9 +383,25 @@ export const useMessageStore = defineStore('messages', () => {
         if (removed.length > 0) b.topicsVersion++;
     }
 
+    function setConfiguredDisabledTopics(connectionId: string, topics: Iterable<string>): void {
+        const b = bucketFor(connectionId);
+        const next = new Set(topics);
+        b.configuredDisabledTopics.clear();
+        for (const topic of next) b.configuredDisabledTopics.add(topic);
+        let changed = false;
+        for (const [topic, view] of b.topics) {
+            const disabled = next.has(topic);
+            if (view.disabled === disabled) continue;
+            view.disabled = disabled;
+            changed = true;
+        }
+        if (changed) b.topicsVersion++;
+    }
+
     function setTopicDisabled(connectionId: string, topic: string, disabled: boolean): void {
-        const b = buckets.get(connectionId);
-        if (!b) return;
+        const b = bucketFor(connectionId);
+        if (disabled) b.configuredDisabledTopics.add(topic);
+        else b.configuredDisabledTopics.delete(topic);
         const v = b.topics.get(topic);
         if (v) { v.disabled = disabled; b.topicsVersion++; }
     }
@@ -336,62 +453,125 @@ export const useMessageStore = defineStore('messages', () => {
         b.paused = paused;
     }
 
-    function buildDecodedByKey(
-        rows: { topic: string; payload: string; time: number }[],
-        decodedBatch?: (DecodedResult | null)[]
-    ): Map<string, DecodedResult | null> {
-        const decodedByKey = new Map<string, DecodedResult | null>();
-        if (!decodedBatch?.length) return decodedByKey;
-        for (let i = 0; i < rows.length; i++) {
-            const source = rows[i];
-            decodedByKey.set(`${source.time}:${source.topic}:${source.payload}`, decodedBatch[i] ?? null);
-        }
-        return decodedByKey;
+    type OccurrenceCounts = Map<number, Map<string, Map<string, number>>>;
+
+    function addOccurrence(counts: OccurrenceCounts, row: { topic: string; payload: string; time: number }): void {
+        let byTopic = counts.get(row.time);
+        if (!byTopic) counts.set(row.time, byTopic = new Map());
+        let byPayload = byTopic.get(row.topic);
+        if (!byPayload) byTopic.set(row.topic, byPayload = new Map());
+        byPayload.set(row.payload, (byPayload.get(row.payload) ?? 0) + 1);
     }
 
-    function appendHydrateChunk(
-        b: MsgBucket,
+    function consumeOccurrence(counts: OccurrenceCounts, row: { topic: string; payload: string; time: number }): boolean {
+        const byPayload = counts.get(row.time)?.get(row.topic);
+        const remaining = byPayload?.get(row.payload) ?? 0;
+        if (remaining <= 0) return false;
+        if (remaining === 1) byPayload!.delete(row.payload);
+        else byPayload!.set(row.payload, remaining - 1);
+        return true;
+    }
+
+    /** 按出现次数差额合并 recent；合法重复报文仍分别保留。 */
+    function mergeRecentSnapshot(
+        connectionId: string,
         rows: { topic: string; payload: string; time: number }[],
-        decodedByKey: Map<string, DecodedResult | null>,
-        start: number,
-        end: number
-    ): void {
-        for (let i = start; i < end; i++) {
-            const r = rows[i];
+        decodedBatch?: (DecodedResult | null)[]
+    ): MsgRow[] {
+        const startedAt = performance.now();
+        if (!connectionId || !rows.length) return [];
+        const b = bucketFor(connectionId);
+        if (b.paused) return [];
+        const visibleRows = filterRowsAfterClear(
+            rows.map((row, index) => ({ row, decoded: decodedBatch?.[index] ?? null, topic: row.topic, time: row.time })),
+            displayClearTimes.get(connectionId) ?? 0,
+            b.topicClearTimes
+        ).sort((a, b2) => a.time - b2.time);
+        if (!visibleRows.length || b.paused) return [];
+
+        const remainingExisting: OccurrenceCounts = new Map();
+        const currentTimeline = b.timeline.snapshot();
+        const existingRows = new Set<MsgRow>(currentTimeline);
+        for (const view of b.topics.values()) {
+            for (const row of view.buf.snapshot()) existingRows.add(row);
+        }
+        for (const row of existingRows) addOccurrence(remainingExisting, row);
+        const additions: MsgRow[] = [];
+        for (const item of visibleRows) {
+            const r = item.row;
+            if (consumeOccurrence(remainingExisting, r)) continue;
             const row: MsgRow = {
                 topic: r.topic,
                 payload: r.payload,
                 time: r.time,
                 seq: nextSeq(),
-                decoded: decodedByKey.get(`${r.time}:${r.topic}:${r.payload}`) ?? null
+                decoded: item.decoded
             };
-            pushTimelineRow(b, row);
-            const v = ensureTopic(b, r.topic);
-            v.buf.push(row);
-            v.total++;
-            v.lastTime = r.time;
-            v.lastSeq = row.seq;
+            additions.push(row);
         }
-        b.receiveCount += end - start;
+        if (!additions.length) {
+            recordRendererPerf('message.hydration-merge', performance.now() - startedAt, visibleRows.length);
+            return [];
+        }
+
+        const combined = [...currentTimeline, ...additions]
+            .sort((a, b2) => a.time - b2.time || a.seq - b2.seq)
+            .slice(-maxMemoryMessages);
+        b.timeline = markRaw(new RingBuffer<MsgRow>(maxMemoryMessages));
+        for (const row of combined) b.timeline.push(row);
+        const timelineRows = new Set(combined);
+
+        const additionsByTopic = new Map<string, MsgRow[]>();
+        for (const row of additions) {
+            const list = additionsByTopic.get(row.topic) ?? [];
+            list.push(row);
+            additionsByTopic.set(row.topic, list);
+        }
+        for (const [topic, topicAdditions] of additionsByTopic) {
+            const view = ensureTopic(b, topic);
+            const seen = new Set<MsgRow>();
+            const protectedTopic = topic === b.selectedTopic || b.retainedTopics.has(topic);
+            const ordered = [...view.buf.snapshot(), ...topicAdditions]
+                .filter((row) => {
+                    if (seen.has(row) || (!protectedTopic && !timelineRows.has(row))) return false;
+                    seen.add(row);
+                    return true;
+                })
+                .sort((a, b2) => a.time - b2.time || a.seq - b2.seq)
+                .slice(-maxPerTopic);
+            view.buf = markRaw(new RingBuffer<MsgRow>(maxPerTopic));
+            for (const row of ordered) view.buf.push(row);
+            view.total += topicAdditions.length;
+            const last = ordered[ordered.length - 1];
+            view.lastTime = last?.time ?? 0;
+            view.lastSeq = last?.seq ?? 0;
+        }
+        for (const [topic, view] of b.topics) {
+            if (additionsByTopic.has(topic) || topic === b.selectedTopic || b.retainedTopics.has(topic)) continue;
+            const kept = view.buf.snapshot().filter((row) => timelineRows.has(row));
+            if (kept.length === view.buf.length) continue;
+            view.buf = markRaw(new RingBuffer<MsgRow>(maxPerTopic));
+            for (const row of kept.slice(-maxPerTopic)) view.buf.push(row);
+        }
+
+        b.receiveCount += additions.length;
+        b.messageEpoch++;
+        capRetainedTopics(b);
+        pruneTopicMetadata(b);
         b.timelineVersion++;
+        b.timelineRowsVersion++;
         b.topicsVersion++;
+        recordRendererPerf('message.hydration-merge', performance.now() - startedAt, visibleRows.length);
+        return additions;
     }
 
-    async function hydrate(connectionId: string, rows: { topic: string; payload: string; time: number }[], decodedBatch?: (DecodedResult | null)[]): Promise<void> {
-        if (!connectionId || !rows.length) return;
-        const clearedAt = displayClearTimes.get(connectionId) ?? 0;
-        const visibleRows = clearedAt > 0 ? rows.filter((row) => row.time > clearedAt) : rows;
-        if (!visibleRows.length) return;
+    function isVisibleAtCurrentClearEpoch(connectionId: string, row: { topic: string; time: number }): boolean {
         const b = bucketFor(connectionId);
-        const ordered = visibleRows.slice().sort((a, b2) => a.time - b2.time);
-        const decodedByKey = buildDecodedByKey(rows, decodedBatch);
-        const chunkSize = 100;
-        for (let i = 0; i < ordered.length; i += chunkSize) {
-            appendHydrateChunk(b, ordered, decodedByKey, i, Math.min(i + chunkSize, ordered.length));
-            if (i + chunkSize < ordered.length) {
-                await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-            }
-        }
+        return isRowAfterClear(
+            row,
+            displayClearTimes.get(connectionId) ?? 0,
+            b.topicClearTimes.get(row.topic) ?? 0
+        );
     }
 
     /** 删除连接配置时清掉 bucket；普通断开保留离线查看和暂停状态。 */
@@ -407,13 +587,15 @@ export const useMessageStore = defineStore('messages', () => {
         setLimits,
         ingest,
         applyDecodedRows,
-        hydrate,
+        mergeRecentSnapshot,
+        isVisibleAtCurrentClearEpoch,
         clearAll,
         clearDisplay,
         clearTopic,
         removeTopic,
         selectTopic,
         setRetainedTopics,
+        setConfiguredDisabledTopics,
         setTopicDisabled,
         reorderTopic,
         setTopicPinned,

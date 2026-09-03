@@ -9,7 +9,78 @@ permissions:
     contents: write
 
 jobs:
+    validate:
+        runs-on: windows-latest
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  submodules: recursive
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 20
+                  cache: npm
+
+            - name: Install application dependencies
+              run: npm ci
+
+            - name: Install nested package dependencies
+              shell: pwsh
+              run: |
+                  npm ci --prefix packages/mqttmountain-mcp
+                  npm ci --prefix plugins/MQTTMountain-Shangyun-Plugin
+
+            - name: Typecheck application and plugin
+              shell: pwsh
+              run: |
+                  npm run typecheck
+                  npm run typecheck --prefix plugins/MQTTMountain-Shangyun-Plugin
+
+            - name: Build plugin and verify generated panel
+              shell: pwsh
+              run: |
+                  npm test --prefix plugins/MQTTMountain-Shangyun-Plugin
+                  npm run build --prefix plugins/MQTTMountain-Shangyun-Plugin
+                  git -C plugins/MQTTMountain-Shangyun-Plugin diff --exit-code -- panel
+
+            - name: Build testable Electron bundles
+              run: npx vite build
+
+            - name: Run storage regressions
+              shell: pwsh
+              run: |
+                  npm run test:history-fixtures
+                  npm run test:storage-fts-scheduler
+                  npm run test:storage-fts-cursor
+                  npm run test:storage-maintenance
+                  npm run test:storage-watermark
+                  npm run test:storage-shard
+                  npm run test:history-query-regressions
+                  npm run test:log-dir-safety
+                  npm run test:storage-corruption
+                  npm run test:mqtt-service
+                  npm run test:payload-codec
+                  npm run test:history-export-regressions
+                  npm run test:renderer-regressions
+
+            - name: Run performance invariants
+              shell: pwsh
+              run: |
+                  npm run bench:main-storage
+                  npm run bench:storage-batch
+                  npm run bench:storage-diagnostics
+                  npm run bench:diagnostic-writer
+                  npm run bench:storage-fts-pending
+                  npm run bench:log-dir
+                  npm run bench:renderer
+                  npm run bench:history-topic-stats
+
+            - name: Run MQTTMountain MCP tests
+              run: npm test --prefix packages/mqttmountain-mcp
+
     build:
+        needs: validate
         strategy:
             fail-fast: false
             matrix:
@@ -25,6 +96,8 @@ jobs:
 
         steps:
             - uses: actions/checkout@v4
+              with:
+                  submodules: recursive
 
             - uses: actions/setup-node@v4
               with:

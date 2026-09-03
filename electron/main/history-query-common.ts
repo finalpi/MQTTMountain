@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { HistoryKeywordJoin, HistoryQueryOptions } from '../../shared/types';
+import { isOwnedConnectionDirInRoot } from './log-root-safety';
 
 export const HISTORY_DB_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db$/u;
 export const HISTORY_DB_SIDECAR_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db(?:-wal|-shm)?$/u;
@@ -142,7 +143,9 @@ export function collectDayFiles(logRoot: string, opts: { connectionId?: string |
     const et = opts.endTime != null && opts.endTime > 0 ? opts.endTime : 8640000000000000;
     const sanFilter = opts.connectionId ? sanitizeConnectionId(opts.connectionId) : null;
     const dirs = fs.readdirSync(logRoot, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
+        .filter((d) => d.isDirectory()
+            && isOwnedConnectionDirInRoot(logRoot, path.join(logRoot, d.name))
+            && (!sanFilter || d.name === sanFilter));
     const files: DayFileEntry[] = [];
     for (const d of dirs) {
         const dir = path.join(logRoot, d.name);

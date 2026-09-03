@@ -8,6 +8,15 @@ const require = createRequire(import.meta.url);
 const { app } = require('electron');
 const Database = require('better-sqlite3');
 
+async function waitFor(predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`${label} timed out`);
+}
+
 function queryHistory(logRoot, opts) {
   const workerPath = path.resolve('dist-electron/main/history-query-worker.js');
   return new Promise((resolve, reject) => {
@@ -15,7 +24,7 @@ function queryHistory(logRoot, opts) {
     const timer = setTimeout(() => {
       void worker.terminate();
       reject(new Error('history query worker timed out'));
-    }, 15_000);
+    }, 30_000);
     worker.on('message', (message) => {
       if (message?.type === 'diagnostic') return;
       clearTimeout(timer);
@@ -86,11 +95,18 @@ async function run() {
   const workerPath = path.resolve('dist-electron/main/storage-worker.js');
   const expectedDb = path.join(logRoot, 'fixture', '2026-07-14-09.db');
   const rolloverLoadDb = path.join(logRoot, 'rollover-load', '2026-07-14-09.db');
-  const worker = new Worker(workerPath, { workerData: { logRoot } });
+  const worker = new Worker(workerPath, {
+    workerData: { logRoot },
+    env: {
+      ...process.env,
+      MQTTMOUNTAIN_CLOSED_FTS_INTERVAL_MS: '50',
+      MQTTMOUNTAIN_CLOSED_FTS_BATCH_ENTRIES: '500'
+    }
+  });
 
   try {
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('storage shard worker timed out')), 15_000);
+      const timer = setTimeout(() => reject(new Error('storage shard worker timed out')), 60_000);
       worker.on('message', async (message) => {
         if (message?.id === 1) {
           if (!message.ok) {
@@ -130,6 +146,17 @@ async function run() {
             reject(new Error(message.error || 'next-hour storage batch failed'));
             return;
           }
+          await waitFor(() => {
+            if (!fs.existsSync(expectedDb)) return false;
+            try {
+              const checkDb = new Database(expectedDb, { readonly: true, fileMustExist: true });
+              try {
+                return checkDb.prepare("SELECT value FROM history_index_meta WHERE key = 'topic_stats_complete'").get()?.value === '1';
+              } finally {
+                checkDb.close();
+              }
+            } catch { return false; }
+          }, 5_000, 'background topic stats finalization');
           worker.postMessage({
             id: 5,
             command: 'enqueueBatch',
@@ -183,12 +210,18 @@ async function run() {
     try {
       const row = db.prepare('SELECT COALESCE(SUM(count), 0) AS count FROM buckets').get();
       if (Number(row?.count) !== 2) throw new Error(`expected 2 committed messages, got ${row?.count}`);
-      const meta = Object.fromEntries(db.prepare("SELECT key, value FROM history_index_meta WHERE key IN ('schema_version', 'fts_layout', 'fts_query_mode', 'fts_index_complete', 'fts_indexed_id')").all().map((item) => [item.key, item.value]));
-      if (meta.schema_version !== '6' || meta.fts_layout !== 'contentless' || meta.fts_query_mode !== 'compact-trigram-candidates' || meta.fts_index_complete !== '1' || Number(meta.fts_indexed_id) !== 2) {
+      const meta = Object.fromEntries(db.prepare("SELECT key, value FROM history_index_meta WHERE key IN ('schema_version', 'fts_layout', 'fts_query_mode', 'fts_index_complete', 'fts_indexed_id', 'topic_stats_complete')").all().map((item) => [item.key, item.value]));
+      if (meta.schema_version !== '6' || meta.fts_layout !== 'contentless' || meta.fts_query_mode !== 'compact-trigram-candidates' || meta.fts_index_complete !== '1' || Number(meta.fts_indexed_id) !== 2 || meta.topic_stats_complete !== '1') {
         throw new Error(`unexpected deferred FTS metadata: ${JSON.stringify(meta)}`);
+      }
+      const topicStats = db.prepare("SELECT count, latest_time FROM history_topic_stats WHERE topic = 'a/b'").get();
+      if (Number(topicStats?.count) !== 2 || Number(topicStats?.latest_time) !== tsMs + 1) {
+        throw new Error(`unexpected finalized topic stats: ${JSON.stringify(topicStats)}`);
       }
       const columns = db.prepare('PRAGMA table_info(history_messages)').all().map((item) => item.name);
       if (columns.includes('search_text')) throw new Error('v6 history_messages unexpectedly retains search_text');
+      const pendingColumns = db.prepare('PRAGMA table_info(history_fts_pending)').all().map((item) => item.name);
+      if (pendingColumns.join(',') !== 'id') throw new Error(`v6 pending table unexpectedly persists search text: ${pendingColumns.join(',')}`);
       const pendingCount = Number(db.prepare('SELECT COUNT(*) AS count FROM history_fts_pending').get()?.count);
       if (pendingCount !== 0) throw new Error(`expected pending FTS text to be deleted, got ${pendingCount}`);
       const ftsSql = String(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'history_messages_fts'").get()?.sql || '').toLowerCase();
@@ -214,9 +247,11 @@ async function run() {
       const messageCount = Number(rolloverDb.prepare('SELECT COUNT(*) AS count FROM history_messages').get()?.count);
       const pendingFtsCount = Number(rolloverDb.prepare('SELECT COUNT(*) AS count FROM history_fts_pending').get()?.count);
       const finalizedAt = Number(rolloverDb.prepare("SELECT value FROM history_index_meta WHERE key = 'fts_finalized_at'").get()?.value || 0);
+      const topicStatsComplete = rolloverDb.prepare("SELECT value FROM history_index_meta WHERE key = 'topic_stats_complete'").get()?.value;
       if (messageCount !== 1500) throw new Error(`expected 1500 rollover load messages, got ${messageCount}`);
       if (pendingFtsCount <= 0) throw new Error('incomplete rollover shard unexpectedly has no deferred FTS rows');
       if (finalizedAt > 0) throw new Error('incomplete rollover shard was unexpectedly finalized synchronously');
+      if (topicStatsComplete === '1') throw new Error('open/incomplete rollover shard unexpectedly exposed complete topic stats');
     } finally {
       rolloverDb.close();
     }

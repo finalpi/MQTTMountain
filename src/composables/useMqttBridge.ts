@@ -11,6 +11,8 @@ import {
 } from '@/utils/textInputActivity';
 import type { MqttMessage } from '@shared/types';
 import type { DecodedResult } from '@shared/plugin';
+import { consumeHydrationCredit, createHydrationCredits, type HydrationCreditLedger } from '@/utils/hydrationCredits';
+import { recordRendererPerf } from '@/utils/rendererPerf';
 
 export function useMqttBridge() {
     const conn = useConnectionStore();
@@ -22,6 +24,7 @@ export function useMqttBridge() {
     let stopWatch: (() => void) | null = null;
     let stopActiveWatch: (() => void) | null = null;
     let stopInputActivityTracking: (() => void) | null = null;
+    let stopPluginWatch: (() => void) | null = null;
 
     const pending: MqttMessage[] = [];
     const decodePending: { connectionId: string; topic: string; row: MsgRow }[] = [];
@@ -32,6 +35,8 @@ export function useMqttBridge() {
     let decodeTimer: number | null = null;
     let decodeGeneration = 0;
     let activeHydrateToken = 0;
+    const hydrationCredits = new Map<string, HydrationCreditLedger>();
+    const decoderTopicCache = new Map<string, boolean>();
     let renderCostEma = 0;
     const RENDER_BATCH_LIMIT = 1000;
     const RENDER_INPUT_BATCH_LIMIT = 120;
@@ -88,13 +93,23 @@ export function useMqttBridge() {
     }
 
     function hasDecoderForTopic(topic: string): boolean {
+        const cached = decoderTopicCache.get(topic);
+        if (cached !== undefined) return cached;
+        let matched = false;
         for (const plugin of plugins.enabledPlugins) {
             if (!plugin.hasDecoder) continue;
             const patterns = plugin.manifest.topicPatterns;
-            if (!patterns?.length) return true;
-            if (patterns.some((pattern) => topicMatchesPattern(topic, pattern))) return true;
+            if (!patterns?.length || patterns.some((pattern) => topicMatchesPattern(topic, pattern))) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+        if (!decoderTopicCache.has(topic) && decoderTopicCache.size >= 20_000) {
+            const oldest = decoderTopicCache.keys().next().value;
+            if (oldest != null) decoderTopicCache.delete(oldest);
+        }
+        decoderTopicCache.set(topic, matched);
+        return matched;
     }
 
     function adaptiveRenderDelay(): number {
@@ -112,13 +127,35 @@ export function useMqttBridge() {
         return RENDER_BATCH_LIMIT;
     }
 
+    function drainPendingConnection(connectionId: string): void {
+        if (!pending.some((item) => item.connectionId === connectionId)) return;
+        const selected: MqttMessage[] = [];
+        const remaining: MqttMessage[] = [];
+        for (const item of pending) {
+            if (item.connectionId === connectionId) selected.push(item);
+            else remaining.push(item);
+        }
+        pending.length = 0;
+        pending.push(...remaining);
+        const rows = msg.ingest(connectionId, selected);
+        enqueueDecodeRows(connectionId, rows);
+    }
+
     async function hydrateActiveConnection(connectionId: string): Promise<void> {
         const token = ++activeHydrateToken;
-        const recent = await window.api.mqttReadRecent({ connectionId, limit: 300 });
-        if (token !== activeHydrateToken || conn.selectedId !== connectionId) return;
-        if (!recent.success || !recent.data?.length) return;
-        msg.clearAll(connectionId);
-        await msg.hydrate(connectionId, recent.data);
+        try {
+            const limit = Math.min(50_000, msg.bucketFor(connectionId).timeline.capacity);
+            const recent = await window.api.mqttReadRecent({ connectionId, limit });
+            if (token !== activeHydrateToken || conn.selectedId !== connectionId || msg.bucketFor(connectionId).paused) return;
+            if (!recent.success || !recent.data) return;
+            // 先把已抵达 renderer、但尚未 RAF flush 的同连接消息原子落入 store，
+            // 再按快照出现次数差额补齐，避免 pending 与 recent 重复。
+            drainPendingConnection(connectionId);
+            const additions = msg.mergeRecentSnapshot(connectionId, recent.data.rows);
+            hydrationCredits.set(connectionId, createHydrationCredits(recent.data.throughTime, additions));
+        } catch (error) {
+            if (import.meta.env.DEV) console.warn('[hydrate recent]', error);
+        }
     }
 
     function rememberDecodedParams(decodedBatch: (DecodedResult | null)[]): void {
@@ -181,9 +218,11 @@ export function useMqttBridge() {
                     .splice(0, decodeLimit)
                     .filter((item) => item.connectionId === selectedConnection);
                 if (batch.length === 0) continue;
+                const decodeStartedAt = performance.now();
                 const result = await window.api.pluginDecodeBatch(
                     batch.map((item) => ({ topic: item.topic, payload: item.row.payload }))
                 );
+                recordRendererPerf('mqtt.decode-batch', performance.now() - decodeStartedAt, batch.length);
                 if (generation !== decodeGeneration) return;
                 if (!result.success || !result.data) continue;
                 const decodedBatch = batch.map((_, i) => result.data?.[i] ?? null);
@@ -208,11 +247,13 @@ export function useMqttBridge() {
         }
         logCompletedInputDeferral();
         const startedAt = performance.now();
+        let flushedCount = 0;
         flushing = true;
         try {
             const byConn = new Map<string, MqttMessage[]>();
             const renderLimit = adaptiveRenderLimit();
             const batch = pending.splice(0, Math.min(pending.length, renderLimit));
+            flushedCount = batch.length;
             for (let i = 0; i < batch.length; i++) {
                 const item = batch[i];
                 if (!item.connectionId) continue;
@@ -231,6 +272,7 @@ export function useMqttBridge() {
             }
         } finally {
             const cost = performance.now() - startedAt;
+            recordRendererPerf('mqtt.render-flush', cost, flushedCount);
             renderCostEma = renderCostEma === 0 ? cost : renderCostEma * 0.8 + cost * 0.2;
             flushing = false;
             if (pending.length > 0) schedule();
@@ -263,13 +305,24 @@ export function useMqttBridge() {
 
     function start(): void {
         stopInputActivityTracking = installTextInputActivityTracking();
+        stopPluginWatch = watch(() => plugins.list, () => decoderTopicCache.clear());
         unsubMsg = window.api.onMqttMessages((batch) => {
             if (!batch.length) return;
+            const visibleBatch = batch.filter((item) => {
+                if (!item.connectionId) return false;
+                const ledger = hydrationCredits.get(item.connectionId);
+                const suppress = consumeHydrationCredit(ledger, item);
+                if (ledger && (ledger.counts.size === 0 || item.time > ledger.cutoff)) {
+                    hydrationCredits.delete(item.connectionId);
+                }
+                return !suppress;
+            });
+            if (!visibleBatch.length) return;
             if (import.meta.env.DEV) {
-                const connIds = new Set(batch.map((item) => item.connectionId).filter(Boolean));
-                console.debug('[mqtt] batch:', [...connIds].join(','), batch.length, batch[0]?.topic);
+                const connIds = new Set(visibleBatch.map((item) => item.connectionId).filter(Boolean));
+                console.debug('[mqtt] batch:', [...connIds].join(','), visibleBatch.length, visibleBatch[0]?.topic);
             }
-            pending.push(...batch);
+            pending.push(...visibleBatch);
             if (pending.length > RENDER_PENDING_LIMIT) {
                 pending.splice(0, pending.length - RENDER_PENDING_LIMIT);
             }
@@ -306,6 +359,9 @@ export function useMqttBridge() {
                 decodeGeneration++;
                 pending.length = 0;
                 decodePending.length = 0;
+                for (const connectionId of hydrationCredits.keys()) {
+                    if (connectionId !== cid) hydrationCredits.delete(connectionId);
+                }
                 window.api.mqttSetActiveConnection({ connectionId: cid });
                 if (cid) window.api.mqttSetDisplayPaused({ connectionId: cid, paused });
                 if (cid && !paused) void hydrateActiveConnection(cid);
@@ -325,6 +381,9 @@ export function useMqttBridge() {
         stopActiveWatch = null;
         stopInputActivityTracking?.();
         stopInputActivityTracking = null;
+        stopPluginWatch?.();
+        stopPluginWatch = null;
+        decoderTopicCache.clear();
         window.api.mqttSetActiveConnection({ connectionId: null });
         activeHydrateToken++;
         decodeGeneration++;
@@ -336,6 +395,7 @@ export function useMqttBridge() {
         decodeTimer = null;
         pending.length = 0;
         decodePending.length = 0;
+        hydrationCredits.clear();
     }
 
     return { start, stop };

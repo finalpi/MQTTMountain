@@ -22,6 +22,7 @@ interface QueuedMqttMessage {
     connectionId: string;
     topic: string;
     payload: Buffer;
+    receivedAt: number;
 }
 
 interface ConnectionCtx {
@@ -36,7 +37,7 @@ interface ConnectionCtx {
 const MESSAGE_PROCESS_INTERVAL_MS = 8;
 const MESSAGE_PROCESS_BATCH = 1000;
 const MESSAGE_PROCESS_QUEUE_HARD = 100_000;
-const MQTT_OPERATION_TIMEOUT_MS = 10_000;
+const MQTT_OPERATION_TIMEOUT_MS = Math.max(50, Number(process.env.MQTTMOUNTAIN_OPERATION_TIMEOUT_MS) || 10_000);
 // 部分现场 Broker/四层代理约 20 秒未收到客户端上行包就会断链。
 // MQTT.js 默认 60 秒保活会导致连接周期性进入 reconnecting，缩短后提前发送 PINGREQ。
 const MQTT_KEEPALIVE_SECONDS = 10;
@@ -228,6 +229,9 @@ export class MqttService {
                 if (err) {
                     console.log(`[mqtt][${connectionId}] sub FAIL:`, normalized, err.message);
                     finish({ success: false, message: err.message });
+                } else if (granted?.some((item) => item.qos === 128)) {
+                    console.log(`[mqtt][${connectionId}] sub REJECTED:`, normalized);
+                    finish({ success: false, message: 'Broker 拒绝订阅' });
                 } else {
                     console.log(`[mqtt][${connectionId}] sub OK:`, granted?.map((g) => `${g.topic}@qos${g.qos}`).join(','));
                     finish({ success: true });
@@ -263,9 +267,25 @@ export class MqttService {
         const ctx = this.conns.get(connectionId);
         if (!ctx || !ctx.client.connected) return Promise.resolve({ success: false, message: '未连接' });
         return new Promise((resolve) => {
+            let settled = false;
+            const finish = (result: ApiResult) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(result);
+            };
+            const timer = setTimeout(() => {
+                writeDiagnosticLog('[mqtt] publish timeout', {
+                    connectionId,
+                    topic: p.topic,
+                    qos: p.qos,
+                    timeoutMs: MQTT_OPERATION_TIMEOUT_MS
+                });
+                finish({ success: false, message: '发布超时，Broker 是否收到消息未知' });
+            }, MQTT_OPERATION_TIMEOUT_MS);
             ctx.client.publish(p.topic, p.payload, { qos: p.qos, retain: p.retain }, (err) => {
-                if (err) resolve({ success: false, message: err.message });
-                else resolve({ success: true });
+                if (err) finish({ success: false, message: err.message });
+                else finish({ success: true });
             });
         });
     }
@@ -289,6 +309,7 @@ export class MqttService {
     }
 
     private enqueueIncomingMessage(ctx: ConnectionCtx, connectionId: string, topic: string, payload: Buffer): void {
+        const receivedAt = Date.now();
         if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) return;
         if (this.storageBackpressured) {
             ctx.droppedMessages++;
@@ -308,12 +329,24 @@ export class MqttService {
             console.warn(`[mqtt][${connectionId}] 入站消息积压超限，已丢弃 ${dropped} 条，避免主进程卡死`);
             writeDiagnosticLog('[mqtt] message queue overflow', { connectionId, dropped, ...snapshot });
         }
-        this.messageQueue.push({ ctx, connectionId, topic, payload: Buffer.from(payload) });
+        this.messageQueue.push({ ctx, connectionId, topic, payload: Buffer.from(payload), receivedAt });
         this.scheduleMessageProcessing();
     }
 
     private queuedMessageCount(): number {
         return this.messageQueue.length - this.messageQueueHead;
+    }
+
+    /**
+     * 返回可由持久化快照安全接管的接收时间边界。
+     * 尚在主进程队列中的消息必须留在边界之后，之后仍由实时 IPC 投递。
+     */
+    hydrationBoundaryTime(): number {
+        const beforeFutureMessages = Date.now() - 1;
+        const oldestQueued = this.messageQueue[this.messageQueueHead]?.receivedAt;
+        return oldestQueued == null
+            ? beforeFutureMessages
+            : Math.min(beforeFutureMessages, oldestQueued - 1);
     }
 
     private dropQueuedMessages(count: number): number {
@@ -351,15 +384,19 @@ export class MqttService {
             if (isStorageBackpressured()) break;
             const item = this.messageQueue[this.messageQueueHead++];
             if (!item) break;
-            const { ctx, connectionId, topic, payload } = item;
+            const { ctx, connectionId, topic, payload, receivedAt } = item;
             if (this.shuttingDown || ctx.closing || ctx.disabledTopics.has(topic)) continue;
             const payloadView = decodePayloadView(payload);
             const text = payloadView.text;
-            const now = Date.now();
+            const now = receivedAt;
 
             enqueueMessage(connectionId, topic, text, now, {
                 payloadSize: payloadView.size,
-                payloadEncoding: payloadView.encoding
+                payloadEncoding: payloadView.encoding,
+                // Valid UTF-8 can be reconstructed byte-for-byte from `text`; sending
+                // both the string and Buffer through worker structured-clone doubled
+                // the dominant payload traffic. Preserve raw bytes only when needed.
+                ...(payloadView.base64 ? { payloadBytes: payload } : {})
             });
             const msg: MqttMessage = {
                 connectionId,
@@ -367,6 +404,7 @@ export class MqttService {
                 payload: text,
                 payloadSize: payloadView.size,
                 payloadEncoding: payloadView.encoding,
+                payloadBase64: payloadView.base64,
                 time: now,
                 seq: ++this.seq
             };

@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
-import { useConnectionStore } from '@/stores/connection';
+import { normalizeConnectionConfig, useConnectionStore } from '@/stores/connection';
 import { useMessageStore } from '@/stores/messages';
 import { useToast } from '@/composables/useToast';
 import { useSubscriptionSync } from '@/composables/useSubscriptionSync';
-import type { MqttProtocol } from '@shared/types';
+import type { ConnectionConfig, MqttProtocol } from '@shared/types';
 import { randomClientId } from '@/utils/format';
 
 const conn = useConnectionStore();
@@ -14,9 +14,10 @@ const { sync: syncSubs, reset: resetSubs } = useSubscriptionSync();
 
 const showPassword = ref(false);
 const connecting = ref(false);
+const connectingId = ref<string | null>(null);
 const fileInput = ref<HTMLInputElement | null>(null);
-let recentHydrateToken = 0;
 let connectAttemptToken = 0;
+let selectAttemptToken = 0;
 
 const selected = computed(() => conn.selected);
 const isConnected = computed(() => conn.selectedState === 'connected' || conn.selectedState === 'reconnecting');
@@ -50,7 +51,8 @@ async function saveConfig(): Promise<void> {
 }
 
 async function doConnect(): Promise<void> {
-    const c = selected.value;
+    const selectedConfig = selected.value;
+    const c = selectedConfig ? JSON.parse(JSON.stringify(selectedConfig)) as ConnectionConfig : null;
     if (!c) return;
     if (!c.host) { toast.error('请填写服务器地址'); return; }
     if (!c.port) { toast.error('请填写端口'); return; }
@@ -58,15 +60,12 @@ async function doConnect(): Promise<void> {
 
     const attemptToken = ++connectAttemptToken;
     connecting.value = true;
+    connectingId.value = c.id;
     const label = c.name || `${c.host}:${c.port}`;
     const wasDirty = conn.dirty;
     try {
-        // 自动保存当前配置；失败只警告，不阻塞连接（可能只是磁盘 IO 临时问题）
-        try {
-            await conn.persist();
-        } catch (e) {
-            toast.error('配置保存失败：' + (e as Error).message + '，仍会尝试连接');
-        }
+        await conn.persist();
+        if (attemptToken !== connectAttemptToken || !conn.list.some((item) => item.id === c.id)) return;
         conn.setState(c.id, 'reconnecting');
         const r = await window.api.mqttConnect({
             connectionId: c.id,
@@ -86,13 +85,20 @@ async function doConnect(): Promise<void> {
             return;
         }
         const displayPaused = msg.bucketFor(c.id).paused;
-        await window.api.mqttSetDisplayPaused({ connectionId: c.id, paused: displayPaused });
+        const displayResult = await window.api.mqttSetDisplayPaused({ connectionId: c.id, paused: displayPaused });
+        if (!displayResult.success) throw new Error(displayResult.message || '恢复显示状态失败');
         resetSubs(c.id);
-        await syncSubs(c, true);
+        const syncResult = await syncSubs(c, true);
         if (attemptToken !== connectAttemptToken) return;
+        if (!syncResult.ok) {
+            await window.api.mqttDisconnect(c.id);
+            resetSubs(c.id);
+            const message = syncResult.errors.join('；');
+            conn.setState(c.id, 'error', message);
+            toast.error(`连接后订阅同步失败（${label}）：${message}`);
+            return;
+        }
 
-        // 为该连接的 bucket 预填历史（不影响其他连接）
-        void hydrateRecentMessages(c.id);
         toast.success(wasDirty ? `已连接：${label}（配置已自动保存）` : `已连接：${label}`);
     } catch (error) {
         if (attemptToken === connectAttemptToken) {
@@ -101,18 +107,11 @@ async function doConnect(): Promise<void> {
             toast.error(`连接失败（${label}）：${message}`);
         }
     } finally {
-        if (attemptToken === connectAttemptToken) connecting.value = false;
+        if (attemptToken === connectAttemptToken) {
+            connecting.value = false;
+            connectingId.value = null;
+        }
     }
-}
-
-async function hydrateRecentMessages(connectionId: string): Promise<void> {
-    const token = ++recentHydrateToken;
-    if (msg.bucketFor(connectionId).paused) return;
-    const recent = await window.api.mqttReadRecent({ connectionId, limit: 300 });
-    if (token !== recentHydrateToken || conn.selectedId !== connectionId || msg.bucketFor(connectionId).paused) return;
-    msg.clearAll(connectionId);
-    if (!recent.success || !recent.data?.length) return;
-    await msg.hydrate(connectionId, recent.data);
 }
 
 async function doDisconnect(): Promise<void> {
@@ -120,29 +119,89 @@ async function doDisconnect(): Promise<void> {
     if (!c) return;
     connectAttemptToken++;
     connecting.value = false;
-    recentHydrateToken++;
     const label = c.name || `${c.host}:${c.port}`;
-    await window.api.mqttDisconnect(c.id);
+    const result = await window.api.mqttDisconnect(c.id);
+    if (!result.success) {
+        toast.error(`断开失败（${label}）：${result.message || '未知错误'}`);
+        return;
+    }
     conn.setState(c.id, 'closed');
     resetSubs(c.id);
     toast.info(`已断开：${label}`);
 }
 
-function newConn(): void {
+async function newConn(): Promise<void> {
+    const previousSelectedId = conn.selectedId;
+    const previousDirty = conn.dirty;
     const c = conn.create();
-    toast.success('已新增连接：' + c.name);
+    try {
+        await conn.persist();
+        toast.success('已新增连接：' + c.name);
+    } catch (error) {
+        const index = conn.list.findIndex((item) => item.id === c.id);
+        if (index >= 0) conn.list.splice(index, 1);
+        conn.selectedId = previousSelectedId;
+        conn.touch();
+        conn.dirty = previousDirty;
+        toast.error('新增连接失败：' + (error instanceof Error ? error.message : String(error)));
+    }
 }
 
-function selectConn(id: string): void {
+async function selectConn(id: string): Promise<void> {
+    const attempt = ++selectAttemptToken;
+    const previousSelectedId = conn.selectedId;
+    const previousDirty = conn.dirty;
     conn.select(id);
-    // 只切换配置；消息区会自动切到该连接的 bucket
+    if (conn.selectedId === previousSelectedId) return;
+    try {
+        await conn.persist();
+    } catch (error) {
+        if (attempt !== selectAttemptToken) return;
+        conn.selectedId = previousSelectedId;
+        conn.touch();
+        conn.dirty = previousDirty;
+        toast.error('保存当前选择失败：' + (error instanceof Error ? error.message : String(error)));
+    }
 }
 
-function removeConn(id: string): void {
-    if (!confirm('确定删除这个连接配置？')) return;
-    window.api.mqttDisconnect(id);
-    msg.dropBucket(id, true);
+async function removeConn(id: string): Promise<void> {
+    if (!confirm('确定删除这个连接配置？关联的本地历史日志也会被清理，此操作不可撤销。')) return;
+    if (connectingId.value === id) {
+        connectAttemptToken++;
+        connecting.value = false;
+        connectingId.value = null;
+    }
+    const disconnectResult = await window.api.mqttDisconnect(id);
+    if (!disconnectResult.success) {
+        toast.error('删除前断开连接失败：' + (disconnectResult.message || '未知错误'));
+        return;
+    }
+    const index = conn.list.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    const removed = JSON.parse(JSON.stringify(conn.list[index])) as ConnectionConfig;
+    const previousSelectedId = conn.selectedId;
+    const previousDirty = conn.dirty;
     conn.remove(id);
+    try {
+        await conn.persist();
+        resetSubs(id);
+        msg.dropBucket(id, true);
+        toast.success('连接配置已删除');
+    } catch (error) {
+        conn.list.splice(index, 0, removed);
+        conn.selectedId = previousSelectedId;
+        conn.touch();
+        let restored = false;
+        try {
+            await conn.persist();
+            restored = true;
+        } catch {
+            conn.dirty = true;
+        }
+        if (restored) conn.dirty = previousDirty;
+        const suffix = restored ? '，配置已回滚' : '，配置回滚仍待保存';
+        toast.error('删除连接失败：' + (error instanceof Error ? error.message : String(error)) + suffix);
+    }
 }
 
 async function duplicateConn(id: string): Promise<void> {
@@ -158,9 +217,11 @@ async function duplicateConn(id: string): Promise<void> {
 async function exportConfigs(): Promise<void> {
     const blob = new Blob([JSON.stringify({ connections: conn.list, selectedId: conn.selectedId }, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(blob);
+    a.href = url;
     a.download = `mqtt-mountain-config-${Date.now()}.json`;
     a.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
 function importConfigs(): void {
@@ -171,35 +232,46 @@ async function onImportFile(e: Event): Promise<void> {
     const input = e.target as HTMLInputElement;
     const f = input.files?.[0];
     if (!f) return;
+    const previousList = JSON.parse(JSON.stringify(conn.list)) as ConnectionConfig[];
+    const previousSelectedId = conn.selectedId;
+    const previousDirty = conn.dirty;
     try {
         const text = await f.text();
         const data = JSON.parse(text);
-        const arr = Array.isArray(data) ? data : (data.connections ?? []);
+        const arr = Array.isArray(data) ? data : (data && typeof data === 'object' && Array.isArray(data.connections) ? data.connections : []);
+        if (!arr.length) throw new Error('文件中没有连接配置');
         const existingIds = new Set(conn.list.map((item) => item.id));
-        for (const raw of arr) {
+        for (const item of arr) {
+            if (!item || typeof item !== 'object') throw new Error('连接配置格式不正确');
+            const raw = item as Record<string, unknown>;
             let id = String(raw.id ?? '');
             if (!id || existingIds.has(id)) id = (Date.now() + Math.random()).toString(36);
             existingIds.add(id);
-            conn.list.push({
+            conn.list.push(normalizeConnectionConfig({
                 id,
-                name: raw.name ?? '导入连接',
-                protocol: raw.protocol ?? 'mqtt://',
-                host: raw.host ?? '',
-                port: raw.port ?? 1883,
-                path: raw.path ?? '/mqtt',
-                username: raw.username ?? '',
-                password: raw.password ?? '',
+                name: typeof raw.name === 'string' ? raw.name : '导入连接',
+                protocol: raw.protocol as MqttProtocol,
+                host: typeof raw.host === 'string' ? raw.host : '',
+                port: Number(raw.port),
+                path: typeof raw.path === 'string' ? raw.path : '/mqtt',
+                username: typeof raw.username === 'string' ? raw.username : '',
+                password: typeof raw.password === 'string' ? raw.password : '',
                 clientId: randomClientId(),
-                subscriptions: raw.subscriptions ?? [],
-                disabledTopics: raw.disabledTopics ?? [],
-                createdAt: raw.createdAt ?? Date.now(),
+                subscriptions: Array.isArray(raw.subscriptions) ? raw.subscriptions as ConnectionConfig['subscriptions'] : [],
+                disabledTopics: Array.isArray(raw.disabledTopics) ? raw.disabledTopics as string[] : [],
+                createdAt: Number(raw.createdAt) || Date.now(),
                 updatedAt: Date.now()
-            });
+            }));
         }
         conn.sanitizeConnections();
+        conn.touch();
         await conn.persist();
         toast.success(`已导入 ${arr.length} 个连接`);
     } catch (err) {
+        conn.list.splice(0, conn.list.length, ...previousList);
+        conn.selectedId = previousSelectedId;
+        conn.touch();
+        conn.dirty = previousDirty;
         toast.error('导入失败：' + (err as Error).message);
     } finally {
         input.value = '';

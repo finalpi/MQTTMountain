@@ -10,7 +10,7 @@ const Database = require('better-sqlite3');
 function loadBuiltStorage() {
   const distDir = path.resolve('dist-electron/main');
   const file = fs.readdirSync(distDir)
-    .filter((name) => /^storage-.+\.js$/.test(name))
+    .filter((name) => /^storage-.+\.js$/.test(name) && name !== 'storage-worker.js')
     .sort((left, right) => fs.statSync(path.join(distDir, right)).mtimeMs - fs.statSync(path.join(distDir, left)).mtimeMs)[0];
   if (!file) throw new Error('built storage module not found; run vite build first');
   return require(path.join(distDir, file));

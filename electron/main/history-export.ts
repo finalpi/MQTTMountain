@@ -17,7 +17,8 @@ interface WorkerMessage {
 }
 
 function sendProgress(sender: WebContents, progress: HistoryExportProgress): void {
-    if (!sender.isDestroyed()) sender.send('history:exportProgress', progress);
+    if (sender.isDestroyed()) return;
+    try { sender.send('history:exportProgress', progress); } catch {}
 }
 
 export async function exportHistoryToFile(sender: WebContents, req: HistoryExportRequest, targetPath: string): Promise<HistoryExportResult> {
@@ -69,8 +70,9 @@ export async function exportHistoryToFile(sender: WebContents, req: HistoryExpor
             });
 
             worker.once('exit', (code) => {
-                if (!settled && code !== 0) {
-                    reject(new Error(`导出任务异常退出（${code}）`));
+                if (!settled) {
+                    settled = true;
+                    reject(new Error(`导出任务退出但未返回结果（${code}）`));
                 }
             });
         }).finally(() => {

@@ -1,6 +1,7 @@
 import { ipcMain, dialog, shell, app, BrowserWindow } from 'electron';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Worker } from 'node:worker_threads';
 import type { MqttService } from './mqtt-service';
 import type {
     AppSettings,
@@ -20,16 +21,16 @@ import {
     readConnections,
     writeConnections,
     getCurrentLogDir,
-    getDefaultLogDir
+    getDefaultLogDir,
+    setCurrentLogDir
 } from './settings';
 import {
     clearLogsAsync,
     clearLogsWithoutConnectionsAsync,
     closeAllLogDbsAsync,
-    flushStorageAsync,
     pauseStorageWrites,
-    readRecentByConnection,
-    resumeStorageWrites
+    resumeStorageWrites,
+    switchStorageLogRootAsync
 } from './storage';
 import { APP_START_TIME } from './constants';
 import { pluginManager } from './plugin-manager';
@@ -40,7 +41,77 @@ import { exportHistoryToFile } from './history-export';
 import { buildHistoryIndex, readHistoryIndexStatus } from './history-index';
 import { cancelHistoryQueryStream, queryHistoryAsync, startHistoryQueryStream } from './history-query';
 import { scheduleHeavyJob } from './heavy-job-scheduler';
-import { HISTORY_DB_SIDECAR_FILE_RE } from './history-query-common';
+import { ensureOwnedLogRoot, listOwnedHistoryFiles, resolveLogRootSelection } from './log-root-safety';
+import { writeDiagnosticLog } from './diagnostics';
+
+interface LogDirWorkerResult {
+    files: number;
+    bytes: number;
+    sourceDir: string;
+    targetDir?: string;
+}
+
+interface PendingLogDirChange {
+    info: LogDirChangeInfo;
+}
+
+const pendingLogDirChanges = new Map<number, PendingLogDirChange>();
+
+async function runLogDirWorker(operation: 'copy' | 'delete', sourceDir: string, targetDir?: string): Promise<LogDirWorkerResult> {
+    const workerPath = path.join(__dirname, 'log-dir-worker.js');
+    const worker = new Worker(workerPath, { workerData: { operation, sourceDir, targetDir } });
+    try {
+        return await new Promise<LogDirWorkerResult>((resolve, reject) => {
+            let settled = false;
+            worker.once('message', (message: { ok?: boolean; result?: LogDirWorkerResult; error?: string }) => {
+                settled = true;
+                if (message.ok && message.result) resolve(message.result);
+                else reject(new Error(message.error || '日志目录操作失败'));
+            });
+            worker.once('error', (error) => {
+                settled = true;
+                reject(error);
+            });
+            worker.once('exit', (code) => {
+                if (!settled) reject(new Error(`日志目录任务退出但未返回结果（${code}）`));
+            });
+        });
+    } finally {
+        await worker.terminate().catch(() => undefined);
+    }
+}
+
+function persistedLogDir(root: string): string {
+    return normalizeDirForCompare(root) === normalizeDirForCompare(getDefaultLogDir()) ? '' : root;
+}
+
+async function switchLogRootAndWriteSettings(settings: AppSettings, targetDir: string, alreadyPaused = false): Promise<void> {
+    const previous = readSettings();
+    const previousRoot = getCurrentLogDir();
+    const targetRoot = ensureOwnedLogRoot(targetDir);
+    const changed = normalizeDirForCompare(previousRoot) !== normalizeDirForCompare(targetRoot);
+    if (changed && !alreadyPaused) pauseStorageWrites('settings-log-dir-switch');
+    try {
+        if (changed) {
+            await switchStorageLogRootAsync(targetRoot);
+            setCurrentLogDir(targetRoot);
+        }
+        writeSettings({ ...settings, logDir: persistedLogDir(targetRoot) });
+    } catch (error) {
+        if (changed) {
+            try {
+                await switchStorageLogRootAsync(previousRoot);
+                setCurrentLogDir(previousRoot);
+                writeSettings(previous);
+            } catch (rollbackError) {
+                console.error('[settings] log directory rollback failed:', rollbackError);
+            }
+        }
+        throw error;
+    } finally {
+        if (changed && !alreadyPaused) resumeStorageWrites('settings-log-dir-switch');
+    }
+}
 
 function win(): BrowserWindow | null {
     return BrowserWindow.getAllWindows()[0] ?? null;
@@ -51,23 +122,11 @@ function normalizeDirForCompare(dir: string): string {
 }
 
 function resolveRequestedLogDir(logDir: string): string {
-    const trimmed = typeof logDir === 'string' ? logDir.trim() : '';
-    return trimmed || getDefaultLogDir();
+    return resolveLogRootSelection(typeof logDir === 'string' ? logDir : '', getDefaultLogDir());
 }
 
 function countLogDbFiles(root: string): number {
-    if (!fs.existsSync(root)) return 0;
-    let total = 0;
-    const stack = [root];
-    while (stack.length) {
-        const dir = stack.pop()!;
-        for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
-            const fp = path.join(dir, item.name);
-            if (item.isDirectory()) stack.push(fp);
-            else if (HISTORY_DB_SIDECAR_FILE_RE.test(item.name)) total++;
-        }
-    }
-    return total;
+    return listOwnedHistoryFiles(root).length;
 }
 
 function getLogDirChangeInfo(logDir: string): LogDirChangeInfo {
@@ -104,34 +163,46 @@ function assertDifferentLogDirs(sourceDir: string, targetDir?: string): void {
     }
 }
 
-async function migrateLogDirData(sourceDir: string, targetDir: string): Promise<LogDirDataResult> {
+async function migrateLogDirData(sourceDir: string, targetDir: string, requestedSettings: AppSettings): Promise<LogDirDataResult> {
     assertCurrentLogDir(sourceDir);
     assertDifferentLogDirs(sourceDir, targetDir);
     pauseStorageWrites('migrate-log-dir');
     try {
         await closeAllLogDbsAsync();
-        const files = countLogDbFiles(sourceDir);
-        if (files > 0) {
-            fs.mkdirSync(targetDir, { recursive: true });
-            fs.cpSync(sourceDir, targetDir, { recursive: true, force: true });
-            fs.rmSync(sourceDir, { recursive: true, force: true });
+        writeDiagnosticLog('[storage] log directory migration started', { sourceDir, targetDir });
+        const result = await runLogDirWorker('copy', sourceDir, targetDir);
+        await switchLogRootAndWriteSettings(requestedSettings, targetDir, true);
+        try {
+            await runLogDirWorker('delete', sourceDir);
+        } catch (cleanupError) {
+            writeDiagnosticLog('[storage] source cleanup after migration failed; source copy preserved', { sourceDir, targetDir }, cleanupError);
+            console.warn('[storage] source cleanup after migration failed; source copy preserved:', cleanupError);
         }
-        return { files, sourceDir, targetDir };
+        writeDiagnosticLog('[storage] log directory migration completed', result);
+        return { files: result.files, sourceDir, targetDir };
     } finally {
         resumeStorageWrites('migrate-log-dir');
     }
 }
 
-async function deleteLogDirData(sourceDir: string): Promise<LogDirDataResult> {
+async function deleteLogDirData(sourceDir: string, targetDir: string, requestedSettings: AppSettings): Promise<LogDirDataResult> {
     assertCurrentLogDir(sourceDir);
+    assertDifferentLogDirs(sourceDir, targetDir);
     pauseStorageWrites('delete-log-dir');
     try {
         await closeAllLogDbsAsync();
+        writeDiagnosticLog('[storage] owned log data deletion started', { sourceDir, targetDir });
         const files = countLogDbFiles(sourceDir);
-        if (files > 0 && fs.existsSync(sourceDir)) {
-            fs.rmSync(sourceDir, { recursive: true, force: true });
+        ensureOwnedLogRoot(targetDir);
+        await switchLogRootAndWriteSettings(requestedSettings, targetDir, true);
+        try {
+            await runLogDirWorker('delete', sourceDir);
+        } catch (cleanupError) {
+            writeDiagnosticLog('[storage] source cleanup after log directory switch failed; source data preserved', { sourceDir, targetDir }, cleanupError);
+            console.warn('[storage] source cleanup after log directory switch failed; source data preserved:', cleanupError);
         }
-        return { files, sourceDir };
+        writeDiagnosticLog('[storage] owned log data deletion completed', { files, sourceDir, targetDir });
+        return { files, sourceDir, targetDir };
     } finally {
         resumeStorageWrites('delete-log-dir');
     }
@@ -172,8 +243,16 @@ export function initIpc(mqttService: MqttService): void {
     });
     ipcMain.handle('mqtt:readRecent', async (_e, p: { connectionId: string; limit?: number }) => {
         try {
-            await flushStorageAsync();
-            return { success: true, data: readRecentByConnection(p.connectionId, p.limit ?? 5000) };
+            const throughTime = mqttService.hydrationBoundaryTime();
+            const limit = Math.min(100_000, Math.max(1, Math.trunc(Number(p.limit) || 5000)));
+            const rows = await queryHistoryAsync({
+                connectionId: p.connectionId,
+                endTime: throughTime,
+                order: 'desc',
+                limit,
+                freshness: 'strict'
+            });
+            return { success: true, data: { rows, throughTime } };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
@@ -214,10 +293,14 @@ export function initIpc(mqttService: MqttService): void {
         }
     });
     ipcMain.handle('history:indexStatus', (_e, req?: { connectionId?: string | null }) => {
+        const startedAt = performance.now();
         try {
             return { success: true, data: readHistoryIndexStatus(req || {}) };
         } catch (e) {
             return { success: false, message: (e as Error).message };
+        } finally {
+            const elapsedMs = performance.now() - startedAt;
+            if (elapsedMs > 100) writeDiagnosticLog('[main-performance] slow history index status', { elapsedMs: Math.round(elapsedMs) });
         }
     });
     ipcMain.handle('history:buildIndex', async (event, req?: { connectionId?: string | null }) => {
@@ -279,38 +362,60 @@ export function initIpc(mqttService: MqttService): void {
 
     // settings
     ipcMain.handle('settings:get', () => ({ success: true, data: readSettings() }));
-    ipcMain.handle('settings:set', (_e, s: AppSettings) => {
+    ipcMain.handle('settings:set', async (event, s: AppSettings) => {
         try {
-            const r = writeSettings(s);
+            const desiredRoot = ensureOwnedLogRoot(resolveRequestedLogDir(s.logDir));
+            pendingLogDirChanges.delete(event.sender.id);
+            await switchLogRootAndWriteSettings(s, desiredRoot);
             rescheduleAutoDelete(true);
-            return { success: true, data: r };
+            return { success: true, data: { needRestart: false } };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
     });
-    ipcMain.handle('settings:getLogDirChangeInfo', (_e, logDir: string) => {
+    ipcMain.handle('settings:getLogDirChangeInfo', (event, logDir: string) => {
+        const startedAt = performance.now();
         try {
-            return { success: true, data: getLogDirChangeInfo(logDir) };
+            const info = getLogDirChangeInfo(logDir);
+            pendingLogDirChanges.set(event.sender.id, { info });
+            return { success: true, data: info };
         } catch (e) {
             return { success: false, message: (e as Error).message };
+        } finally {
+            const elapsedMs = performance.now() - startedAt;
+            if (elapsedMs > 100) writeDiagnosticLog('[main-performance] slow log directory inspection', { elapsedMs: Math.round(elapsedMs) });
         }
     });
-    ipcMain.handle('settings:migrateLogDirData', async (_e, p: { sourceDir: string; targetDir: string }) => {
+    ipcMain.handle('settings:migrateLogDirData', async (event, p: { sourceDir: string; targetDir: string }) => {
         try {
+            const pending = pendingLogDirChanges.get(event.sender.id);
+            if (!pending
+                || normalizeDirForCompare(pending.info.sourceDir) !== normalizeDirForCompare(p.sourceDir)
+                || normalizeDirForCompare(pending.info.targetDir) !== normalizeDirForCompare(p.targetDir)) {
+                throw new Error('日志目录迁移上下文已失效，请重新保存设置');
+            }
+            pendingLogDirChanges.delete(event.sender.id);
+            const requestedSettings = { ...readSettings(), logDir: persistedLogDir(pending.info.targetDir) };
             const data = await scheduleHeavyJob(
                 { kind: 'exclusive', label: 'migrate-log-dir', priority: 40 },
-                () => migrateLogDirData(p.sourceDir, p.targetDir)
+                () => migrateLogDirData(p.sourceDir, p.targetDir, requestedSettings)
             ).promise;
             return { success: true, data };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
     });
-    ipcMain.handle('settings:deleteLogDirData', async (_e, p: { sourceDir: string }) => {
+    ipcMain.handle('settings:deleteLogDirData', async (event, p: { sourceDir: string }) => {
         try {
+            const pending = pendingLogDirChanges.get(event.sender.id);
+            if (!pending || normalizeDirForCompare(pending.info.sourceDir) !== normalizeDirForCompare(p.sourceDir)) {
+                throw new Error('日志目录变更上下文已失效，请重新保存设置');
+            }
+            pendingLogDirChanges.delete(event.sender.id);
+            const requestedSettings = { ...readSettings(), logDir: persistedLogDir(pending.info.targetDir) };
             const data = await scheduleHeavyJob(
                 { kind: 'exclusive', label: 'delete-log-dir', priority: 40 },
-                () => deleteLogDirData(p.sourceDir)
+                () => deleteLogDirData(p.sourceDir, pending.info.targetDir, requestedSettings)
             ).promise;
             return { success: true, data };
         } catch (e) {
@@ -328,7 +433,7 @@ export function initIpc(mqttService: MqttService): void {
                 defaultPath: getCurrentLogDir()
             });
             if (r.canceled || !r.filePaths.length) return { success: true, data: null };
-            return { success: true, data: { path: r.filePaths[0] } };
+            return { success: true, data: { path: resolveLogRootSelection(r.filePaths[0], getDefaultLogDir()) } };
         } catch (e) {
             return { success: false, message: (e as Error).message };
         }
@@ -348,7 +453,7 @@ export function initIpc(mqttService: MqttService): void {
     // app
     ipcMain.handle('app:relaunch', () => {
         app.relaunch();
-        app.exit(0);
+        app.quit();
         return { success: true };
     });
     ipcMain.handle('app:getStartTime', () => ({ success: true, data: APP_START_TIME }));

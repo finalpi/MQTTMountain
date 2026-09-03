@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { ref } from 'vue';
 import { usePluginStore } from '@/stores/plugins';
 import { useToast } from '@/composables/useToast';
 
@@ -10,8 +10,6 @@ const gitUrl = ref('');
 const gitRef = ref('');
 const localPath = ref('');
 const installing = ref(false);
-
-onMounted(() => plugins.refresh());
 
 async function doInstallGit(): Promise<void> {
     if (!gitUrl.value.trim()) { toast.error('请填写 Git 仓库地址'); return; }

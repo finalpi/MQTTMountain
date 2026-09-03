@@ -28,6 +28,7 @@ const PLUGIN_DIR = path.join(app.getPath('userData'), 'plugins');
 const CONFIG_DB_PATH = path.join(app.getPath('userData'), 'mqtt_mountain.db');
 const CONFIG_KEY = 'plugins';
 const HOST_VERSION = app.getVersion();
+const PLUGIN_ID_RE = /^[a-zA-Z0-9](?:[a-zA-Z0-9._-]{0,119})$/u;
 
 interface LoadedPlugin {
     manifest: PluginManifest;
@@ -49,14 +50,56 @@ function escapeInlineText(text: string): string {
     return text.replace(/<\/(script|style)/gi, '<\\/$1');
 }
 
-function inlineViewAssets(html: string, entryPath: string): string {
+function isPathInside(parentDir: string, targetPath: string): boolean {
+    const relative = path.relative(path.resolve(parentDir), path.resolve(targetPath));
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function assertPluginId(id: string): string {
+    const normalized = String(id || '').trim();
+    if (!PLUGIN_ID_RE.test(normalized)) {
+        throw new Error('manifest id 只能包含字母、数字、点、下划线和连字符，且长度不能超过 120');
+    }
+    return normalized;
+}
+
+function resolvePluginFile(pluginDir: string, relativePath: string, label: string): string {
+    const requested = String(relativePath || '').trim();
+    if (!requested || path.isAbsolute(requested)) throw new Error(`${label} 必须是插件目录内的相对路径`);
+    const target = path.resolve(pluginDir, requested);
+    if (!isPathInside(pluginDir, target)) throw new Error(`${label} 不能指向插件目录外`);
+    if (!fs.existsSync(target)) return target;
+    const realRoot = fs.realpathSync(pluginDir);
+    const realTarget = fs.realpathSync(target);
+    if (!isPathInside(realRoot, realTarget)) throw new Error(`${label} 不能通过符号链接指向插件目录外`);
+    return target;
+}
+
+function managedPluginTarget(name: string): string {
+    const target = path.resolve(PLUGIN_DIR, name);
+    const relative = path.relative(path.resolve(PLUGIN_DIR), target);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)) {
+        throw new Error('非法插件安装目录');
+    }
+    return target;
+}
+
+function assertManagedPluginDir(dir: string): void {
+    const relative = path.relative(path.resolve(PLUGIN_DIR), path.resolve(dir));
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || relative.includes(path.sep)) {
+        throw new Error('拒绝操作插件根目录之外的路径');
+    }
+}
+
+function inlineViewAssets(html: string, entryPath: string, pluginDir: string): string {
     const viewDir = path.dirname(entryPath);
 
     const withStyles = html.replace(
         /<link\b([^>]*?)rel=["']stylesheet["']([^>]*?)href=["']([^"']+)["']([^>]*)>/gi,
         (match, before, middle, href, after) => {
             if (/^(https?:|data:|blob:|\/\/)/i.test(href)) return match;
-            const assetPath = path.resolve(viewDir, href);
+            const localHref = String(href).split(/[?#]/u, 1)[0];
+            const assetPath = resolvePluginFile(pluginDir, path.relative(pluginDir, path.resolve(viewDir, localHref)), '插件样式');
             if (!fs.existsSync(assetPath) || !fs.statSync(assetPath).isFile()) return match;
             const css = fs.readFileSync(assetPath, 'utf8');
             return `<style data-plugin-inline="css"${before || ''}${middle || ''}${after || ''}>${escapeInlineText(css)}</style>`;
@@ -66,8 +109,11 @@ function inlineViewAssets(html: string, entryPath: string): string {
     return withStyles.replace(
         /<script\b([^>]*?)src=["']([^"']+)["']([^>]*)>\s*<\/script>/gi,
         (match, before, src, after) => {
-            if (/^(https?:|data:|blob:|\/\/)/i.test(src)) return match;
-            const assetPath = path.resolve(viewDir, src);
+            if (/^(https?:|data:|blob:|\/\/)/i.test(src)) {
+                throw new Error('插件页面禁止加载远程脚本，请将依赖打包到插件目录');
+            }
+            const localSrc = String(src).split(/[?#]/u, 1)[0];
+            const assetPath = resolvePluginFile(pluginDir, path.relative(pluginDir, path.resolve(viewDir, localSrc)), '插件脚本');
             if (!fs.existsSync(assetPath) || !fs.statSync(assetPath).isFile()) return match;
             const code = fs.readFileSync(assetPath, 'utf8');
             const attrs = `${before || ''}${after || ''}`.replace(/\bcrossorigin(?:=(["']).*?\1)?/gi, '');
@@ -124,6 +170,9 @@ class PluginManager {
             if (!isDirLike) continue;
             try {
                 const manifest = this.loadManifest(full);
+                if (this.plugins.has(manifest.id)) {
+                    throw new Error(`插件 id 冲突：${manifest.id}`);
+                }
                 const stateEntry = state[manifest.id];
                 const enabled = stateEntry?.enabled ?? false;
                 const source = stateEntry?.source;
@@ -185,12 +234,13 @@ class PluginManager {
         if (!raw.id || !raw.name || !raw.version) {
             throw new Error('manifest 缺少必要字段 id/name/version');
         }
+        raw.id = assertPluginId(raw.id);
         return raw;
     }
 
     // --------------- runtime load/unload ---------------
     private async loadRuntime(p: LoadedPlugin): Promise<void> {
-        const mainFile = path.resolve(p.dir, p.manifest.main || 'index.js');
+        const mainFile = resolvePluginFile(p.dir, p.manifest.main || 'index.js', '插件运行时入口');
         if (!fs.existsSync(mainFile)) {
             p.error = `入口文件不存在：${p.manifest.main || 'index.js'}`;
             p.loaded = false;
@@ -232,7 +282,7 @@ class PluginManager {
         if (p.runtime && typeof p.runtime.deactivate === 'function') {
             try { await p.runtime.deactivate(); } catch (e) { console.error('[plugin] deactivate:', e); }
         }
-        const mainFile = path.resolve(p.dir, p.manifest.main || 'index.js');
+        const mainFile = resolvePluginFile(p.dir, p.manifest.main || 'index.js', '插件运行时入口');
         this.clearRequireCache(mainFile);
         p.runtime = undefined;
         p.loaded = false;
@@ -339,7 +389,7 @@ class PluginManager {
     async installFromGit(url: string, ref?: string): Promise<PluginRecord> {
         if (!url || !url.trim()) throw new Error('Git URL 不能为空');
         const name = deriveDirName(url);
-        const target = path.join(PLUGIN_DIR, name);
+        const target = managedPluginTarget(name);
         if (fs.existsSync(target)) {
             throw new Error(`目标目录已存在：${target}，请先卸载或改名`);
         }
@@ -375,23 +425,12 @@ class PluginManager {
         if (!localPath || !fs.existsSync(localPath)) throw new Error('本地路径不存在');
         const manifest = this.loadManifest(localPath);
         if (this.plugins.has(manifest.id)) {
-            return this.list().find((x) => x.manifest.id === manifest.id)!;
+            throw new Error(`插件 id 冲突：${manifest.id} 已安装`);
         }
-        const target = path.join(PLUGIN_DIR, manifest.id);
+        const target = managedPluginTarget(manifest.id);
         const resolvedLocalPath = fs.realpathSync(localPath);
         if (fs.existsSync(target)) {
-            const plugin: LoadedPlugin = {
-                manifest,
-                dir: target,
-                enabled: false,
-                loaded: false,
-                source: { type: 'path', path: resolvedLocalPath },
-                senders: manifest.senders ? [...manifest.senders] : [],
-                views: manifest.views ? [...manifest.views] : []
-            };
-            this.plugins.set(manifest.id, plugin);
-            this.writeState();
-            return this.list().find((x) => x.manifest.id === manifest.id)!;
+            throw new Error(`目标目录已存在：${target}，请先确认并移除旧目录`);
         }
         fs.symlinkSync(
             resolvedLocalPath,
@@ -416,7 +455,8 @@ class PluginManager {
         const p = this.plugins.get(pluginId);
         if (!p) throw new Error('未找到插件：' + pluginId);
         if (p.enabled) await this.unloadRuntime(p);
-        try { fs.rmSync(p.dir, { recursive: true, force: true }); } catch (e) { console.error('[plugin] uninstall rm:', e); }
+        assertManagedPluginDir(p.dir);
+        fs.rmSync(p.dir, { recursive: true, force: true });
         this.plugins.delete(pluginId);
         this.writeState();
     }
@@ -425,7 +465,18 @@ class PluginManager {
         const p = this.plugins.get(pluginId);
         if (!p) throw new Error('未找到插件：' + pluginId);
         // 重新读 manifest
-        try { p.manifest = this.loadManifest(p.dir); } catch (e) { p.error = (e as Error).message; return; }
+        try {
+            const nextManifest = this.loadManifest(p.dir);
+            if (nextManifest.id !== pluginId) {
+                throw new Error(`插件更新不能修改 id：期望 ${pluginId}，实际 ${nextManifest.id}`);
+            }
+            const collision = this.plugins.get(nextManifest.id);
+            if (collision && collision !== p) throw new Error(`插件 id 冲突：${nextManifest.id}`);
+            p.manifest = nextManifest;
+        } catch (e) {
+            p.error = (e as Error).message;
+            throw e;
+        }
         p.senders = p.manifest.senders ? [...p.manifest.senders] : [];
         p.views = p.manifest.views ? [...p.manifest.views] : [];
         if (p.enabled) {
@@ -474,9 +525,9 @@ class PluginManager {
         const view = p.views.find((item) => item.id === viewId);
         if (!view) throw new Error('未找到视图：' + viewId);
         if (view.type !== 'web') throw new Error('该视图不是插件自定义页面');
-        const entryPath = path.resolve(p.dir, view.entry);
+        const entryPath = resolvePluginFile(p.dir, view.entry, '插件页面入口');
         if (!fs.existsSync(entryPath)) throw new Error('插件页面入口不存在：' + view.entry);
-        const html = inlineViewAssets(fs.readFileSync(entryPath, 'utf8'), entryPath);
+        const html = inlineViewAssets(fs.readFileSync(entryPath, 'utf8'), entryPath, p.dir);
         const baseDir = path.dirname(entryPath);
         const normalizedBase = baseDir.endsWith(path.sep) ? baseDir : `${baseDir}${path.sep}`;
         return {

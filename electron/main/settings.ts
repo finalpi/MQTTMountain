@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import type { AppSettings, ConnectionsFile } from '../../shared/types';
+import { ensureOwnedLogRoot, resolveLogRootSelection } from './log-root-safety';
 
 const CONFIG_DB_PATH = path.join(app.getPath('userData'), 'mqtt_mountain.db');
 const DEFAULT_LOG_ROOT = path.join(app.getPath('userData'), 'message_logs');
@@ -41,16 +42,23 @@ export function initSettings(): void {
     const s = readSettings();
     if (s.logDir && s.logDir.trim()) {
         try {
-            fs.mkdirSync(s.logDir, { recursive: true });
-            currentLogDir = s.logDir;
+            const safeLogDir = resolveLogRootSelection(s.logDir, DEFAULT_LOG_ROOT);
+            currentLogDir = ensureOwnedLogRoot(safeLogDir);
+            if (safeLogDir !== s.logDir.trim()) {
+                console.warn('[settings] unsafe/shared logDir redirected to dedicated directory:', {
+                    requested: s.logDir,
+                    resolved: safeLogDir
+                });
+                const value = JSON.stringify({ ...s, logDir: safeLogDir });
+                getDb().prepare('INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)').run('settings', value);
+            }
         } catch (e) {
             console.error('[settings] custom logDir unusable, fallback default:', (e as Error).message);
-            currentLogDir = DEFAULT_LOG_ROOT;
+            currentLogDir = ensureOwnedLogRoot(DEFAULT_LOG_ROOT);
         }
     } else {
-        currentLogDir = DEFAULT_LOG_ROOT;
+        currentLogDir = ensureOwnedLogRoot(DEFAULT_LOG_ROOT);
     }
-    fs.mkdirSync(currentLogDir, { recursive: true });
 }
 
 export function getCurrentLogDir(): string {
@@ -58,6 +66,10 @@ export function getCurrentLogDir(): string {
 }
 export function getDefaultLogDir(): string {
     return DEFAULT_LOG_ROOT;
+}
+
+export function setCurrentLogDir(logDir: string): void {
+    currentLogDir = ensureOwnedLogRoot(logDir);
 }
 
 export function readSettings(): AppSettings {
@@ -79,27 +91,37 @@ export function readSettings(): AppSettings {
 
 export function writeSettings(s: AppSettings): { needRestart: boolean } {
     const prev = readSettings();
+    const requestedLogDir = typeof s.logDir === 'string' ? s.logDir.trim() : '';
+    const safeLogDir = requestedLogDir
+        ? resolveLogRootSelection(requestedLogDir, DEFAULT_LOG_ROOT)
+        : '';
+    ensureOwnedLogRoot(safeLogDir || DEFAULT_LOG_ROOT);
     const value = JSON.stringify({
         autoDeleteDays: Math.max(0, parseInt(String(s.autoDeleteDays), 10) || 0),
         maxMemoryMessages: Math.max(100, parseInt(String(s.maxMemoryMessages), 10) || DEFAULT_SETTINGS.maxMemoryMessages),
         maxPerTopic: Math.max(50, parseInt(String(s.maxPerTopic), 10) || DEFAULT_SETTINGS.maxPerTopic),
-        logDir: typeof s.logDir === 'string' ? s.logDir.trim() : ''
+        logDir: safeLogDir
     });
     getDb().prepare('INSERT OR REPLACE INTO app_config (key, value) VALUES (?, ?)').run('settings', value);
-    const newDir = typeof s.logDir === 'string' ? s.logDir.trim() : '';
+    const newDir = safeLogDir;
     const prevDir = prev.logDir.trim();
     return { needRestart: newDir !== prevDir };
 }
 
+export function readConnectionsStrict(): ConnectionsFile {
+    const row = getDb().prepare('SELECT value FROM app_config WHERE key = ?').get('connections') as { value: string } | undefined;
+    if (!row) return { connections: [], selectedId: null };
+    const data = JSON.parse(row.value) as ConnectionsFile;
+    if (!Array.isArray(data.connections)) throw new Error('连接配置格式无效');
+    return {
+        connections: data.connections,
+        selectedId: data.selectedId ?? null
+    };
+}
+
 export function readConnections(): ConnectionsFile {
     try {
-        const row = getDb().prepare('SELECT value FROM app_config WHERE key = ?').get('connections') as { value: string } | undefined;
-        if (!row) return { connections: [], selectedId: null };
-        const data = JSON.parse(row.value) as ConnectionsFile;
-        return {
-            connections: Array.isArray(data.connections) ? data.connections : [],
-            selectedId: data.selectedId ?? null
-        };
+        return readConnectionsStrict();
     } catch (e) {
         console.error('[settings] readConnections:', e);
         return { connections: [], selectedId: null };

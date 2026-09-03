@@ -7,14 +7,19 @@ export const usePluginStore = defineStore('plugins', () => {
     const updates = ref<PluginUpdateInfo[]>([]);
     const loading = ref(false);
     const checkingUpdates = ref(false);
+    let refreshSeq = 0;
+    let refreshInFlight = 0;
 
     async function refresh(): Promise<void> {
+        const seq = ++refreshSeq;
+        refreshInFlight++;
         loading.value = true;
         try {
             const r = await window.api.pluginList();
-            if (r.success && r.data) list.value = r.data;
+            if (seq === refreshSeq && r.success && r.data) list.value = r.data;
         } finally {
-            loading.value = false;
+            refreshInFlight--;
+            loading.value = refreshInFlight > 0;
         }
     }
 
@@ -78,7 +83,7 @@ export const usePluginStore = defineStore('plugins', () => {
     async function updateFromGit(pluginId: string): Promise<{ ok: boolean; message?: string }> {
         const r = await window.api.pluginUpdateFromGit(pluginId);
         await refresh();
-        updates.value = updates.value.filter((item) => item.pluginId !== pluginId);
+        if (r.success) updates.value = updates.value.filter((item) => item.pluginId !== pluginId);
         return { ok: r.success, message: r.message };
     }
 

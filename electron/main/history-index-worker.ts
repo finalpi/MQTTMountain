@@ -5,7 +5,7 @@ import Database from 'better-sqlite3';
 import type { HistoryIndexProgress, HistoryIndexRequest, HistoryIndexResult } from '../../shared/types';
 import { isCompressedBucketBlob, iterateBucketEntries, packBucketBlob, unpackBucketBlob } from './history-bucket-codec';
 import { HISTORY_DB_FILE_RE, normalizeSearchText, sanitizeConnectionId } from './history-query-common';
-import { ensureHistoryIndexSchema, getHistoryFtsLayout, getIndexMeta, setIndexMeta } from './history-index-schema';
+import { ensureHistoryIndexSchema, getHistoryFtsLayout, getIndexMeta, rebuildHistoryTopicStats, setIndexMeta } from './history-index-schema';
 
 const port = parentPort;
 
@@ -149,6 +149,7 @@ function buildFileIndex(file: { path: string; san: string }, progress: HistoryIn
             setIndexMeta(db, 'compression_raw_bytes', rawBucketBytes);
             setIndexMeta(db, 'compression_stored_bytes', storedBucketBytes);
             if (getIndexMeta(db, 'index_dirty_at') === '0') {
+                rebuildHistoryTopicStats(db);
                 setIndexMeta(db, 'index_complete', '1');
                 return { buckets: processedBuckets, messages: processedMessages, fts5Enabled };
             }

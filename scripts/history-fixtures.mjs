@@ -402,7 +402,8 @@ function runBuiltWorker(logRoot, opts) {
   if (sourcePaths.some((sourcePath) => fs.existsSync(sourcePath) && fs.statSync(sourcePath).mtimeMs > workerMtime)) return null;
   return new Promise((resolve, reject) => {
     const worker = new Worker(workerPath, { workerData: { opts, logRoot } });
-    worker.once('message', (message) => {
+    worker.on('message', (message) => {
+      if (message?.type === 'diagnostic') return;
       if (message?.type === 'done') resolve(message.data);
       else reject(new Error(message?.error || 'worker query failed'));
     });

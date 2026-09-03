@@ -56,6 +56,44 @@ export function isHistoryFtsComplete(db: Database.Database): boolean {
     return getIndexMeta(db, 'fts_index_complete') !== '0';
 }
 
+export function isHistoryTopicStatsComplete(db: Database.Database): boolean {
+    return getIndexMeta(db, 'topic_stats_complete') === '1' && tableExists(db, 'history_topic_stats');
+}
+
+export function markHistoryTopicStatsDirty(db: Database.Database): void {
+    setIndexMeta(db, 'topic_stats_complete', '0');
+}
+
+export function rebuildHistoryTopicStats(db: Database.Database): { topics: number; messages: number; elapsedMs: number } {
+    const startedAt = Date.now();
+    let topics = 0;
+    let messages = 0;
+    const rebuild = db.transaction(() => {
+        markHistoryTopicStatsDirty(db);
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS history_topic_stats (
+                topic TEXT PRIMARY KEY,
+                count INTEGER NOT NULL,
+                latest_time INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            DELETE FROM history_topic_stats;
+            INSERT INTO history_topic_stats(topic, count, latest_time)
+            SELECT topic, COUNT(*), MAX(time_ms)
+            FROM history_messages INDEXED BY idx_history_messages_topic_time_msg
+            GROUP BY topic;
+        `);
+        const row = db.prepare(
+            'SELECT COUNT(*) AS topics, COALESCE(SUM(count), 0) AS messages FROM history_topic_stats'
+        ).get() as { topics: number; messages: number };
+        topics = Number(row.topics) || 0;
+        messages = Number(row.messages) || 0;
+        setIndexMeta(db, 'topic_stats_built_at', Date.now());
+        setIndexMeta(db, 'topic_stats_complete', '1');
+    });
+    rebuild();
+    return { topics, messages, elapsedMs: Date.now() - startedAt };
+}
+
 function tableExists(db: Database.Database, name: string): boolean {
     const row = db.prepare('SELECT name FROM sqlite_master WHERE name = ?').get(name);
     return Boolean(row);
@@ -129,7 +167,7 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
     const resetIndex = options.rebuild || hasPayloadColumn || !hasCompactColumns || version !== HISTORY_INDEX_SCHEMA_VERSION;
 
     if (resetIndex) {
-        db.exec('DROP TABLE IF EXISTS history_messages_fts; DROP TABLE IF EXISTS history_fts_pending; DROP TABLE IF EXISTS history_messages;');
+        db.exec('DROP TABLE IF EXISTS history_messages_fts; DROP TABLE IF EXISTS history_fts_pending; DROP TABLE IF EXISTS history_topic_stats; DROP TABLE IF EXISTS history_messages;');
     }
     const layout: HistoryFtsLayout = 'contentless';
     if (layout === 'contentless') {
@@ -149,8 +187,7 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
             CREATE INDEX IF NOT EXISTS idx_history_messages_time_topic_msg ON history_messages(time_ms, topic, msg_index);
             CREATE INDEX IF NOT EXISTS idx_history_messages_topic_time_msg ON history_messages(topic, time_ms, msg_index);
             CREATE TABLE IF NOT EXISTS history_fts_pending (
-                id INTEGER PRIMARY KEY,
-                search_text TEXT NOT NULL
+                id INTEGER PRIMARY KEY
             );
         `);
     } else {
@@ -183,6 +220,7 @@ export function ensureHistoryIndexSchema(db: Database.Database, options: { initi
     setIndexMeta(db, 'fts5_tokenizer', tokenizer);
     setIndexMeta(db, 'fts_layout', layout);
     setIndexMeta(db, 'fts_query_mode', tokenizer === 'trigram' ? 'compact-trigram-candidates' : 'scan');
+    if (resetIndex) markHistoryTopicStatsDirty(db);
     if (options.initializeCompletion) {
         const complete = getIndexMeta(db, 'index_complete');
         if (resetIndex || !complete) {

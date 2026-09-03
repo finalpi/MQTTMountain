@@ -113,15 +113,16 @@ export function useMqttReplay() {
                     await waitIfPaused();
                     if (state.stopRequested) break;
                     const row = options.rows[i];
-                    state.currentIndex = i;
-                    state.currentTopic = row.topic;
-                    state.currentTime = row.time;
                     if (i > 0) {
                         await waitForDelta(options.rows[i - 1], row, options.speed);
                         if (state.stopRequested) break;
                         await waitIfPaused();
                         if (state.stopRequested) break;
                     }
+                    // 等待节奏结束后才更新“当前消息”，避免预览提前显示尚未发布的行。
+                    state.currentIndex = i;
+                    state.currentTopic = row.topic;
+                    state.currentTime = row.time;
                     const tw = options.timestampRewrite ?? 'off';
                     const payload = rewriteReplayPayloadTimestamps(row.payload, tw);
                     const result = await window.api.mqttPublish({

@@ -9,10 +9,11 @@ const props = defineProps<{
 const loading = ref(false);
 const error = ref('');
 const frameHtml = ref('');
+let loadSeq = 0;
 
 const isWebView = computed(() => props.view.type === 'web');
 
-function injectBridge(html: string, baseUrl: string): string {
+function injectBridge(html: string, baseUrl: string, view: typeof props.view): string {
 const bridge = `
 <base href="${baseUrl}">
 <script>
@@ -20,10 +21,10 @@ window.MqttMountainHost = {
   api: window.parent.api,
   bridge: window.parent.__MM_PLUGIN_HOST_BRIDGE__,
   view: ${JSON.stringify({
-      id: props.view.id,
-      name: props.view.name,
-      pluginId: props.view.pluginId,
-      pluginName: props.view.pluginName
+      id: view.id,
+      name: view.name,
+      pluginId: view.pluginId,
+      pluginName: view.pluginName
   })}
 };
 <\/script>`;
@@ -34,6 +35,8 @@ window.MqttMountainHost = {
 }
 
 async function loadView(): Promise<void> {
+    const seq = ++loadSeq;
+    const view = { ...props.view };
     if (!isWebView.value) {
         error.value = '该插件视图不是自定义页面';
         frameHtml.value = '';
@@ -43,17 +46,23 @@ async function loadView(): Promise<void> {
     error.value = '';
     try {
         const result = await window.api.pluginReadViewHtml({
-            pluginId: props.view.pluginId,
-            viewId: props.view.id
+            pluginId: view.pluginId,
+            viewId: view.id
         });
+        if (seq !== loadSeq || props.view.pluginId !== view.pluginId || props.view.id !== view.id) return;
         if (!result.success || !result.data) {
             error.value = result.message || '插件页面加载失败';
             frameHtml.value = '';
             return;
         }
-        frameHtml.value = injectBridge(result.data.html, result.data.baseUrl);
+        frameHtml.value = injectBridge(result.data.html, result.data.baseUrl, view);
+    } catch (loadError) {
+        if (seq === loadSeq) {
+            error.value = loadError instanceof Error ? loadError.message : String(loadError);
+            frameHtml.value = '';
+        }
     } finally {
-        loading.value = false;
+        if (seq === loadSeq) loading.value = false;
     }
 }
 

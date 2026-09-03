@@ -23,6 +23,7 @@ export default defineConfig(({ command }) => {
                             sourcemap: !isBuild,
                             minify: isBuild,
                             outDir: 'dist-electron/main',
+                            emptyOutDir: true,
                             rollupOptions: {
                                 input: {
                                     index: path.resolve(__dirname, 'electron/main/index.ts'),
@@ -30,6 +31,7 @@ export default defineConfig(({ command }) => {
                                     'history-query-worker': path.resolve(__dirname, 'electron/main/history-query-worker.ts'),
                                     'history-index-worker': path.resolve(__dirname, 'electron/main/history-index-worker.ts'),
                                     'auto-delete-worker': path.resolve(__dirname, 'electron/main/auto-delete-worker.ts'),
+                                    'log-dir-worker': path.resolve(__dirname, 'electron/main/log-dir-worker.ts'),
                                     'storage-worker': path.resolve(__dirname, 'electron/main/storage-worker.ts')
                                 },
                                 external: ['electron', 'better-sqlite3', 'mqtt']
@@ -44,6 +46,7 @@ export default defineConfig(({ command }) => {
                             sourcemap: !isBuild ? 'inline' : false,
                             minify: isBuild,
                             outDir: 'dist-electron/preload',
+                            emptyOutDir: true,
                             rollupOptions: {
                                 external: ['electron']
                             }

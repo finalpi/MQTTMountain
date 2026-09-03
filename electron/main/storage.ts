@@ -19,13 +19,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Worker, isMainThread } from 'node:worker_threads';
 import Database from 'better-sqlite3';
-import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions } from '../../shared/types';
+import type { HistoryIndexStatus, HistoryMessage, HistoryQueryOptions, StorageDiskPressureState } from '../../shared/types';
 import {
     appendEntriesToBucketBlob,
     bucketUncompressedBytes,
     decodeBucket,
     encodeBucket,
     iterateBucketEntries,
+    unpackBucketBlob,
     validateBucketBlob,
     type BucketEntry,
     type BucketItem,
@@ -51,9 +52,19 @@ import {
     getIndexMeta,
     HISTORY_INDEX_SCHEMA_VERSION,
     isHistoryFtsComplete,
+    isHistoryTopicStatsComplete,
+    markHistoryTopicStatsDirty,
+    rebuildHistoryTopicStats,
     setIndexMeta,
     type HistoryFtsLayout
 } from './history-index-schema';
+import {
+    deleteAllOwnedHistory,
+    deleteOwnedConnectionHistory,
+    ensureOwnedConnectionDir,
+    ensureOwnedLogRoot,
+    isOwnedConnectionDirInRoot
+} from './log-root-safety';
 
 const MAX_OPEN_LOG_DBS = 8;
 
@@ -65,6 +76,7 @@ interface LogDbPack {
     db: Database.Database;
     schemaVersion: string;
     ftsLayout: HistoryFtsLayout;
+    topicStatsComplete: boolean;
     getStmt: Database.Statement;
     upsertStmt: Database.Statement;
     insertIndexStmt: Database.Statement;
@@ -146,23 +158,48 @@ let storageFlushLastMs = 0;
 let storageFlushCompletedAt = 0;
 let storageFlushMaxMs = 0;
 let storageFlushErrors = 0;
+let storageSlowFlushes = 0;
+let storageVerySlowFlushes = 0;
 let staleShardFinalizeTimer: NodeJS.Timeout | null = null;
 let staleShardCandidates: Array<{ san: string; key: string; path: string }> | null = null;
 let closedFtsBatchEntries = 10_000;
 let closedFtsDeferredForRealtime = 0;
 let closedFtsCandidateScans = 0;
+let closedFtsCycles = 0;
+let closedFtsSlowCycles = 0;
+let closedFtsLastCycleMs = 0;
+let closedFtsMaxCycleMs = 0;
 let deferredFtsRuns = 0;
 let deferredFtsIndexedEntries = 0;
 let deferredFtsLastMs = 0;
 let deferredFtsMaxMs = 0;
 let deferredFtsErrors = 0;
+let deferredFtsSkippedEntries = 0;
 let finalizedShards = 0;
 let finalizedShardErrors = 0;
+let topicStatsBuilds = 0;
+let topicStatsTopics = 0;
+let topicStatsMessages = 0;
+let topicStatsLastMs = 0;
+let topicStatsMaxMs = 0;
+let topicStatsErrors = 0;
 let storageDiagnosticListener: ((label: string, ...values: unknown[]) => void) | null = null;
+let storageDiskPressureListener: ((state: StorageDiskPressureState) => void) | null = null;
+let storageDiskPressureTimer: NodeJS.Timeout | null = null;
+let storageDiskLastCheckAt = 0;
+let storageDiskSkippedEntries = 0;
+let storageDiskState: StorageDiskPressureState = {
+    level: 'normal', logRoot: '', totalBytes: 0, freeBytes: 0, freeRatio: 1, historyWritesPaused: false
+};
 const STORAGE_FLUSH_MS = 1000;
 const STORAGE_FLUSH_BYTES = 4 * 1024 * 1024;
 const STORAGE_HARD_ENTRIES = 20_000;
-const STORAGE_WORKER_BATCH_MS = 50;
+// The storage worker itself commits on an approximately one-second cadence.
+// A 50 ms producer timer created ~4 durable RPCs per SQLite flush in production;
+// coalescing for 500 ms roughly halves durable RPCs in the steady-rate benchmark
+// while the explicit flush/shutdown watermark still bypasses this timer. Byte/entry
+// hard limits continue to flush bursts immediately.
+const STORAGE_WORKER_BATCH_MS = Math.max(50, Number(process.env.MQTTMOUNTAIN_STORAGE_BATCH_MS) || 500);
 const STORAGE_WORKER_BATCH_BYTES = 1024 * 1024;
 const STORAGE_WORKER_BATCH_ENTRIES = 2000;
 const STORAGE_WORKER_MAX_IN_FLIGHT_BATCHES = 4;
@@ -179,21 +216,67 @@ const STORAGE_WORKER_BATCH_ACK_TIMEOUT_MS = 0;
 const STORAGE_WORKER_SHUTDOWN_TIMEOUT_MS = 55_000;
 const DEFERRED_FTS_BATCH_ENTRIES = 1_000;
 const CLOSED_FTS_INTERVAL_MS = Math.max(50, Number(process.env.MQTTMOUNTAIN_CLOSED_FTS_INTERVAL_MS) || 15_000);
-const CLOSED_FTS_INITIAL_BATCH_ENTRIES = Math.max(1, Number(process.env.MQTTMOUNTAIN_CLOSED_FTS_BATCH_ENTRIES) || 10_000);
-const CLOSED_FTS_MIN_BATCH_ENTRIES = Math.min(1_000, CLOSED_FTS_INITIAL_BATCH_ENTRIES);
+const CLOSED_FTS_INITIAL_BATCH_ENTRIES = Math.max(1, Number(process.env.MQTTMOUNTAIN_CLOSED_FTS_BATCH_ENTRIES) || 500);
+const CLOSED_FTS_MIN_BATCH_ENTRIES = Math.min(100, CLOSED_FTS_INITIAL_BATCH_ENTRIES);
 const CLOSED_FTS_MAX_BATCH_ENTRIES = Math.max(CLOSED_FTS_INITIAL_BATCH_ENTRIES, 20_000);
 const CLOSED_FTS_TARGET_BATCH_MS = 750;
 const CLOSED_FTS_REALTIME_FLUSH_BUDGET_MS = 500;
 const USE_STORAGE_WORKER = isMainThread && process.env.MQTTMOUNTAIN_STORAGE_WORKER !== '0';
+const STORAGE_DISK_CHECK_INTERVAL_MS = 60_000;
+const STORAGE_DISK_CHECK_THROTTLE_MS = 15_000;
+const STORAGE_DISK_WARNING_BYTES = Math.max(64 * 1024 * 1024, Number(process.env.MQTTMOUNTAIN_DISK_WARNING_BYTES) || 2 * 1024 * 1024 * 1024);
+const STORAGE_DISK_CRITICAL_BYTES = Math.max(32 * 1024 * 1024, Number(process.env.MQTTMOUNTAIN_DISK_CRITICAL_BYTES) || 512 * 1024 * 1024);
+
+function checkStorageDiskPressure(force = false): void {
+    if (!isMainThread || !LOG_ROOT) return;
+    const now = Date.now();
+    if (!force && now - storageDiskLastCheckAt < STORAGE_DISK_CHECK_THROTTLE_MS) return;
+    storageDiskLastCheckAt = now;
+    try {
+        const stats = fs.statfsSync(LOG_ROOT);
+        const totalBytes = Number(stats.blocks) * Number(stats.bsize);
+        const freeBytes = Number(stats.bavail) * Number(stats.bsize);
+        const freeRatio = totalBytes > 0 ? freeBytes / totalBytes : 1;
+        const level: StorageDiskPressureState['level'] = freeBytes <= STORAGE_DISK_CRITICAL_BYTES || freeRatio <= 0.02
+            ? 'critical'
+            : freeBytes <= STORAGE_DISK_WARNING_BYTES || freeRatio <= 0.10
+                ? 'warning'
+                : 'normal';
+        const next: StorageDiskPressureState = {
+            level,
+            logRoot: LOG_ROOT,
+            totalBytes,
+            freeBytes,
+            freeRatio: Number(freeRatio.toFixed(4)),
+            historyWritesPaused: level === 'critical'
+        };
+        const changed = next.level !== storageDiskState.level || next.historyWritesPaused !== storageDiskState.historyWritesPaused;
+        storageDiskState = next;
+        if (changed || force) {
+            reportStorageDiagnostic('[storage] disk pressure', next);
+            storageDiskPressureListener?.(next);
+        }
+    } catch (error) {
+        reportStorageDiagnostic('[storage] disk pressure check failed', { logRoot: LOG_ROOT }, error);
+    }
+}
+
+function startStorageDiskMonitor(): void {
+    if (!isMainThread || storageDiskPressureTimer) return;
+    checkStorageDiskPressure(true);
+    storageDiskPressureTimer = setInterval(() => checkStorageDiskPressure(true), STORAGE_DISK_CHECK_INTERVAL_MS);
+    storageDiskPressureTimer.unref();
+}
 
 export function initStorage(logRoot: string): void {
-    LOG_ROOT = logRoot;
+    LOG_ROOT = ensureOwnedLogRoot(logRoot);
     storageAcceptingWrites = true;
     fs.mkdirSync(LOG_ROOT, { recursive: true });
     closedFtsBatchEntries = CLOSED_FTS_INITIAL_BATCH_ENTRIES;
     staleShardCandidates = null;
     if (USE_STORAGE_WORKER) ensureStorageWorker();
     else scheduleStaleShardFinalization();
+    startStorageDiskMonitor();
 }
 
 export function getLogRoot(): string {
@@ -231,6 +314,7 @@ export function getStorageDiagnostics(): Record<string, unknown> {
             key,
             ftsLayout: pack.ftsLayout,
             ftsComplete: isHistoryFtsComplete(pack.db),
+            topicStatsComplete: pack.topicStatsComplete,
             ftsIndexedId: Number(getIndexMeta(pack.db, 'fts_indexed_id') || 0),
             dbBytes: size(dbPath),
             walBytes: size(`${dbPath}-wal`),
@@ -254,6 +338,9 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         workerMaxAckMs: storageWorkerMaxAckMs,
         workerAckedBatches: storageWorkerAckedBatches,
         workerAckedEntries: storageWorkerAckedEntries,
+        workerAvgAckedBatchEntries: storageWorkerAckedBatches
+            ? Number((storageWorkerAckedEntries / storageWorkerAckedBatches).toFixed(1))
+            : 0,
         workerAcceptedSequence: storageWorkerAcceptedSequence,
         workerCommittedSequence: storageWorkerCommittedSequence,
         workerDurableWatermarkLag: storageWorkerAcceptedSequence - storageWorkerCommittedSequence,
@@ -263,6 +350,8 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         workerWatermarkMaxMs: storageWorkerWatermarkMaxMs,
         workerPendingRpc: storageWorkerRequests.size,
         workerDrainWaiters: storageWorkerDrainWaiters.size,
+        diskPressure: storageDiskState,
+        diskSkippedEntries: storageDiskSkippedEntries,
         storageBackpressured,
         enqueuedEntries: storageEnqueuedEntries,
         enqueuedBytes: storageEnqueuedBytes,
@@ -282,19 +371,32 @@ export function getStorageDiagnostics(): Record<string, unknown> {
         flushMaxMs: storageFlushMaxMs,
         flushAvgMs: storageFlushCount ? Math.round(storageFlushTotalMs / storageFlushCount) : 0,
         flushErrors: storageFlushErrors,
+        slowFlushesOver500Ms: storageSlowFlushes,
+        verySlowFlushesOver5000Ms: storageVerySlowFlushes,
         deferredFtsRuns,
         deferredFtsIndexedEntries,
         deferredFtsLastMs,
         deferredFtsMaxMs,
         deferredFtsErrors,
+        deferredFtsSkippedEntries,
         deferredFtsScheduled: false,
         closedFtsScheduled: staleShardFinalizeTimer != null,
         closedFtsBatchEntries,
         closedFtsDeferredForRealtime,
         closedFtsCandidateScans,
+        closedFtsCycles,
+        closedFtsSlowCycles,
+        closedFtsLastCycleMs,
+        closedFtsMaxCycleMs,
         closedFtsCandidateCount: staleShardCandidates?.length ?? null,
         finalizedShards,
         finalizedShardErrors,
+        topicStatsBuilds,
+        topicStatsTopics,
+        topicStatsMessages,
+        topicStatsLastMs,
+        topicStatsMaxMs,
+        topicStatsErrors,
         openLogDbs: logDbCache.size,
         openDbFiles,
         maintenancePauseDepth,
@@ -305,8 +407,17 @@ export function getStorageDiagnostics(): Record<string, unknown> {
     };
 }
 
+export function getPendingStorageEntryCount(): number {
+    return pending.length;
+}
+
 export function setStorageDiagnosticListener(listener: ((label: string, ...values: unknown[]) => void) | null): void {
     storageDiagnosticListener = listener;
+}
+
+export function setStorageDiskPressureListener(listener: ((state: StorageDiskPressureState) => void) | null): void {
+    storageDiskPressureListener = listener;
+    if (listener && storageDiskState.logRoot) listener(storageDiskState);
 }
 
 function reportStorageDiagnostic(label: string, ...values: unknown[]): void {
@@ -382,19 +493,24 @@ function isCurrentHistoryIndexDb(filePath: string): boolean {
 
 function purgeNonCurrentHistoryIndexDbs(): number {
     if (!LOG_ROOT || !fs.existsSync(LOG_ROOT)) return 0;
-    let deleted = 0;
+    let preserved = 0;
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
+        if (!isOwnedConnectionDirInRoot(LOG_ROOT, dir)) continue;
         const files = fs.readdirSync(dir).filter((file) => HISTORY_DB_FILE_RE.test(file));
         for (const file of files) {
             const filePath = path.join(dir, file);
             if (isCurrentHistoryIndexDb(filePath)) continue;
-            deleted += deleteDayDbFiles(filePath);
+            // Buckets remain queryable through the raw fallback even when an index is
+            // old, incomplete or temporarily unreadable. Never turn an index/version
+            // problem into automatic history deletion during startup.
+            preserved++;
+            reportStorageDiagnostic('[storage] preserved history with unavailable index', { filePath });
         }
     }
-    if (deleted > 0) console.info(`[storage] purged ${deleted} old history db files; new history uses index schema v${HISTORY_INDEX_SCHEMA_VERSION}`);
-    return deleted;
+    if (preserved > 0) console.warn(`[storage] preserved ${preserved} history files with unavailable indexes; queries will use raw fallback`);
+    return 0;
 }
 
 function rejectStorageWorkerRequests(error: Error): void {
@@ -622,13 +738,19 @@ function refreshIndexedCounts(db: Database.Database): void {
 
 function appendBucketIndex(pack: LogDbPack, bucketSec: number, topic: string, entries: BucketEntry[]): void {
     for (const entry of entries) {
-        const searchText = normalizeSearchText(topic, entry.payload);
-        const inserted = pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
-            ? pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen)
-            : pack.insertIndexStmt.run(bucketSec, topic, entry.msgIndex, entry.time, searchText, entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen);
         if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-            pack.insertPendingFtsStmt?.run(Number(inserted.lastInsertRowid), searchText);
+            const inserted = pack.insertIndexStmt.run(
+                bucketSec, topic, entry.msgIndex, entry.time,
+                entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen
+            );
+            pack.insertPendingFtsStmt?.run(Number(inserted.lastInsertRowid));
+            continue;
         }
+        const searchText = normalizeSearchText(topic, entry.payload);
+        pack.insertIndexStmt.run(
+            bucketSec, topic, entry.msgIndex, entry.time, searchText,
+            entry.payloadOffset, entry.payloadLen, entry.entryOffset, entry.entryLen
+        );
         pack.insertFtsStmt?.run(searchText, bucketSec, topic, entry.msgIndex, entry.time);
     }
     if (entries.length > 0 && pack.ftsLayout === 'contentless' && pack.insertDeferredFtsStmt) {
@@ -650,6 +772,90 @@ function deferredFtsCursor(pack: LogDbPack): number {
     return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+interface PendingFtsIndexRow {
+    id: number;
+    bucket_ts: number | null;
+    topic: string | null;
+    msg_index: number | null;
+    payload_offset: number | null;
+    payload_len: number | null;
+}
+
+function isPendingFtsBucketStructurallyValid(raw: Buffer, bucket: ExistingBucketRow): boolean {
+    if (bucket.bytes !== bucket.blob.length || raw.length < 4) return false;
+    const count = raw.readUInt32LE(0);
+    if (count !== bucket.count) return false;
+    let offset = 4;
+    for (let index = 0; index < count; index++) {
+        if (offset + 6 > raw.length) return false;
+        const payloadLength = raw.readUInt32LE(offset + 2);
+        offset += 6;
+        if (offset + payloadLength > raw.length) return false;
+        offset += payloadLength;
+    }
+    return offset === raw.length;
+}
+
+function derivePendingFtsBatch(pack: LogDbPack, batchEntries: number): {
+    selected: number;
+    rows: Array<{ id: number; searchText: string }>;
+    orphanIds: number[];
+    skipped: number;
+} {
+    const pending = pack.db.prepare(`
+        SELECT p.id, m.bucket_ts, m.topic, m.msg_index, m.payload_offset, m.payload_len
+        FROM history_fts_pending p
+        LEFT JOIN history_messages m ON m.id = p.id
+        ORDER BY p.id ASC
+        LIMIT ?
+    `).all(batchEntries) as PendingFtsIndexRow[];
+    const groups = new Map<string, { bucketTs: number; topic: string; rows: PendingFtsIndexRow[] }>();
+    const orphanIds: number[] = [];
+    for (const row of pending) {
+        if (row.bucket_ts == null || row.topic == null) {
+            orphanIds.push(row.id);
+            continue;
+        }
+        const key = `${row.bucket_ts}\0${row.topic}`;
+        let group = groups.get(key);
+        if (!group) {
+            group = { bucketTs: row.bucket_ts, topic: row.topic, rows: [] };
+            groups.set(key, group);
+        }
+        group.rows.push(row);
+    }
+
+    const rows: Array<{ id: number; searchText: string }> = [];
+    let skipped = 0;
+    for (const group of groups.values()) {
+        try {
+            const bucket = pack.getStmt.get(group.bucketTs, group.topic) as ExistingBucketRow | undefined;
+            if (!bucket || !Buffer.isBuffer(bucket.blob)) {
+                skipped += group.rows.length;
+                continue;
+            }
+            const raw = unpackBucketBlob(bucket.blob);
+            if (!isPendingFtsBucketStructurallyValid(raw, bucket)) {
+                skipped += group.rows.length;
+                continue;
+            }
+            for (const row of group.rows) {
+                const start = Number(row.payload_offset);
+                const length = Number(row.payload_len);
+                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(length) || start < 4 || length < 0 || start + length > raw.length) {
+                    skipped++;
+                    continue;
+                }
+                const payload = raw.subarray(start, start + length).toString('utf8');
+                rows.push({ id: row.id, searchText: normalizeSearchText(group.topic, payload) });
+            }
+        } catch {
+            skipped += group.rows.length;
+        }
+    }
+    return { selected: pending.length, rows, orphanIds, skipped };
+}
+
 function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string, batchEntries = DEFERRED_FTS_BATCH_ENTRIES): number {
     if (pack.ftsLayout !== 'contentless' || !pack.insertDeferredFtsStmt) return 0;
     const startedAt = Date.now();
@@ -658,43 +864,56 @@ function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string
         let cursor = deferredFtsCursor(pack);
         while (true) {
             let batchCount = 0;
+            let processedCount = 0;
             if (pack.schemaVersion === HISTORY_INDEX_SCHEMA_VERSION) {
-                // Keep the transient search text in memory while deleting the durable
-                // pending rows first. SQLite can then reuse those freed pages for FTS,
-                // avoiding the old insert-then-delete file growth pattern.
+                // v6 persists only row IDs. Search text is reconstructed from the
+                // durable bucket and history offsets, grouped so compressed blobs are
+                // inflated at most once per batch.
+                const derived = derivePendingFtsBatch(pack, batchEntries);
+                if (derived.skipped > 0) deferredFtsSkippedEntries += derived.skipped;
                 pack.db.pragma('temp_store = MEMORY');
                 pack.db.exec('CREATE TEMP TABLE IF NOT EXISTS temp_history_fts_batch (id INTEGER PRIMARY KEY, search_text TEXT NOT NULL)');
+                const insertTemp = pack.db.prepare('INSERT INTO temp_history_fts_batch(id, search_text) VALUES (?, ?)');
+                const deletePendingId = pack.db.prepare('DELETE FROM history_fts_pending WHERE id = ?');
                 const writeBatch = pack.db.transaction(() => {
                     pack.db.exec('DELETE FROM temp_history_fts_batch');
-                    pack.db.prepare(`
-                        INSERT INTO temp_history_fts_batch(id, search_text)
-                        SELECT id, search_text FROM history_fts_pending ORDER BY id ASC LIMIT ?
-                    `).run(batchEntries);
-                    const batch = pack.db.prepare('SELECT COUNT(*) AS count, MAX(id) AS maxId FROM temp_history_fts_batch').get() as {
-                        count: number;
-                        maxId: number | null;
-                    };
-                    batchCount = Number(batch.count) || 0;
-                    if (batchCount === 0 || batch.maxId == null) {
-                        setIndexMeta(pack.db, 'fts_index_complete', '1');
-                        return;
+                    for (const row of derived.rows) insertTemp.run(row.id, row.searchText);
+                    for (const id of derived.orphanIds) deletePendingId.run(id);
+                    batchCount = derived.rows.length;
+                    processedCount = batchCount + derived.orphanIds.length;
+                    if (batchCount > 0) {
+                        pack.db.prepare('DELETE FROM history_fts_pending WHERE id IN (SELECT id FROM temp_history_fts_batch)').run();
+                        pack.db.exec(`
+                            INSERT INTO history_messages_fts(rowid, search_text)
+                            SELECT id, search_text FROM temp_history_fts_batch ORDER BY id ASC
+                        `);
                     }
-                    cursor = Number(batch.maxId);
-                    pack.db.prepare('DELETE FROM history_fts_pending WHERE id IN (SELECT id FROM temp_history_fts_batch)').run();
-                    pack.db.exec(`
-                        INSERT INTO history_messages_fts(rowid, search_text)
-                        SELECT id, search_text FROM temp_history_fts_batch ORDER BY id ASC
-                    `);
+                    const firstPending = pack.db.prepare('SELECT MIN(id) AS id FROM history_fts_pending').get() as { id: number | null };
+                    if (firstPending.id == null) {
+                        const maxHistory = pack.db.prepare('SELECT COALESCE(MAX(id), 0) AS id FROM history_messages').get() as { id: number };
+                        cursor = Number(maxHistory.id) || 0;
+                    } else {
+                        cursor = Math.max(0, Number(firstPending.id) - 1);
+                    }
                     setIndexMeta(pack.db, 'fts_indexed_id', cursor);
                     const hasMore = Boolean(pack.db.prepare('SELECT 1 FROM history_fts_pending LIMIT 1').get());
                     setIndexMeta(pack.db, 'fts_index_complete', hasMore ? '0' : '1');
                 });
                 writeBatch();
+                if (derived.skipped > 0 && (deferredFtsSkippedEntries === derived.skipped || deferredFtsSkippedEntries % 1000 < derived.skipped)) {
+                    reportStorageDiagnostic('[storage] deferred fts payload recovery skipped', {
+                        key: pack.key,
+                        selected: derived.selected,
+                        skipped: derived.skipped,
+                        totalSkipped: deferredFtsSkippedEntries
+                    });
+                }
             } else {
                 const rows = pack.db.prepare(
                     'SELECT id, search_text FROM history_messages WHERE id > ? ORDER BY id ASC LIMIT ?'
                 ).all(cursor, batchEntries) as Array<{ id: number; search_text: string }>;
                 batchCount = rows.length;
+                processedCount = batchCount;
                 if (batchCount === 0) {
                     setIndexMeta(pack.db, 'fts_index_complete', '1');
                     break;
@@ -708,14 +927,14 @@ function flushDeferredFtsForPack(pack: LogDbPack, force: boolean, reason: string
                 writeBatch();
             }
             indexed += batchCount;
-            if (batchCount === 0 || !force || batchCount < batchEntries) break;
+            if (processedCount === 0 || !force || processedCount < batchEntries) break;
         }
         const elapsed = Date.now() - startedAt;
         deferredFtsRuns++;
         deferredFtsIndexedEntries += indexed;
         deferredFtsLastMs = elapsed;
         deferredFtsMaxMs = Math.max(deferredFtsMaxMs, elapsed);
-        if (indexed > 0) {
+        if (indexed > 0 && reason !== 'closed-shard-catchup') {
             reportStorageDiagnostic('[storage] deferred fts batch', {
                 key: pack.key,
                 reason,
@@ -764,6 +983,27 @@ function finalizeShard(pack: LogDbPack, reason: string): boolean {
             });
             return false;
         }
+        if (!pack.topicStatsComplete && reason === 'hour-rollover') {
+            reportStorageDiagnostic('[storage] shard topic stats deferred', { key: pack.key, reason });
+            return false;
+        }
+        if (!pack.topicStatsComplete && getIndexMeta(pack.db, 'index_complete') === '1') {
+            try {
+                const stats = rebuildHistoryTopicStats(pack.db);
+                topicStatsBuilds++;
+                topicStatsTopics += stats.topics;
+                topicStatsMessages += stats.messages;
+                topicStatsLastMs = stats.elapsedMs;
+                topicStatsMaxMs = Math.max(topicStatsMaxMs, stats.elapsedMs);
+                pack.topicStatsComplete = true;
+                reportStorageDiagnostic('[storage] history topic stats built', { key: pack.key, ...stats });
+            } catch (error) {
+                topicStatsErrors++;
+                pack.topicStatsComplete = false;
+                try { markHistoryTopicStatsDirty(pack.db); } catch {}
+                reportStorageDiagnostic('[storage] history topic stats failed', { key: pack.key, reason }, error);
+            }
+        }
         // FTS5 optimize may rewrite multiple gigabytes and block the realtime writer
         // for several minutes. A completed contentless index is already queryable;
         // keep rollover bounded to metadata + WAL checkpoint only.
@@ -811,6 +1051,7 @@ function findStaleShardCandidates(currentKey: string): Array<{ san: string; key:
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
     for (const dirEntry of dirs) {
         const dir = path.join(LOG_ROOT, dirEntry.name);
+        if (!isOwnedConnectionDirInRoot(LOG_ROOT, dir)) continue;
         const files = fs.readdirSync(dir).filter((file) => HISTORY_DB_FILE_RE.test(file));
         for (const file of files) {
             const key = file.slice(0, -3);
@@ -823,7 +1064,9 @@ function findStaleShardCandidates(currentKey: string): Array<{ san: string; key:
                 // v5 files are immutable compatibility archives. They remain queryable,
                 // but realtime storage maintenance must never reopen or modify them.
                 if (getIndexMeta(db, 'schema_version') !== HISTORY_INDEX_SCHEMA_VERSION) continue;
-                if (getIndexMeta(db, 'fts_finalized_at')) continue;
+                const ftsFinalized = Boolean(getIndexMeta(db, 'fts_finalized_at'));
+                const topicStatsNeeded = getIndexMeta(db, 'index_complete') === '1' && !isHistoryTopicStatsComplete(db);
+                if (ftsFinalized && !topicStatsNeeded) continue;
                 candidates.push({ san: dirEntry.name, key, path: filePath });
             } catch (error) {
                 reportStorageDiagnostic('[storage] stale shard inspect failed', { filePath }, error);
@@ -881,20 +1124,28 @@ function runStaleShardFinalization(): void {
         : 0;
     const elapsedMs = Date.now() - cycleStartedAt;
     if (indexed >= requestedBatchEntries && elapsedMs > 0) {
-        const factor = Math.max(0.5, Math.min(2, CLOSED_FTS_TARGET_BATCH_MS / elapsedMs));
-        const adjusted = Math.round((requestedBatchEntries * factor) / 500) * 500;
+        const factor = Math.max(0.1, Math.min(2, CLOSED_FTS_TARGET_BATCH_MS / elapsedMs));
+        const adjusted = Math.round((requestedBatchEntries * factor) / 100) * 100;
         closedFtsBatchEntries = Math.max(CLOSED_FTS_MIN_BATCH_ENTRIES, Math.min(CLOSED_FTS_MAX_BATCH_ENTRIES, adjusted));
     }
-    const finalized = finalizeShard(pack, 'background-catchup');
-    reportStorageDiagnostic('[storage] closed FTS catchup cycle', {
-        key: pack.key,
-        indexed,
-        requestedBatchEntries,
-        nextBatchEntries: closedFtsBatchEntries,
-        elapsedMs,
-        finalized,
-        remainingCandidates: staleShardCandidates.length
-    });
+    const finalized = isHistoryFtsComplete(pack.db) ? finalizeShard(pack, 'background-catchup') : false;
+    closedFtsCycles++;
+    closedFtsLastCycleMs = elapsedMs;
+    closedFtsMaxCycleMs = Math.max(closedFtsMaxCycleMs, elapsedMs);
+    if (elapsedMs > CLOSED_FTS_TARGET_BATCH_MS * 2) closedFtsSlowCycles++;
+    if (finalized || elapsedMs > CLOSED_FTS_TARGET_BATCH_MS * 2 || closedFtsCycles % 20 === 0) {
+        reportStorageDiagnostic('[storage] closed FTS catchup cycle', {
+            key: pack.key,
+            indexed,
+            requestedBatchEntries,
+            nextBatchEntries: closedFtsBatchEntries,
+            elapsedMs,
+            finalized,
+            remainingCandidates: staleShardCandidates.length,
+            cycles: closedFtsCycles,
+            slowCycles: closedFtsSlowCycles
+        });
+    }
     if (finalized) {
         try { pack.db.close(); } catch {}
         logDbCache.delete(pack.key);
@@ -935,8 +1186,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     }
     finalizeClosedHourShards(dk);
     evictLogDbIfNeeded();
-    const dir = path.join(LOG_ROOT, san);
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = ensureOwnedConnectionDir(LOG_ROOT, san, san);
     const filePath = path.join(dir, `${dk}.db`);
     const db = new Database(filePath);
     db.exec(`
@@ -996,8 +1246,15 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
     const insertDeferredFtsStmt = ftsTokenizer === 'none' || ftsLayout !== 'contentless'
         ? null
         : db.prepare('INSERT INTO history_messages_fts (rowid, search_text) VALUES (?, ?)');
+    const pendingFtsColumns = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
+        ? new Set(db.prepare('PRAGMA table_info(history_fts_pending)').all().map((column) => String((column as { name?: string }).name ?? '')))
+        : new Set<string>();
     const insertPendingFtsStmt = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION && ftsTokenizer !== 'none'
-        ? db.prepare('INSERT OR REPLACE INTO history_fts_pending (id, search_text) VALUES (?, ?)')
+        ? pendingFtsColumns.has('search_text')
+            // Existing v6 files keep their old table shape for compatibility, but
+            // new writes no longer duplicate the payload text durably.
+            ? db.prepare("INSERT OR REPLACE INTO history_fts_pending (id, search_text) VALUES (?, '')")
+            : db.prepare('INSERT OR REPLACE INTO history_fts_pending (id) VALUES (?)')
         : null;
     const deletePendingFtsStmt = schemaVersion === HISTORY_INDEX_SCHEMA_VERSION
         ? db.prepare('DELETE FROM history_fts_pending WHERE id IN (SELECT id FROM history_messages WHERE bucket_ts = ? AND topic = ?)')
@@ -1020,6 +1277,7 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         db,
         schemaVersion,
         ftsLayout,
+        topicStatsComplete: isHistoryTopicStatsComplete(db),
         getStmt,
         upsertStmt,
         insertIndexStmt,
@@ -1039,6 +1297,8 @@ function getOrOpenLogDb(san: string, dk: string): LogDbPack {
         ftsLayout,
         ftsComplete: isHistoryFtsComplete(db),
         ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
+        pendingFtsStoresText: pendingFtsColumns.has('search_text'),
+        topicStatsComplete: pack.topicStatsComplete,
         walAutoCheckpointPages: 65536,
         journalSizeLimitBytes: 268435456,
         bucketCompression: 'deflate-raw-level-1'
@@ -1195,12 +1455,24 @@ export function stopAcceptingStorageWrites(): void {
 
 export function enqueueMessage(connectionId: string, topic: string, payload: string, tsMs: number, meta: Partial<BucketItem> = {}): void {
     if (!storageAcceptingWrites || !connectionId) return;
+    checkStorageDiskPressure();
+    if (storageDiskState.historyWritesPaused) {
+        storageDiskSkippedEntries++;
+        if (storageDiskSkippedEntries === 1 || storageDiskSkippedEntries % 5000 === 0) {
+            reportStorageDiagnostic('[storage] history write skipped for critical disk space', {
+                skippedEntries: storageDiskSkippedEntries,
+                ...storageDiskState
+            });
+        }
+        return;
+    }
     const payloadSize = meta.payloadSize ?? meta.payloadBytes?.byteLength ?? payload.length;
     const entry = {
         connectionId,
         topic,
         payload,
         tsMs,
+        payloadBytes: meta.payloadBytes,
         payloadSize,
         payloadEncoding: meta.payloadEncoding,
         storageSequence: USE_STORAGE_WORKER ? ++storageWorkerAcceptedSequence : 0
@@ -1281,7 +1553,13 @@ function flushStorageLocal(): void {
         const bk = `${sec}|${e.topic}`;
         let g = m.get(bk);
         if (!g) { g = { connectionId: e.connectionId, sec, topic: e.topic, items: [] }; m.set(bk, g); }
-        g.items.push({ payload: e.payload, tsMs: e.tsMs });
+        g.items.push({
+            payload: e.payload,
+            payloadBytes: e.payloadBytes,
+            payloadSize: e.payloadSize,
+            payloadEncoding: e.payloadEncoding,
+            tsMs: e.tsMs
+        });
     }
 
     for (const [dayKey, groups] of byDay) {
@@ -1292,7 +1570,7 @@ function flushStorageLocal(): void {
         const dayEntries = dayGroups.reduce((sum, group) => sum + group.items.length, 0);
         const dayBytes = dayGroups.reduce(
             (sum, group) => sum + group.items.reduce(
-                (itemSum, item) => itemSum + Buffer.byteLength(item.payload, 'utf8') + group.topic.length + 16,
+                (itemSum, item) => itemSum + (item.payloadSize ?? item.payloadBytes?.byteLength ?? Buffer.byteLength(item.payload, 'utf8')) + group.topic.length + 16,
                 0
             ),
             0
@@ -1307,6 +1585,10 @@ function flushStorageLocal(): void {
             let dayBucketRawBytes = 0;
             let dayBucketStoredBytes = 0;
             const txn = pack.db.transaction(() => {
+                if (pack.topicStatsComplete) {
+                    markHistoryTopicStatsDirty(pack.db);
+                    pack.topicStatsComplete = false;
+                }
                 for (const g of groups.values()) {
                     const existing = pack.getStmt.get(g.sec, g.topic) as ExistingBucketRow | undefined;
                     let startIndex = 0;
@@ -1340,21 +1622,30 @@ function flushStorageLocal(): void {
                         } else {
                             indexFailed = true;
                             canAppendIndex = false;
-                            if (Buffer.isBuffer(existing.blob)) {
-                                backupBucketBlob(pack, g.sec, g.topic, existing, validation.reason);
-                            }
+                            const backupSaved = Buffer.isBuffer(existing.blob)
+                                ? backupBucketBlob(pack, g.sec, g.topic, existing, validation.reason)
+                                : false;
                             if (validation.structureValid && Buffer.isBuffer(existing.blob)) {
                                 const next = appendEntriesToBucketBlob(existing.blob, validation.count, g.items, g.sec);
                                 nextBlob = next.blob;
                                 pack.upsertStmt.run(g.sec, g.topic, next.blob, next.count, next.bytes);
                             } else {
-                                const oldItems = Buffer.isBuffer(existing.blob)
-                                    ? decodeBucket(existing.blob, g.sec, g.topic).map((m) => ({ payload: m.payload, tsMs: m.time }))
-                                    : [];
-                                const items = [...oldItems, ...g.items];
-                                const blob = encodeBucket(items, g.sec);
+                                if (Buffer.isBuffer(existing.blob) && !backupSaved) {
+                                    throw new Error(`failed to quarantine corrupt bucket: ${validation.reason || 'invalid bucket blob'}`);
+                                }
+                                // Structurally corrupt data must never be decoded again here: a damaged
+                                // compressed blob would throw forever and keep the durable watermark stuck.
+                                // The original bytes remain in bucket_blob_backups; the live bucket is reset
+                                // to the newly received messages so subsequent writes can make progress.
+                                const blob = encodeBucket(g.items, g.sec);
                                 nextBlob = blob;
-                                pack.upsertStmt.run(g.sec, g.topic, blob, items.length, blob.length);
+                                pack.upsertStmt.run(g.sec, g.topic, blob, g.items.length, blob.length);
+                                reportStorageDiagnostic('[storage] corrupt bucket quarantined', {
+                                    key: dayKey,
+                                    topic: g.topic,
+                                    reason: validation.reason,
+                                    replacementMessages: g.items.length
+                                });
                             }
                             console.warn('[storage] rewrite suspicious bucket', dayKey, g.topic, validation.reason);
                         }
@@ -1411,12 +1702,14 @@ function flushStorageLocal(): void {
     storageFlushCompletedAt = Date.now();
     storageFlushMaxMs = Math.max(storageFlushMaxMs, elapsed);
     storageFlushTotalMs += elapsed;
+    if (elapsed > 500) storageSlowFlushes++;
+    if (elapsed > 5_000) storageVerySlowFlushes++;
 }
 
 // ---------------- read ----------------
 function listDayFiles(san: string, descending: boolean): string[] {
     const dir = path.join(LOG_ROOT, san);
-    if (!fs.existsSync(dir)) return [];
+    if (!fs.existsSync(dir) || !isOwnedConnectionDirInRoot(LOG_ROOT, dir)) return [];
     const keys = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
     keys.sort();
     if (descending) keys.reverse();
@@ -1490,7 +1783,9 @@ export function queryHistory(opts: HistoryQueryOptions): HistoryMessage[] {
 
     const sanFilter = opts.connectionId ? sanitizeConnectionId(opts.connectionId) : null;
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
+        .filter((d) => d.isDirectory()
+            && isOwnedConnectionDirInRoot(LOG_ROOT, path.join(LOG_ROOT, d.name))
+            && (!sanFilter || d.name === sanFilter));
 
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
@@ -1583,7 +1878,9 @@ export function getHistoryIndexStatus(connectionId?: string | null): HistoryInde
     if (!fs.existsSync(LOG_ROOT)) return status;
     const sanFilter = connectionId ? sanitizeConnectionId(connectionId) : null;
     const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && (!sanFilter || d.name === sanFilter));
+        .filter((d) => d.isDirectory()
+            && isOwnedConnectionDirInRoot(LOG_ROOT, path.join(LOG_ROOT, d.name))
+            && (!sanFilter || d.name === sanFilter));
     for (const d of dirs) {
         const dir = path.join(LOG_ROOT, d.name);
         const files = fs.readdirSync(dir).filter((f) => HISTORY_DB_FILE_RE.test(f));
@@ -1656,6 +1953,60 @@ export async function closeAllLogDbsAsync(): Promise<void> {
     closeAllLogDbs();
 }
 
+export async function switchStorageLogRootAsync(logRoot: string): Promise<void> {
+    const nextRoot = ensureOwnedLogRoot(logRoot);
+    const current = path.resolve(LOG_ROOT);
+    const next = path.resolve(nextRoot);
+    const same = process.platform === 'win32'
+        ? current.toLowerCase() === next.toLowerCase()
+        : current === next;
+    if (same) return;
+    if (maintenancePauseDepth <= 0) throw new Error('切换日志目录前必须暂停存储写入');
+
+    if (USE_STORAGE_WORKER) {
+        await waitForStorageWorkerDrain();
+        if (storageWorker) await callStorageWorker('closeAll');
+        const worker = storageWorker;
+        storageWorkerShuttingDown = true;
+        try {
+            await worker?.terminate();
+        } finally {
+            storageWorker = null;
+            rejectStorageWorkerRequests(new Error('storage worker log root changed'));
+            storageWorkerShuttingDown = false;
+            storageWorkerFailure = null;
+            storageWorkerFailureLogged = false;
+            storageWorkerInFlightBatches = 0;
+            storageWorkerInFlightEntries = 0;
+            storageWorkerInFlightBytes = 0;
+            storageWorkerInFlightRanges.clear();
+            storageWorkerCompletedRanges.clear();
+        }
+    } else {
+        if (staleShardFinalizeTimer) {
+            clearTimeout(staleShardFinalizeTimer);
+            staleShardFinalizeTimer = null;
+        }
+        staleShardCandidates = null;
+        for (const [, value] of logDbCache) {
+            try { value.db.close(); } catch {}
+        }
+        logDbCache.clear();
+    }
+
+    LOG_ROOT = nextRoot;
+    storageDiskState = { ...storageDiskState, logRoot: nextRoot };
+    checkStorageDiskPressure(true);
+    staleShardCandidates = null;
+    if (staleShardFinalizeTimer) {
+        clearTimeout(staleShardFinalizeTimer);
+        staleShardFinalizeTimer = null;
+    }
+    if (USE_STORAGE_WORKER) ensureStorageWorker();
+    else scheduleStaleShardFinalization();
+    reportStorageDiagnostic('[storage] log root switched', { from: current, to: nextRoot });
+}
+
 export function clearLogs(connectionId?: string | null): { deletedFiles: number } {
     return withStorageMaintenance(() => {
         let deleted = 0;
@@ -1663,18 +2014,10 @@ export function clearLogs(connectionId?: string | null): { deletedFiles: number 
             const san = sanitizeConnectionId(connectionId);
             closeLogDbsForSan(san);
             const dir = path.join(LOG_ROOT, san);
-            if (fs.existsSync(dir)) {
-                deleted = countDayDbFiles(dir);
-                fs.rmSync(dir, { recursive: true, force: true });
-            }
+            if (isOwnedConnectionDirInRoot(LOG_ROOT, dir)) deleted = deleteOwnedConnectionHistory(dir, false);
         } else {
             closeAllLogDbs();
-            if (fs.existsSync(LOG_ROOT)) {
-                const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
-                for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
-                fs.rmSync(LOG_ROOT, { recursive: true, force: true });
-            }
-            fs.mkdirSync(LOG_ROOT, { recursive: true });
+            deleted = deleteAllOwnedHistory(LOG_ROOT, false).deletedFiles;
         }
         return { deletedFiles: deleted };
     });
@@ -1684,15 +2027,19 @@ export function clearLogsWithoutConnections(connectionIds: string[]): { deletedF
     return withStorageMaintenance(() => {
         const valid = new Set(connectionIds.filter(Boolean).map((id) => sanitizeConnectionId(id)));
         let deletedDirs = 0;
+        let deletedFiles = 0;
         if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
         const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
         for (const d of dirs) {
             if (valid.has(d.name)) continue;
+            const dir = path.join(LOG_ROOT, d.name);
+            if (!isOwnedConnectionDirInRoot(LOG_ROOT, dir)) continue;
             closeLogDbsForSan(d.name);
-            fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
-            deletedDirs++;
+            const existed = fs.existsSync(dir);
+            deletedFiles += deleteOwnedConnectionHistory(dir, true);
+            if (existed && !fs.existsSync(dir)) deletedDirs++;
         }
-        return { deletedFiles: 0, deletedDirs };
+        return { deletedFiles, deletedDirs };
     });
 }
 
@@ -1705,17 +2052,9 @@ export async function clearLogsAsync(connectionId?: string | null): Promise<{ de
         if (connectionId) {
             const san = sanitizeConnectionId(connectionId);
             const dir = path.join(LOG_ROOT, san);
-            if (fs.existsSync(dir)) {
-                deleted = countDayDbFiles(dir);
-                fs.rmSync(dir, { recursive: true, force: true });
-            }
+            if (isOwnedConnectionDirInRoot(LOG_ROOT, dir)) deleted = deleteOwnedConnectionHistory(dir, false);
         } else {
-            if (fs.existsSync(LOG_ROOT)) {
-                const subs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
-                for (const s of subs) deleted += countDayDbFiles(path.join(LOG_ROOT, s.name));
-                fs.rmSync(LOG_ROOT, { recursive: true, force: true });
-            }
-            fs.mkdirSync(LOG_ROOT, { recursive: true });
+            deleted = deleteAllOwnedHistory(LOG_ROOT, false).deletedFiles;
         }
         return { deletedFiles: deleted };
     } finally {
@@ -1732,12 +2071,16 @@ export async function clearLogsWithoutConnectionsAsync(connectionIds: string[]):
         let deletedDirs = 0;
         if (!fs.existsSync(LOG_ROOT)) return { deletedFiles: 0, deletedDirs };
         const dirs = fs.readdirSync(LOG_ROOT, { withFileTypes: true }).filter((d) => d.isDirectory());
+        let deletedFiles = 0;
         for (const d of dirs) {
             if (valid.has(d.name)) continue;
-            fs.rmSync(path.join(LOG_ROOT, d.name), { recursive: true, force: true });
-            deletedDirs++;
+            const dir = path.join(LOG_ROOT, d.name);
+            if (!isOwnedConnectionDirInRoot(LOG_ROOT, dir)) continue;
+            const existed = fs.existsSync(dir);
+            deletedFiles += deleteOwnedConnectionHistory(dir, true);
+            if (existed && !fs.existsSync(dir)) deletedDirs++;
         }
-        return { deletedFiles: 0, deletedDirs };
+        return { deletedFiles, deletedDirs };
     } finally {
         resumeStorageWrites('clear-stale-logs');
     }
@@ -1764,10 +2107,19 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
     }
     const cutoff = Date.now() - days * 86_400_000;
     pauseStorageWrites('auto-delete');
-    flushStorageLocal();
-    closeOldLogDbs(cutoff);
-    const workerPath = path.join(__dirname, 'auto-delete-worker.js');
-    const w = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT, cutoff } });
+    let w: Worker;
+    try {
+        flushStorageLocal();
+        closeOldLogDbs(cutoff);
+        const workerPath = path.join(__dirname, 'auto-delete-worker.js');
+        w = new Worker(workerPath, { workerData: { logRoot: LOG_ROOT, cutoff } });
+    } catch (error) {
+        resumeStorageWrites('auto-delete');
+        reportStorageDiagnostic('[storage] auto-delete failed to start', { cutoff, logRoot: LOG_ROOT }, error);
+        console.error('[storage] auto-delete failed to start:', error);
+        onFinish?.();
+        return;
+    }
     autoDeleteWorkers.add(w);
     let finished = false;
     const finish = () => {
@@ -1777,8 +2129,15 @@ export function runAutoDeleteAsync(days: number, onDone: (files: number) => void
         resumeStorageWrites('auto-delete');
         onFinish?.();
     };
-    w.once('message', (msg: { removed: number; error?: string }) => {
+    w.once('message', (msg: { removed: number; failed?: number; failures?: Array<{ path: string; message: string }>; error?: string }) => {
         if (msg.error) console.error('[storage] auto-delete worker:', msg.error);
+        if (msg.failed) {
+            console.error(`[storage] auto-delete failed to remove ${msg.failed} files`, msg.failures ?? []);
+            reportStorageDiagnostic('[storage] auto-delete partial failure', {
+                failed: msg.failed,
+                failures: msg.failures ?? []
+            });
+        }
         if (msg.removed > 0) onDone(msg.removed);
         finish();
     });
@@ -1805,6 +2164,10 @@ export function shutdownStorage(): void {
 
 export async function shutdownStorageAsync(): Promise<void> {
     storageAcceptingWrites = false;
+    if (storageDiskPressureTimer) {
+        clearInterval(storageDiskPressureTimer);
+        storageDiskPressureTimer = null;
+    }
     if (USE_STORAGE_WORKER) {
         clearStorageWorkerBatchTimer();
         if (maintenancePauseDepth > 0) {

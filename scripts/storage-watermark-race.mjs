@@ -9,7 +9,7 @@ const { app } = require('electron');
 function loadBuiltStorage() {
   const distDir = path.resolve('dist-electron/main');
   const file = fs.readdirSync(distDir)
-    .filter((name) => /^storage-.+\.js$/.test(name))
+    .filter((name) => /^storage-.+\.js$/.test(name) && name !== 'storage-worker.js')
     .sort((left, right) => fs.statSync(path.join(distDir, right)).mtimeMs - fs.statSync(path.join(distDir, left)).mtimeMs)[0];
   if (!file) throw new Error('built storage module not found; run vite build first');
   return require(path.join(distDir, file));
@@ -24,6 +24,13 @@ async function run() {
 
   storage.initStorage(logRoot);
   try {
+    storage.enqueueMessage(connectionId, 'fixture/low-traffic', `low:${payloadBody}`, now - 1);
+    const lowTrafficFlushStartedAt = Date.now();
+    await storage.flushStorageAsync();
+    const lowTrafficFlushMs = Date.now() - lowTrafficFlushStartedAt;
+    if (lowTrafficFlushMs >= 3_000) {
+      throw new Error(`explicit low-traffic flush was delayed by producer batching: ${lowTrafficFlushMs}ms`);
+    }
     for (let index = 0; index < 300; index++) {
       storage.enqueueMessage(connectionId, `fixture/seed/${index % 10}`, `${index}:${payloadBody}`, now + index);
     }
@@ -63,6 +70,7 @@ async function run() {
     }
     console.log('✓ durable watermark resolves while newer MQTT writes remain active');
     console.log('✓ watermark diagnostics report committed and accepted sequences');
+    console.log(`✓ explicit low-traffic flush bypasses producer timer (${lowTrafficFlushMs}ms)`);
   } finally {
     await storage.shutdownStorageAsync().catch(() => undefined);
     fs.rmSync(logRoot, { recursive: true, force: true });

@@ -5,6 +5,12 @@ import { randomClientId, randomId } from '@/utils/format';
 
 export type ConnState = 'connected' | 'reconnecting' | 'offline' | 'closed' | 'error' | 'idle';
 
+const MQTT_PROTOCOLS = new Set<MqttProtocol>(['mqtt://', 'mqtts://', 'ws://', 'wss://']);
+
+function stringValue(value: unknown, fallback: string): string {
+    return typeof value === 'string' ? value : fallback;
+}
+
 function normalizeSubscriptions(subscriptions: unknown): SubscriptionConfig[] {
     if (!Array.isArray(subscriptions)) return [];
     const seen = new Set<string>();
@@ -15,7 +21,10 @@ function normalizeSubscriptions(subscriptions: unknown): SubscriptionConfig[] {
         if (!topic || seen.has(topic)) continue;
         const qosValue = Number((item as { qos?: unknown }).qos);
         const qos: 0 | 1 | 2 = qosValue === 1 || qosValue === 2 ? qosValue : 0;
-        const paused = 'paused' in item ? Boolean((item as { paused?: unknown }).paused) : undefined;
+        const pausedValue = (item as { paused?: unknown }).paused;
+        const paused = 'paused' in item
+            ? pausedValue === true || (typeof pausedValue === 'string' && pausedValue.trim().toLowerCase() === 'true')
+            : undefined;
         seen.add(topic);
         result.push({ topic, qos, paused });
     }
@@ -36,20 +45,22 @@ function normalizeDisabledTopics(disabledTopics: unknown): string[] {
 }
 
 export function normalizeConnectionConfig(raw: Partial<ConnectionConfig>): ConnectionConfig {
+    const protocol = MQTT_PROTOCOLS.has(raw.protocol as MqttProtocol) ? raw.protocol as MqttProtocol : 'mqtt://';
+    const port = Number(raw.port);
     return {
         id: String(raw.id ?? randomId()),
-        name: raw.name ?? '新连接',
-        protocol: raw.protocol ?? 'mqtt://',
-        host: raw.host ?? 'broker.emqx.io',
-        port: Number(raw.port) || 1883,
-        path: raw.path ?? '/mqtt',
-        username: raw.username ?? '',
-        password: raw.password ?? '',
-        clientId: raw.clientId ?? randomClientId(),
+        name: stringValue(raw.name, '新连接'),
+        protocol,
+        host: stringValue(raw.host, 'broker.emqx.io'),
+        port: Number.isFinite(port) && port > 0 && port <= 65535 ? Math.trunc(port) : 1883,
+        path: stringValue(raw.path, '/mqtt'),
+        username: stringValue(raw.username, ''),
+        password: stringValue(raw.password, ''),
+        clientId: stringValue(raw.clientId, '') || randomClientId(),
         subscriptions: normalizeSubscriptions(raw.subscriptions),
         disabledTopics: normalizeDisabledTopics(raw.disabledTopics),
-        createdAt: raw.createdAt ?? Date.now(),
-        updatedAt: raw.updatedAt ?? Date.now()
+        createdAt: Number(raw.createdAt) || Date.now(),
+        updatedAt: Number(raw.updatedAt) || Date.now()
     };
 }
 
@@ -76,6 +87,13 @@ export const useConnectionStore = defineStore('connection', () => {
     const selectedId = ref<string | null>(null);
     const states = reactive<Record<string, { state: ConnState; error?: string }>>({});
     const dirty = ref(false);
+    let revision = 0;
+    let persistChain: Promise<void> = Promise.resolve();
+
+    function touch(): void {
+        revision++;
+        dirty.value = true;
+    }
 
     const selected = computed<ConnectionConfig | null>(() => list.value.find((c) => c.id === selectedId.value) ?? null);
     const selectedState = computed<ConnState>(() => {
@@ -88,15 +106,28 @@ export const useConnectionStore = defineStore('connection', () => {
         const r = await window.api.configRead();
         if (r.success && r.data) {
             list.value = normalizeConnectionList(r.data.connections ?? []);
-            selectedId.value = r.data.selectedId ?? list.value[0]?.id ?? null;
+            const persistedSelectedId = r.data.selectedId;
+            selectedId.value = persistedSelectedId && list.value.some((item) => item.id === persistedSelectedId)
+                ? persistedSelectedId
+                : list.value[0]?.id ?? null;
+            revision = 0;
+            dirty.value = false;
         }
     }
 
     async function persist(): Promise<void> {
+        const saveRevision = revision;
         const plain = JSON.parse(JSON.stringify(list.value)) as ConnectionConfig[];
-        const r = await window.api.configWrite({ connections: plain, selectedId: selectedId.value });
-        if (!r.success) throw new Error(r.message || '配置写入失败');
-        dirty.value = false;
+        const selectedSnapshot = selectedId.value;
+        const operation = persistChain
+            .catch(() => undefined)
+            .then(async () => {
+                const r = await window.api.configWrite({ connections: plain, selectedId: selectedSnapshot });
+                if (!r.success) throw new Error(r.message || '配置写入失败');
+            });
+        persistChain = operation.catch(() => undefined);
+        await operation;
+        if (revision === saveRevision) dirty.value = false;
     }
 
     function blank(): ConnectionConfig {
@@ -121,14 +152,14 @@ export const useConnectionStore = defineStore('connection', () => {
         const c = blank();
         list.value.push(c);
         selectedId.value = c.id;
-        dirty.value = true;
-        persist();
+        touch();
         return c;
     }
 
     function select(id: string): void {
+        if (selectedId.value === id || !list.value.some((item) => item.id === id)) return;
         selectedId.value = id;
-        persist();
+        touch();
     }
 
     function remove(id: string): void {
@@ -138,7 +169,8 @@ export const useConnectionStore = defineStore('connection', () => {
         if (selectedId.value === id) {
             selectedId.value = list.value[0]?.id ?? null;
         }
-        persist();
+        delete states[id];
+        touch();
     }
 
     async function duplicate(id: string): Promise<ConnectionConfig | null> {
@@ -158,7 +190,7 @@ export const useConnectionStore = defineStore('connection', () => {
         };
         list.value.push(copy);
         selectedId.value = copy.id;
-        dirty.value = true;
+        touch();
         try {
             await persist();
             return copy;
@@ -175,12 +207,18 @@ export const useConnectionStore = defineStore('connection', () => {
         const c = list.value.find((x) => x.id === id);
         if (!c) return;
         Object.assign(c, patch, { updatedAt: Date.now() });
-        dirty.value = true;
+        touch();
     }
 
     function sanitizeConnections(): void {
-        list.value = normalizeConnectionList(list.value);
-        dirty.value = true;
+        const before = JSON.stringify(list.value);
+        const normalized = normalizeConnectionList(list.value);
+        if (JSON.stringify(normalized) === before) return;
+        list.value = normalized;
+        if (selectedId.value && !list.value.some((item) => item.id === selectedId.value)) {
+            selectedId.value = list.value[0]?.id ?? null;
+        }
+        touch();
     }
 
     function addSubscription(id: string, sub: SubscriptionConfig): void {
@@ -188,14 +226,16 @@ export const useConnectionStore = defineStore('connection', () => {
         if (!c) return;
         if (c.subscriptions.find((s) => s.topic === sub.topic)) return;
         c.subscriptions.push(sub);
-        persist();
+        c.updatedAt = Date.now();
+        touch();
     }
 
     function removeSubscription(id: string, topic: string): void {
         const c = list.value.find((x) => x.id === id);
         if (!c) return;
         c.subscriptions = c.subscriptions.filter((s) => s.topic !== topic);
-        persist();
+        c.updatedAt = Date.now();
+        touch();
     }
 
     function setSubscriptionPaused(id: string, topic: string, paused: boolean): void {
@@ -204,7 +244,8 @@ export const useConnectionStore = defineStore('connection', () => {
         const s = c.subscriptions.find((x) => x.topic === topic);
         if (!s) return;
         s.paused = paused;
-        persist();
+        c.updatedAt = Date.now();
+        touch();
     }
 
     function toggleDisableTopic(id: string, topic: string, disabled: boolean): void {
@@ -213,7 +254,22 @@ export const useConnectionStore = defineStore('connection', () => {
         const set = new Set(c.disabledTopics);
         if (disabled) set.add(topic); else set.delete(topic);
         c.disabledTopics = [...set];
-        persist();
+        c.updatedAt = Date.now();
+        touch();
+    }
+
+    function setAllSubscriptionsPaused(id: string, paused: boolean): void {
+        const c = list.value.find((x) => x.id === id);
+        if (!c) return;
+        let changed = false;
+        for (const subscription of c.subscriptions) {
+            if (Boolean(subscription.paused) === paused) continue;
+            subscription.paused = paused;
+            changed = true;
+        }
+        if (!changed) return;
+        c.updatedAt = Date.now();
+        touch();
     }
 
     function setState(id: string, state: ConnState, message?: string): void {
@@ -235,9 +291,11 @@ export const useConnectionStore = defineStore('connection', () => {
         duplicate,
         update,
         sanitizeConnections,
+        touch,
         addSubscription,
         removeSubscription,
         setSubscriptionPaused,
+        setAllSubscriptionsPaused,
         toggleDisableTopic,
         setState
     };

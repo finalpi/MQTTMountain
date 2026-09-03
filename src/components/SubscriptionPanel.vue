@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue';
+import { ref, computed } from 'vue';
 import { useConnectionStore } from '@/stores/connection';
 import { useToast } from '@/composables/useToast';
 import { useUiPrefs } from '@/composables/useUiPrefs';
 import { useSubscriptionSync } from '@/composables/useSubscriptionSync';
 import type { SubscriptionConfig } from '@shared/types';
+import { isValidTopicFilter } from '@/utils/mqttFilter';
 
 const conn = useConnectionStore();
 const toast = useToast();
@@ -12,67 +13,123 @@ const { prefs, toggleRight } = useUiPrefs();
 const { sync } = useSubscriptionSync();
 const topic = ref('test/#');
 const qos = ref<0 | 1 | 2>(0);
+const busy = ref(false);
 const isOpen = computed(() => prefs.activeRight === 'sub');
 
 const selected = computed(() => conn.selected);
 const canOp = computed(() => conn.selectedState === 'connected');
 
-watch(
-    () => selected.value?.id,
-    async (id) => {
-        if (!id) return;
-        const before = selected.value?.subscriptions.length ?? 0;
-        conn.sanitizeConnections();
-        const after = conn.selected?.subscriptions.length ?? 0;
-        if (after < before) await conn.persist();
-    },
-    { immediate: true }
-);
+async function commitSubscriptionChange(
+    c: NonNullable<typeof selected.value>,
+    previous: SubscriptionConfig[],
+    previousDirty: boolean
+): Promise<boolean> {
+    try {
+        await conn.persist();
+    } catch (error) {
+        c.subscriptions = previous;
+        conn.touch();
+        conn.dirty = previousDirty;
+        toast.error('保存订阅配置失败：' + (error instanceof Error ? error.message : String(error)));
+        return false;
+    }
+
+    const connected = conn.states[c.id]?.state === 'connected';
+    const result = await sync(c, connected);
+    if (result.ok) return true;
+
+    c.subscriptions = previous;
+    conn.touch();
+    try {
+        await conn.persist();
+        await sync(c, connected);
+    } catch {
+        // 保留 dirty，用户下次保存/重连时仍会再次收敛。
+    }
+    toast.error(result.errors.join('；'));
+    return false;
+}
 
 async function doSubscribe(): Promise<void> {
     const c = selected.value;
     if (!c) return;
     const t = topic.value.trim();
     if (!t) { toast.error('主题不能为空'); return; }
+    if (!isValidTopicFilter(t)) { toast.error('主题过滤器不合法：# 只能位于末级，+ 必须独占一级'); return; }
     if (!canOp.value) { toast.error('请先连接'); return; }
 
     // 已存在（等同 filter 已订阅过），保持幂等
     const existing = c.subscriptions.find((s) => s.topic === t);
     if (existing) { toast.info(`已经订阅过：${t}`); return; }
+    if (busy.value) return;
 
-    // 本地先加；broker 层由 sync 决定是否真的下发 / 取消被覆盖的
-    conn.addSubscription(c.id, { topic: t, qos: qos.value, paused: false });
-    await sync(c, canOp.value);
-    toast.success(`订阅成功：${t}`);
+    busy.value = true;
+    try {
+        const previous = c.subscriptions.map((item) => ({ ...item }));
+        const previousDirty = conn.dirty;
+        conn.addSubscription(c.id, { topic: t, qos: qos.value, paused: false });
+        if (await commitSubscriptionChange(c, previous, previousDirty)) toast.success(`订阅成功：${t}`);
+    } finally {
+        busy.value = false;
+    }
 }
 
 async function doUnsubscribe(t: string): Promise<void> {
     const c = selected.value;
-    if (!c) return;
-    conn.removeSubscription(c.id, t);
-    await sync(c, canOp.value);
+    if (!c || busy.value) return;
+    busy.value = true;
+    try {
+        const previous = c.subscriptions.map((item) => ({ ...item }));
+        const previousDirty = conn.dirty;
+        conn.removeSubscription(c.id, t);
+        if (await commitSubscriptionChange(c, previous, previousDirty)) toast.info(`已移除：${t}`);
+    } finally {
+        busy.value = false;
+    }
 }
 
 async function togglePause(s: SubscriptionConfig): Promise<void> {
     const c = selected.value;
-    if (!c) return;
-    const next = !s.paused;
-    conn.setSubscriptionPaused(c.id, s.topic, next);
-    await sync(c, canOp.value);
-    toast.info(next ? `已暂停：${s.topic}` : `已恢复：${s.topic}`);
+    if (!c || busy.value) return;
+    busy.value = true;
+    try {
+        const previous = c.subscriptions.map((item) => ({ ...item }));
+        const previousDirty = conn.dirty;
+        const next = !s.paused;
+        conn.setSubscriptionPaused(c.id, s.topic, next);
+        if (await commitSubscriptionChange(c, previous, previousDirty)) {
+            toast.info(next ? `已暂停：${s.topic}` : `已恢复：${s.topic}`);
+        }
+    } finally {
+        busy.value = false;
+    }
 }
 
 async function pauseAll(): Promise<void> {
     const c = selected.value;
-    if (!c) return;
-    for (const s of c.subscriptions) if (!s.paused) conn.setSubscriptionPaused(c.id, s.topic, true);
-    await sync(c, canOp.value);
+    if (!c || busy.value) return;
+    busy.value = true;
+    try {
+        const previous = c.subscriptions.map((item) => ({ ...item }));
+        const previousDirty = conn.dirty;
+        conn.setAllSubscriptionsPaused(c.id, true);
+        if (await commitSubscriptionChange(c, previous, previousDirty)) toast.info('已暂停全部订阅');
+    } finally {
+        busy.value = false;
+    }
 }
 async function resumeAll(): Promise<void> {
     const c = selected.value;
-    if (!c) return;
-    for (const s of c.subscriptions) if (s.paused) conn.setSubscriptionPaused(c.id, s.topic, false);
-    await sync(c, canOp.value);
+    if (!c || busy.value) return;
+    busy.value = true;
+    try {
+        const previous = c.subscriptions.map((item) => ({ ...item }));
+        const previousDirty = conn.dirty;
+        conn.setAllSubscriptionsPaused(c.id, false);
+        if (await commitSubscriptionChange(c, previous, previousDirty)) toast.info('已恢复全部订阅');
+    } finally {
+        busy.value = false;
+    }
 }
 
 const hasActive = computed(() => (selected.value?.subscriptions ?? []).some((s) => !s.paused));
@@ -93,8 +150,8 @@ const orderedSubs = computed<SubscriptionConfig[]>(() => {
             <h2>📬 订阅管理</h2>
             <span class="pill" v-if="selected">{{ (selected.subscriptions ?? []).length }}</span>
             <span class="spacer"></span>
-            <button v-if="isOpen && hasActive" class="btn btn-mini" :disabled="!canOp" @click.stop="pauseAll" title="暂停全部">⏸️ 全部</button>
-            <button v-if="isOpen && hasPaused" class="btn btn-mini" :disabled="!canOp" @click.stop="resumeAll" title="恢复全部">▶️ 全部</button>
+            <button v-if="isOpen && hasActive" class="btn btn-mini" :disabled="!canOp || busy" @click.stop="pauseAll" title="暂停全部">⏸️ 全部</button>
+            <button v-if="isOpen && hasPaused" class="btn btn-mini" :disabled="!canOp || busy" @click.stop="resumeAll" title="恢复全部">▶️ 全部</button>
             <span class="chev">{{ isOpen ? '▾' : '▸' }}</span>
         </div>
         <div v-if="isOpen" class="panel-body">
@@ -111,7 +168,7 @@ const orderedSubs = computed<SubscriptionConfig[]>(() => {
                         <option :value="2">2</option>
                     </select>
                 </div>
-                <button class="btn btn-success" :disabled="!canOp" @click="doSubscribe">订阅</button>
+                <button class="btn btn-success" :disabled="!canOp || busy" @click="doSubscribe">订阅</button>
             </div>
 
             <div class="list">
@@ -127,11 +184,11 @@ const orderedSubs = computed<SubscriptionConfig[]>(() => {
                     <span v-if="s.paused" class="tag-paused">已暂停</span>
                     <button
                         class="btn btn-mini btn-ghost"
-                        :disabled="!canOp"
+                        :disabled="!canOp || busy"
                         :title="s.paused ? '恢复接收' : '暂停接收'"
                         @click="togglePause(s)"
                     >{{ s.paused ? '▶️' : '⏸️' }}</button>
-                    <button class="btn btn-mini btn-ghost" @click="doUnsubscribe(s.topic)" title="移除订阅">🗑️</button>
+                    <button class="btn btn-mini btn-ghost" :disabled="busy" @click="doUnsubscribe(s.topic)" title="移除订阅">🗑️</button>
                 </div>
             </div>
         </div>

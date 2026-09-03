@@ -77,6 +77,8 @@ export interface SenderParam {
     placeholder?: string;
     required?: boolean;
     actions?: SenderParamAction[];
+    /** 发送成功后自动执行 actions[0]，用于生成下一次发送所需的新 UUID/时间戳。 */
+    refreshAfterPublish?: boolean;
 }
 
 /** 预定义发送模板。topic / payloadTemplate 支持 `{paramKey}` 占位符 */

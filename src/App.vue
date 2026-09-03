@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import AppHeader from './components/AppHeader.vue';
 import ConnectionPanel from './components/ConnectionPanel.vue';
 import SubscriptionPanel from './components/SubscriptionPanel.vue';
@@ -21,6 +21,8 @@ import { installPluginHostBridge } from './composables/usePluginHostBridge';
 import { useToast } from './composables/useToast';
 import { useFocusFix } from './composables/useFocusFix';
 import { useUpdater } from './composables/useUpdater';
+import { useStorageDiskPressure } from './composables/useStorageDiskPressure';
+import { formatBytes } from './utils/format';
 
 const conn = useConnectionStore();
 const msg = useMessageStore();
@@ -29,10 +31,12 @@ const plugins = usePluginStore();
 const { start, stop } = useMqttBridge();
 const toast = useToast();
 const updater = useUpdater();
+const storagePressure = useStorageDiskPressure();
 useFocusFix();
 let teardownPluginHostBridge: (() => void) | null = null;
 let teardownAutoDeleteDone: (() => void) | null = null;
 let rendererDiagnosticsTimer: number | null = null;
+let teardownStorageDiskPressure: (() => void) | null = null;
 
 type StaticMainTab = 'messages' | 'history' | 'plugins';
 type MainTab = StaticMainTab | `plugin:${string}`;
@@ -42,10 +46,15 @@ const leftCollapsed = ref(false);
 const rightCollapsed = ref(false);
 
 const pluginCenterViews = computed(() => plugins.centerViews);
+function pluginTab(view: { pluginId: string; id: string }): `plugin:${string}` {
+    return `plugin:${encodeURIComponent(view.pluginId)}:${encodeURIComponent(view.id)}`;
+}
 const activePluginView = computed(() => {
     if (!mainTab.value.startsWith('plugin:')) return null;
-    const id = mainTab.value.slice('plugin:'.length);
-    return pluginCenterViews.value.find((view) => view.id === id) ?? null;
+    return pluginCenterViews.value.find((view) => pluginTab(view) === mainTab.value) ?? null;
+});
+watch(pluginCenterViews, () => {
+    if (mainTab.value.startsWith('plugin:') && !activePluginView.value) mainTab.value = 'messages';
 });
 
 function logRendererDiagnostics(): void {
@@ -64,10 +73,11 @@ function logRendererDiagnostics(): void {
         if (row.decoded) decodedMessages++;
     });
     console.info(`[renderer-diagnostics] ${JSON.stringify({
-        selectedConnectionId: selectedId,
+        activeMainTab: mainTab.value.startsWith('plugin:') ? 'plugin' : mainTab.value,
+        hasSelectedConnection: Boolean(selectedId),
         timelineMessages: bucket.timeline.length,
         topicBufferedMessages,
-        selectedTopic: bucket.selectedTopic,
+        selectedTopicLength: bucket.selectedTopic?.length ?? 0,
         selectedTopicBufferedMessages: selectedTopicView?.buf.length ?? 0,
         selectedTopicLastTime: selectedTopicView?.lastTime ?? 0,
         selectedTopicLastSeq: selectedTopicView?.lastSeq ?? 0,
@@ -84,6 +94,19 @@ function logRendererDiagnostics(): void {
 }
 
 onMounted(async () => {
+    teardownStorageDiskPressure = window.api.onStorageDiskPressure((next) => {
+        const previousLevel = storagePressure.state.current?.level ?? null;
+        storagePressure.update(next);
+        if (previousLevel === next.level) return;
+        const free = `${formatBytes(next.freeBytes)}（${(next.freeRatio * 100).toFixed(1)}%）`;
+        if (next.level === 'critical') {
+            toast.error(`日志磁盘空间严重不足：剩余 ${free}。历史写入已暂停，实时消息仍继续显示。`);
+        } else if (next.level === 'warning') {
+            toast.warning(`日志磁盘空间不足：剩余 ${free}，请尽快清理或更换日志目录。`);
+        } else if (previousLevel === 'warning' || previousLevel === 'critical') {
+            toast.success(`日志磁盘空间已恢复：剩余 ${free}，历史写入已恢复。`);
+        }
+    });
     await Promise.all([conn.load(), settings.load(), plugins.refresh()]);
     msg.setLimits(settings.state.maxMemoryMessages, settings.state.maxPerTopic);
     await Promise.all(
@@ -122,6 +145,8 @@ onBeforeUnmount(() => {
     teardownPluginHostBridge = null;
     teardownAutoDeleteDone?.();
     teardownAutoDeleteDone = null;
+    teardownStorageDiskPressure?.();
+    teardownStorageDiskPressure = null;
     if (rendererDiagnosticsTimer != null) {
         window.clearInterval(rendererDiagnosticsTimer);
         rendererDiagnosticsTimer = null;
@@ -151,9 +176,9 @@ onBeforeUnmount(() => {
                         v-for="view in pluginCenterViews"
                         :key="view.pluginId + ':' + view.id"
                         class="tab"
-                        :class="{ active: mainTab === `plugin:${view.id}` }"
+                        :class="{ active: mainTab === pluginTab(view) }"
                         :title="view.description || view.pluginName"
-                        @click="mainTab = `plugin:${view.id}`"
+                        @click="mainTab = pluginTab(view)"
                     >{{ view.name }}</button>
                     <button class="tab" :class="{ active: mainTab === 'plugins' }" @click="mainTab = 'plugins'">插件</button>
                     <span class="tab-spacer"></span>
@@ -169,9 +194,12 @@ onBeforeUnmount(() => {
                     <HistoryPanel v-show="mainTab === 'history'" />
                     <PluginWebView
                         v-if="activePluginView?.type === 'web'"
-                        v-show="mainTab === `plugin:${activePluginView.id}`"
+                        v-show="mainTab === pluginTab(activePluginView)"
                         :view="activePluginView"
                     />
+                    <section v-else-if="activePluginView" class="panel plugin-view-unsupported">
+                        暂不支持该插件视图类型：{{ activePluginView.type }}
+                    </section>
                     <PluginPanel v-show="mainTab === 'plugins'" />
                 </div>
             </section>

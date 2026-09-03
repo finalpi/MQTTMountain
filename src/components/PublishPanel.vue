@@ -24,6 +24,9 @@ const qos = ref<0 | 1 | 2>(0);
 const retain = ref(false);
 const payload = ref('{"msg": "hello"}');
 const payloadEl = ref<HTMLTextAreaElement | null>(null);
+const publishing = ref(false);
+let paramActionSeq = 0;
+let senderGeneration = 0;
 
 const canOp = computed(() => conn.selectedState === 'connected');
 
@@ -142,40 +145,81 @@ async function publishPayloadDraft(draft: PayloadDraft): Promise<void> {
 }
 
 async function publishMessage(draft?: PayloadDraft): Promise<void> {
+    if (publishing.value) return;
     const c = conn.selected;
     if (!c) return;
     if (!canOp.value) { toast.error('请先连接'); return; }
     const nextTopic = (draft?.topic ?? topic.value).trim();
     const nextPayload = draft?.raw ?? payload.value;
     if (!nextTopic) { toast.error('主题不能为空'); return; }
-    const r = await window.api.mqttPublish({
+    if (/[+#]/u.test(nextTopic)) { toast.error('发布主题不能包含 MQTT 通配符 + 或 #'); return; }
+    const sender = activeSender.value;
+    const senderGenerationAtPublish = senderGeneration;
+    const missingRequired = sender?.params?.find((param) => param.required && !String(paramValues.value[param.key] ?? '').trim());
+    if (missingRequired) { toast.error(`请填写必填参数：${missingRequired.label}`); return; }
+
+    const request = {
         connectionId: c.id,
         topic: nextTopic,
         payload: nextPayload,
         qos: qos.value,
         retain: retain.value
-    });
-    if (r.success) {
+    } as const;
+    const startedAt = Date.now();
+    const rememberedParams = { ...paramValues.value };
+    let sent = false;
+    publishing.value = true;
+    try {
+        const r = await window.api.mqttPublish(request);
+        if (!r.success) {
+            toast.error('发送失败：' + (r.message || ''));
+            return;
+        }
+        sent = true;
         topic.value = nextTopic;
         payload.value = nextPayload;
-        const item = { topic: nextTopic, payload: nextPayload, qos: qos.value, retain: retain.value, time: Date.now() };
+        const item = { topic: nextTopic, payload: nextPayload, qos: request.qos, retain: request.retain, time: startedAt };
         msg.pushPublishHistory(c.id, item);
-        await window.api.publishHistoryAppend({ connectionId: c.id, ...item });
-        formatViewer.markPublished({ connectionId: c.id, sinceTime: item.time });
+        if (
+            formatViewer.state.visible
+            && formatViewer.state.editable
+            && formatViewer.state.draftTopic === nextTopic
+            && formatViewer.state.draftRaw === nextPayload
+        ) {
+            formatViewer.markPublished({ connectionId: c.id, sinceTime: item.time });
+        }
         // 发送成功后把当前 sender 的参数值记入历史，下次可下拉选择
-        if (activeSender.value?.params) {
-            for (const pr of activeSender.value.params) {
-                const value = paramValues.value[pr.key];
+        if (sender?.params) {
+            for (const pr of sender.params) {
+                const value = rememberedParams[pr.key];
                 paramMem.remember(pr.key, value);
                 for (const key of pr.suggestionKeys ?? []) {
-                    const resolved = resolveSuggestionKey(key);
+                    const resolved = applyTemplate(key, rememberedParams);
                     if (!resolved.includes('{')) paramMem.remember(resolved, value);
                 }
             }
         }
-        toast.success('已发送');
-    } else {
-        toast.error('发送失败：' + (r.message || ''));
+        const [, historyResult] = await Promise.all([
+            refreshMarkedParamsAfterPublish(
+                sender,
+                rememberedParams,
+                senderGenerationAtPublish,
+                nextTopic,
+                nextPayload
+            ),
+            window.api.publishHistoryAppend({ connectionId: c.id, ...item })
+        ]);
+        if (!historyResult.success) {
+            toast.warning('消息已发送，但发送历史保存失败：' + (historyResult.message || '未知错误'));
+        } else {
+            toast.success('已发送');
+        }
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (sent) toast.warning('消息已发送，但后续处理失败：' + message);
+        else toast.error('发送失败：' + message);
+    } finally {
+        publishing.value = false;
     }
 }
 
@@ -244,6 +288,70 @@ function applyTemplate(tpl: string, vals: Record<string, string>): string {
     return tpl.replace(/\{(\w+)\}/g, (_, k) => vals[k] ?? `{${k}}`);
 }
 
+function senderKey(sender: Pick<SenderDefinition, 'id'> & { pluginId: string }): string {
+    return `${sender.pluginId}\u0000${sender.id}`;
+}
+
+async function refreshMarkedParamsAfterPublish(
+    sender: (SenderDefinition & { pluginId: string; pluginName: string }) | null,
+    publishedParams: Record<string, string>,
+    expectedGeneration: number,
+    publishedTopic: string,
+    publishedPayload: string
+): Promise<void> {
+    if (!sender) return;
+    const marked = (sender.params ?? []).filter((param) => param.refreshAfterPublish && param.actions?.[0]);
+    if (!marked.length) return;
+    const expectedKey = senderKey(sender);
+    if (!activeSender.value || senderKey(activeSender.value) !== expectedKey || senderGeneration !== expectedGeneration) return;
+
+    const results = await Promise.all(marked.map(async (param) => {
+        const action = param.actions![0];
+        try {
+            const result = await window.api.pluginSenderParamAction({
+                pluginId: sender.pluginId,
+                senderId: sender.id,
+                paramKey: param.key,
+                actionId: action.id,
+                params: {
+                    ...publishedParams,
+                    __paramSuggestions: JSON.stringify(paramMem.state.data)
+                }
+            });
+            return { param, result };
+        } catch (error) {
+            return {
+                param,
+                result: { success: false, message: error instanceof Error ? error.message : String(error) }
+            };
+        }
+    }));
+
+    if (!activeSender.value || senderKey(activeSender.value) !== expectedKey || senderGeneration !== expectedGeneration) return;
+    const patch: Record<string, string> = {};
+    const failures: string[] = [];
+    for (const { param, result } of results) {
+        if (!result.success) {
+            failures.push(`${param.label}：${result.message || '刷新失败'}`);
+            continue;
+        }
+        const data = result.data;
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            for (const [key, value] of Object.entries(data)) patch[key] = String(value ?? '');
+        } else {
+            patch[param.key] = String(data ?? '');
+        }
+    }
+    if (Object.keys(patch).length > 0) {
+        Object.assign(paramValues.value, patch);
+        senderGeneration++;
+        for (const key of Object.keys(patch)) refreshParamSuggestions(key);
+        const outputStillMatchesPublished = topic.value === publishedTopic && payload.value === publishedPayload;
+        syncTemplateOutput(sender, outputStillMatchesPublished);
+    }
+    if (failures.length) toast.warning(`消息已发送，但刷新参数失败：${failures.join('；')}`);
+}
+
 function syncTemplateOutput(s: SenderDefinition, overwrite = true): void {
     const nextTopic = applyTemplate(s.topic, paramValues.value);
     const nextPayload = applyTemplate(s.payloadTemplate, paramValues.value);
@@ -256,8 +364,10 @@ function syncTemplateOutput(s: SenderDefinition, overwrite = true): void {
     lastTemplatePayload.value = nextPayload;
 }
 
-function pickSender(id: string): void {
-    const s = plugins.allSenders.find((x) => x.id === id);
+function pickSender(key: string): void {
+    paramActionSeq++;
+    senderGeneration++;
+    const s = plugins.allSenders.find((item) => senderKey(item) === key);
     if (!s) {
         activeSender.value = null;
         lastTemplateTopic.value = '';
@@ -299,6 +409,7 @@ function refreshParamSuggestions(changedKey?: string): void {
 function onParamInput(changedKey?: string): void {
     const s = activeSender.value;
     if (!s) return;
+    senderGeneration++;
     refreshParamSuggestions(changedKey);
     syncTemplateOutput(s);
 }
@@ -321,6 +432,9 @@ function fillParamValue(paramKey: string, value: string): void {
 async function runParamAction(paramKey: string, action: SenderParamAction): Promise<void> {
     const s = activeSender.value;
     if (!s) return;
+    const seq = ++paramActionSeq;
+    const activeKey = senderKey(s);
+    const generation = senderGeneration;
     const result = await window.api.pluginSenderParamAction({
         pluginId: s.pluginId,
         senderId: s.id,
@@ -331,6 +445,7 @@ async function runParamAction(paramKey: string, action: SenderParamAction): Prom
             __paramSuggestions: JSON.stringify(paramMem.state.data)
         }
     });
+    if (seq !== paramActionSeq || generation !== senderGeneration || !activeSender.value || senderKey(activeSender.value) !== activeKey) return;
     if (!result.success) {
         toast.error(result.message || '参数动作执行失败');
         return;
@@ -367,8 +482,20 @@ watch(
             }
         }
         if (changed) syncTemplateOutput(s, false);
+        if (changed) senderGeneration++;
     },
     { deep: true }
+);
+
+watch(
+    () => plugins.allSenders,
+    () => {
+        const current = activeSender.value;
+        if (!current) return;
+        const latest = plugins.allSenders.find((item) => senderKey(item) === senderKey(current));
+        if (latest) activeSender.value = latest;
+        else pickSender('');
+    }
 );
 
 const historyList = computed(() => {
@@ -388,10 +515,10 @@ const historyList = computed(() => {
         <div v-if="isOpen" class="panel-body">
             <div v-if="senderGroups.length" class="field">
                 <label>🧩 插件模板</label>
-                <select :value="activeSender?.id ?? ''" @change="pickSender(($event.target as HTMLSelectElement).value)">
+                <select :value="activeSender ? senderKey(activeSender) : ''" @change="pickSender(($event.target as HTMLSelectElement).value)">
                     <option value="">— 自定义发送 —</option>
                     <optgroup v-for="g in senderGroups" :key="g.name" :label="g.name">
-                        <option v-for="s in g.items" :key="s.id" :value="s.id">{{ s.name }}</option>
+                        <option v-for="s in g.items" :key="senderKey(s)" :value="senderKey(s)">{{ s.name }}</option>
                     </optgroup>
                 </select>
             </div>
@@ -498,7 +625,9 @@ const historyList = computed(() => {
                     </template>
                 </div>
             </div>
-            <button class="btn btn-primary" @click="doPublish">发布</button>
+            <button class="btn btn-primary" :disabled="publishing || !canOp" @click="doPublish">
+                {{ publishing ? '发布中...' : '发布' }}
+            </button>
 
             <div class="history">
                 <label>发送历史</label>

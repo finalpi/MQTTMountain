@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage, stopAcceptingStorageWrites, getStorageDiagnostics, setStorageDiagnosticListener, flushDeferredHistoryFts } from './storage';
+import { initStorage, enqueueMessage, flushStorage, closeAllLogDbs, pauseStorageWrites, resumeStorageWrites, shutdownStorage, stopAcceptingStorageWrites, getPendingStorageEntryCount, getStorageDiagnostics, setStorageDiagnosticListener, flushDeferredHistoryFts } from './storage';
 import type { BucketItem } from './history-bucket-codec';
 
 interface StorageWorkerRequest {
@@ -61,8 +61,7 @@ function reply(id: number | undefined, ok: boolean, result?: unknown, error?: un
 }
 
 function pendingEntryCount(): number {
-    const value = getStorageDiagnostics().pendingEntries;
-    return typeof value === 'number' ? value : Number(value ?? 0);
+    return getPendingStorageEntryCount();
 }
 
 function acknowledgeCommittedBatches(): boolean {

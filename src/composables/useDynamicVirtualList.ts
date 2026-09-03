@@ -1,4 +1,5 @@
 import { computed, nextTick, onBeforeUnmount, ref, type Ref } from 'vue';
+import { recordRendererPerf } from '@/utils/rendererPerf';
 
 export type DynamicVirtualKey = string | number;
 
@@ -20,16 +21,10 @@ export interface DynamicVirtualListOptions<T> {
     stickToStart: Ref<boolean>;
 }
 
-interface LayoutRow<T> {
-    item: T;
-    index: number;
-    key: DynamicVirtualKey;
-    top: number;
-    size: number;
-}
-
-interface Layout<T> {
-    rows: LayoutRow<T>[];
+interface Layout {
+    keys: DynamicVirtualKey[];
+    sizes: number[];
+    keyTops: Map<DynamicVirtualKey, number>;
     prefix: number[];
     totalHeight: number;
 }
@@ -56,6 +51,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     const sizeVersion = ref(0);
 
     const measured = new Map<DynamicVirtualKey, number>();
+    const estimated = new Map<DynamicVirtualKey, number>();
     const elements = new Map<DynamicVirtualKey, HTMLElement>();
     const elementKeys = new WeakMap<Element, DynamicVirtualKey>();
     let resizeObserver: ResizeObserver | null = null;
@@ -67,29 +63,42 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     let snapshotKeys: DynamicVirtualKey[] = [];
     let snapshotPrefix: number[] = [0];
 
-    const layout = computed<Layout<T>>(() => {
+    const layout = computed<Layout>(() => {
+        const startedAt = performance.now();
         void sizeVersion.value;
         const items = opts.items.value;
         const gap = Math.max(0, opts.gap.value || 0);
-        const rows: LayoutRow<T>[] = new Array(items.length);
+        const keys: DynamicVirtualKey[] = new Array(items.length);
+        const sizes: number[] = new Array(items.length);
+        const keyTops = new Map<DynamicVirtualKey, number>();
         const prefix: number[] = new Array(items.length + 1);
         prefix[0] = 0;
         for (let i = 0; i < items.length; i++) {
             const item = items[i];
             const key = opts.itemKey(item, i);
-            const contentSize = measured.get(key) ?? Math.max(1, opts.estimateSize(item, i) || 1);
+            let contentSize = measured.get(key);
+            if (contentSize == null) {
+                contentSize = estimated.get(key);
+                if (contentSize == null) {
+                    contentSize = Math.max(1, opts.estimateSize(item, i) || 1);
+                    estimated.set(key, contentSize);
+                }
+            }
             const size = Math.max(1, contentSize) + (i < items.length - 1 ? gap : 0);
             const top = prefix[i];
-            rows[i] = { item, index: i, key, top, size };
+            keys[i] = key;
+            sizes[i] = size;
+            keyTops.set(key, top);
             prefix[i + 1] = top + size;
         }
-        return { rows, prefix, totalHeight: prefix[items.length] ?? 0 };
+        recordRendererPerf('virtual.layout', performance.now() - startedAt, items.length);
+        return { keys, sizes, keyTops, prefix, totalHeight: prefix[items.length] ?? 0 };
     });
 
     function syncSnapshot(): void {
         const l = layout.value;
-        snapshotKeys = l.rows.map((row) => row.key);
-        snapshotPrefix = l.prefix.slice();
+        snapshotKeys = l.keys;
+        snapshotPrefix = l.prefix;
     }
 
     function markUserScrollInteraction(): void {
@@ -116,31 +125,31 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
 
     const startIndex = computed(() => {
         const l = layout.value;
-        return findIndexByOffset(l.prefix, l.rows.length, scrollTop.value - opts.overscanPx.value);
+        return findIndexByOffset(l.prefix, l.keys.length, scrollTop.value - opts.overscanPx.value);
     });
 
     const endIndex = computed(() => {
         const l = layout.value;
-        if (!l.rows.length) return 0;
+        if (!l.keys.length) return 0;
         const bottom = scrollTop.value + viewportHeight.value + opts.overscanPx.value;
-        return Math.min(l.rows.length, findIndexByOffset(l.prefix, l.rows.length, bottom) + 1);
+        return Math.min(l.keys.length, findIndexByOffset(l.prefix, l.keys.length, bottom) + 1);
     });
 
     const virtualRows = computed<DynamicVirtualRow<T>[]>(() => {
         const l = layout.value;
+        const items = opts.items.value;
         const out: DynamicVirtualRow<T>[] = [];
         for (let i = startIndex.value; i < endIndex.value; i++) {
-            const row = l.rows[i];
-            if (!row) continue;
-            out.push(row);
+            const item = items[i];
+            const key = l.keys[i];
+            if (item == null || key == null) continue;
+            out.push({ item, index: i, key, top: l.prefix[i] ?? 0, size: l.sizes[i] ?? 1 });
         }
         return out;
     });
 
     function keyTop(key: DynamicVirtualKey): number | null {
-        const l = layout.value;
-        const row = l.rows.find((item) => item.key === key);
-        return row ? row.top : null;
+        return layout.value.keyTops.get(key) ?? null;
     }
 
     function captureAnchorFrom(keys: DynamicVirtualKey[], prefix: number[]): Anchor | null {
@@ -154,7 +163,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
 
     function captureAnchor(): Anchor | null {
         const l = layout.value;
-        return captureAnchorFrom(l.rows.map((row) => row.key), l.prefix);
+        return captureAnchorFrom(l.keys, l.prefix);
     }
 
     function restoreAnchor(anchor: Anchor | null): void {
@@ -198,12 +207,16 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     }
 
     function pruneMeasurements(): void {
-        const keys = new Set(layout.value.rows.map((row) => row.key));
+        const keyTops = layout.value.keyTops;
         let changed = false;
         for (const key of measured.keys()) {
-            if (keys.has(key)) continue;
+            if (keyTops.has(key)) continue;
             measured.delete(key);
             changed = true;
+        }
+        for (const key of estimated.keys()) {
+            if (keyTops.has(key)) continue;
+            estimated.delete(key);
         }
         if (changed) sizeVersion.value++;
     }
@@ -247,6 +260,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
                 const prev = measured.get(key);
                 if (prev != null && Math.abs(prev - next) < 1) continue;
                 measured.set(key, next);
+                estimated.delete(key);
                 changed = true;
             }
             if (!changed) return;
@@ -270,6 +284,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
         const height = Math.ceil(el.getBoundingClientRect().height);
         if (height > 0 && measured.get(key) !== height) {
             measured.set(key, height);
+            estimated.delete(key);
             sizeVersion.value++;
         }
     }
@@ -290,6 +305,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
 
     function resetMeasurements(scrollTopAfterReset = true): void {
         measured.clear();
+        estimated.clear();
         sizeVersion.value++;
         void nextTick(() => {
             const el = opts.containerRef.value;
@@ -302,6 +318,7 @@ export function useDynamicVirtualList<T>(opts: DynamicVirtualListOptions<T>) {
     function handleLayoutChanged(): void {
         const anchor = opts.stickToStart.value ? null : captureAnchor();
         measured.clear();
+        estimated.clear();
         sizeVersion.value++;
         scheduleRestore(anchor);
     }

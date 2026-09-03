@@ -45,6 +45,7 @@ const virtual = useDynamicVirtualList({
 const verticalPadding = 6;
 let containerResizeObserver: ResizeObserver | null = null;
 let lastWidth = 0;
+let lastHeight = 0;
 let scrollEmitRaf: number | null = null;
 
 function emitScroll(): void {
@@ -134,13 +135,20 @@ onMounted(() => {
     emitScroll();
     if (typeof ResizeObserver !== 'undefined' && containerRef.value) {
         lastWidth = containerRef.value.clientWidth;
+        lastHeight = containerRef.value.clientHeight;
         containerResizeObserver = new ResizeObserver(() => {
             const el = containerRef.value;
             if (!el) return;
             const width = el.clientWidth;
-            if (Math.abs(width - lastWidth) < 1) return;
+            const height = el.clientHeight;
+            const widthChanged = Math.abs(width - lastWidth) >= 1;
+            const heightChanged = Math.abs(height - lastHeight) >= 1;
+            if (!widthChanged && !heightChanged) return;
             lastWidth = width;
-            virtual.handleLayoutChanged();
+            lastHeight = height;
+            if (widthChanged) virtual.handleLayoutChanged();
+            else virtual.measure();
+            scheduleEmitScroll();
         });
         containerResizeObserver.observe(containerRef.value);
     }

@@ -1,17 +1,20 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import type { HistoryMessage, HistoryQueryOptions } from '../../shared/types';
-import { decodeBucket, readPayloadSlice } from './history-bucket-codec';
+import { decodeBucket, readPayloadBytesSlice } from './history-bucket-codec';
 import {
     collectDayFiles,
+    historyFileTimeRangeFromKey,
     matchesSearchText,
     normalizeCombinedSearchText,
     normalizeConditions,
     normalizeKeyword,
     parseKeywordTerms,
+    type DayFileEntry,
     type NormalizedCondition
 } from './history-query-common';
 import { getHistoryFtsLayout, getHistoryFtsTokenizer, getHistoryIndexSchemaVersion, getIndexMeta, isHistoryFtsComplete } from './history-index-schema';
+import { decodePayloadView } from './payload-codec';
 
 interface QueryWorkerData {
     opts: HistoryQueryOptions;
@@ -62,6 +65,9 @@ class StreamQueryOutput implements QueryOutput {
 
 const { opts, logRoot, stream, requestId, chunkSize } = workerData as QueryWorkerData;
 const MAX_DECODED_BUCKET_CACHE = 256;
+const queryStartedAt = Date.now();
+let queryFilesRead = 0;
+let queryPeakCandidateRows = 0;
 
 function getDecodedBucket(
     cache: Map<string, HistoryMessage[]>,
@@ -196,16 +202,40 @@ function pushIndexedRow(
     row: IndexedMessageRow,
     out: QueryOutput
 ): void {
+    const message = readIndexedMessage(db, bucketStmt, bucketCache, fe, row);
+    if (message) out.push(message);
+}
+
+function readIndexedMessage(
+    db: Database.Database,
+    bucketStmt: Database.Statement,
+    bucketCache: Map<string, HistoryMessage[]>,
+    fe: { san: string },
+    row: IndexedMessageRow
+): HistoryMessage | null {
+    void db;
     const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
-    if (!bucket) return;
-    let payload: string | null = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
-    if (payload == null) {
+    if (!bucket) return null;
+    const payloadBytes = readPayloadBytesSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
+    if (payloadBytes) {
+        const payload = decodePayloadView(payloadBytes);
+        return {
+            connectionId: fe.san,
+            topic: row.topic,
+            payload: payload.text,
+            time: row.time_ms,
+            payloadSize: payload.size,
+            payloadEncoding: payload.encoding,
+            ...(payload.encoding === 'utf8' ? {} : { payloadBase64: payloadBytes.toString('base64') })
+        };
+    }
+    {
         const cacheKey = `${row.bucket_ts}|${row.topic}`;
         const decoded = getDecodedBucket(bucketCache, cacheKey, bucket.blob, row.bucket_ts, row.topic);
-        payload = decoded[row.msg_index]?.payload ?? null;
+        const message = decoded[row.msg_index];
+        if (!message) return null;
+        return { ...message, connectionId: fe.san, topic: row.topic, time: row.time_ms };
     }
-    if (payload == null) return;
-    out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
 }
 
 function pushIndexedRowIfMatches(
@@ -221,17 +251,10 @@ function pushIndexedRowIfMatches(
     out: QueryOutput,
     emit = true
 ): boolean {
-    const bucket = bucketStmt.get(row.bucket_ts, row.topic) as { blob: Buffer } | undefined;
-    if (!bucket) return false;
-    let payload: string | null = readPayloadSlice(bucket.blob, row.payload_offset ?? -1, row.payload_len ?? -1);
-    if (payload == null) {
-        const cacheKey = `${row.bucket_ts}|${row.topic}`;
-        const decoded = getDecodedBucket(bucketCache, cacheKey, bucket.blob, row.bucket_ts, row.topic);
-        payload = decoded[row.msg_index]?.payload ?? null;
-    }
-    if (payload == null) return false;
-    if (!matchesSearchText(normalizeCombinedSearchText(row.topic, payload), conditions, terms, keywordLogic)) return false;
-    if (emit) out.push({ connectionId: fe.san, topic: row.topic, payload, time: row.time_ms });
+    const message = readIndexedMessage(db, bucketStmt, bucketCache, fe, row);
+    if (!message) return false;
+    if (!matchesSearchText(normalizeCombinedSearchText(row.topic, message.payload), conditions, terms, keywordLogic)) return false;
+    if (emit) out.push(message);
     return true;
 }
 
@@ -284,7 +307,9 @@ function queryTopicTextIndexedFile(
     fe: { san: string },
     st: number,
     et: number,
+    topicFilter: string | null,
     order: 'asc' | 'desc',
+    candidateTerms: string[],
     conditions: NormalizedCondition[],
     terms: string[],
     keywordLogic: 'and' | 'or',
@@ -294,7 +319,7 @@ function queryTopicTextIndexedFile(
     seen: Set<string>,
     out: QueryOutput
 ): void {
-    const where = topicWhereForSearch(conditions, terms, keywordLogic);
+    const where = buildLikeWhere('lower(topic)', [], candidateTerms, 'or');
     if (!where) return;
     const chunkSize = 1000;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
@@ -307,6 +332,10 @@ function queryTopicTextIndexedFile(
                    FROM history_messages
                    WHERE time_ms BETWEEN ? AND ? AND (${where.sql})`;
         const params: Array<number | string> = [st, et, ...where.params];
+        if (topicFilter) {
+            sql += ' AND topic = ?';
+            params.push(topicFilter);
+        }
         if (lastTime != null && lastTopic != null && lastMsgIndex != null) {
             if (order === 'desc') {
                 sql += ' AND (time_ms < ? OR (time_ms = ? AND topic < ?) OR (time_ms = ? AND topic = ? AND msg_index < ?))';
@@ -322,6 +351,7 @@ function queryTopicTextIndexedFile(
         const rows = db.prepare(sql).all(...params) as IndexedMessageRow[];
         if (rows.length === 0) break;
         for (const row of rows) {
+            if (!pushIndexedRowIfMatches(db, bucketStmt, bucketCache, schemaVersion, fe, row, conditions, terms, keywordLogic, out, false)) continue;
             const key = `${row.bucket_ts}|${row.topic}|${row.msg_index}`;
             if (seen.has(key)) continue;
             seen.add(key);
@@ -348,6 +378,7 @@ function queryTrigramFtsIndexedFile(
     et: number,
     topicFilter: string | null,
     order: 'asc' | 'desc',
+    candidateTerms: string[],
     conditions: NormalizedCondition[],
     terms: string[],
     keywordLogic: 'and' | 'or',
@@ -358,12 +389,9 @@ function queryTrigramFtsIndexedFile(
     out: QueryOutput
 ): boolean {
     if (getHistoryFtsTokenizer(db) !== 'trigram' || !hasFtsIndex(db)) return false;
-    const match = buildFtsMatchForSchema(schemaVersion, conditions, terms, keywordLogic);
+    const match = buildCompactFtsMatch([], candidateTerms, 'or');
     if (!match) return false;
-    const positiveTerms = conditions.length > 0
-        ? conditions.filter((item) => item.join !== 'not').map((item) => item.term)
-        : terms;
-    if (positiveTerms.length === 0 || positiveTerms.some((term) => Array.from(term).length < 3)) return false;
+    if (candidateTerms.some((term) => Array.from(term).length < 3)) return false;
     const chunkSize = 1000;
     const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
     const bucketCache = new Map<string, HistoryMessage[]>();
@@ -413,6 +441,51 @@ function queryTrigramFtsIndexedFile(
         lastMsgIndex = tail.msg_index;
         if (rows.length < chunkSize) break;
     }
+    return true;
+}
+
+function getCandidateTerms(conditions: NormalizedCondition[], terms: string[]): string[] {
+    const values = conditions.length > 0
+        ? conditions.filter((item, index) => index === 0 || item.join !== 'not').map((item) => item.term)
+        : terms;
+    return [...new Set(values)];
+}
+
+function queryCombinedTextIndexedFile(
+    db: Database.Database,
+    schemaVersion: string,
+    fe: { san: string },
+    st: number,
+    et: number,
+    topicFilter: string | null,
+    order: 'asc' | 'desc',
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    out: QueryOutput
+): boolean {
+    const candidateTerms = getCandidateTerms(conditions, terms);
+    if (schemaVersion !== '6'
+        || candidateTerms.length === 0
+        || candidateTerms.some((term) => Array.from(term).length < 3)
+        || !hasFtsIndex(db)) return false;
+
+    const seen = new Set<string>();
+    const payloadOut = new ArrayQueryOutput();
+    const topicOut = new ArrayQueryOutput();
+    const usedPayloadFts = queryTrigramFtsIndexedFile(
+        db, schemaVersion, fe, st, et, topicFilter, order, candidateTerms,
+        conditions, terms, keywordLogic, limit, 0, { value: 0 }, seen, payloadOut
+    );
+    if (!usedPayloadFts) return false;
+    queryTopicTextIndexedFile(
+        db, schemaVersion, fe, st, et, topicFilter, order, candidateTerms,
+        conditions, terms, keywordLogic, limit, 0, { value: 0 }, seen, topicOut
+    );
+
+    const rows = mergeSortedHistoryRows(payloadOut.rows, topicOut.rows, limit, order);
+    for (const row of rows) out.push(row);
     return true;
 }
 
@@ -674,11 +747,154 @@ function queryRawRecentTopicFiles(
     }
 }
 
+function compareHistoryRows(a: HistoryMessage, b: HistoryMessage, order: 'asc' | 'desc'): number {
+    const direction = order === 'asc' ? 1 : -1;
+    if (a.time !== b.time) return (a.time - b.time) * direction;
+    const connectionCompare = a.connectionId.localeCompare(b.connectionId);
+    if (connectionCompare !== 0) return connectionCompare * direction;
+    const topicCompare = a.topic.localeCompare(b.topic);
+    return topicCompare * direction;
+}
+
+function mergeSortedHistoryRows(
+    left: HistoryMessage[],
+    right: HistoryMessage[],
+    limit: number,
+    order: 'asc' | 'desc'
+): HistoryMessage[] {
+    const merged: HistoryMessage[] = [];
+    let leftIndex = 0;
+    let rightIndex = 0;
+    while (merged.length < limit && (leftIndex < left.length || rightIndex < right.length)) {
+        if (leftIndex >= left.length) merged.push(right[rightIndex++]);
+        else if (rightIndex >= right.length) merged.push(left[leftIndex++]);
+        else if (compareHistoryRows(left[leftIndex], right[rightIndex], order) <= 0) merged.push(left[leftIndex++]);
+        else merged.push(right[rightIndex++]);
+    }
+    return merged;
+}
+
+function groupFilesByOverlappingRange(files: DayFileEntry[], order: 'asc' | 'desc'): DayFileEntry[][] {
+    const ranged = files.map((file) => ({ file, range: historyFileTimeRangeFromKey(file.dk) }))
+        .filter((item): item is { file: DayFileEntry; range: { start: number; end: number } } => Boolean(item.range))
+        .sort((a, b) => a.range.start - b.range.start || a.range.end - b.range.end || a.file.san.localeCompare(b.file.san));
+    const groups: Array<{ start: number; end: number; files: DayFileEntry[] }> = [];
+    for (const item of ranged) {
+        const current = groups[groups.length - 1];
+        if (current && item.range.start <= current.end) {
+            current.end = Math.max(current.end, item.range.end);
+            current.files.push(item.file);
+        } else {
+            groups.push({ start: item.range.start, end: item.range.end, files: [item.file] });
+        }
+    }
+    const ordered = order === 'asc' ? groups : groups.reverse();
+    return ordered.map((group) => group.files);
+}
+
+function queryRawFile(
+    db: Database.Database,
+    fe: { san: string },
+    st: number,
+    et: number,
+    topicFilter: string | null,
+    order: 'asc' | 'desc',
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    out: QueryOutput
+): void {
+    if (!tableExists(db, 'buckets')) return;
+    const bucketStart = Math.floor(st / 1000);
+    const bucketEnd = Math.floor(et / 1000);
+    let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
+    const params: Array<number | string> = [bucketStart, bucketEnd];
+    if (topicFilter) {
+        sql += ' AND topic = ?';
+        params.push(topicFilter);
+    }
+    sql += order === 'asc'
+        ? ' ORDER BY bucket_ts ASC, topic ASC'
+        : ' ORDER BY bucket_ts DESC, topic DESC';
+
+    let activeBucketTs: number | null = null;
+    let bucketRows: HistoryMessage[] = [];
+    const flushBucket = (): boolean => {
+        bucketRows.sort((a, b) => compareHistoryRows(a, b, order));
+        for (const message of bucketRows) {
+            out.push(message);
+            if (out.length >= limit) return true;
+        }
+        bucketRows = [];
+        return false;
+    };
+
+    for (const row of db.prepare(sql).iterate(...params) as Iterable<{ bucket_ts: number; topic: string; blob: Buffer }>) {
+        if (activeBucketTs != null && row.bucket_ts !== activeBucketTs && flushBucket()) return;
+        activeBucketTs = row.bucket_ts;
+        for (const item of decodeBucket(row.blob, row.bucket_ts, row.topic)) {
+            if (item.time < st || item.time > et) continue;
+            if (!matchesSearchText(normalizeCombinedSearchText(item.topic, item.payload), conditions, terms, keywordLogic)) continue;
+            bucketRows.push({ ...item, connectionId: fe.san, topic: row.topic });
+        }
+    }
+    flushBucket();
+}
+
+function queryHistoryFile(
+    fe: DayFileEntry,
+    st: number,
+    et: number,
+    topicFilter: string | null,
+    order: 'asc' | 'desc',
+    conditions: NormalizedCondition[],
+    terms: string[],
+    keywordLogic: 'and' | 'or',
+    limit: number,
+    out: QueryOutput
+): void {
+    queryFilesRead++;
+    const db = new Database(fe.path, { readonly: true });
+    try {
+        const indexSchemaVersion = getUsableIndexVersion(db);
+        if (!indexSchemaVersion) {
+            sendDiagnostic('[history-query] raw bucket fallback', {
+                filePath: fe.path,
+                reason: getBestEffortIndexVersion(db) ? 'index-incomplete' : 'index-missing'
+            });
+            queryRawFile(db, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, out);
+            return;
+        }
+
+        const hasTextFilter = conditions.length > 0 || terms.length > 0;
+        if (!hasTextFilter && canUseRecentTopicFastPath(topicFilter, order, 0)) {
+            queryRecentTopicIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, conditions, terms, keywordLogic, limit, out);
+            return;
+        }
+
+        const skippedRef = { value: 0 };
+        if (hasTextFilter && !shouldPreferTimeIndexedScan(st, et)) {
+            const usedCombinedIndex = queryCombinedTextIndexedFile(
+                db, indexSchemaVersion, fe, st, et, topicFilter, order,
+                conditions, terms, keywordLogic, limit, out
+            );
+            if (usedCombinedIndex) return;
+        }
+        queryIndexedFile(
+            db, indexSchemaVersion, fe, st, et, topicFilter, order,
+            conditions, terms, keywordLogic, limit, 0, skippedRef, out
+        );
+    } finally {
+        db.close();
+    }
+}
+
 function queryHistory(out: QueryOutput): void {
     const st = opts.startTime != null && opts.startTime > 0 ? opts.startTime : -8640000000000000;
     const et = opts.endTime != null && opts.endTime > 0 ? opts.endTime : 8640000000000000;
-    const limit = Math.min(500_000, Math.max(1, opts.limit ?? 500));
-    const offset = Math.max(0, opts.offset ?? 0);
+    const limit = Math.min(500_000, Math.max(1, Math.floor(opts.limit ?? 500)));
+    let remainingOffset = Math.max(0, Math.floor(opts.offset ?? 0));
     const order = opts.order === 'asc' ? 'asc' : 'desc';
     const conditions = normalizeConditions(opts.conditions);
     const terms = conditions.length ? [] : parseKeywordTerms(opts.keywords?.length ? opts.keywords : (opts.keyword ? [opts.keyword] : []));
@@ -686,66 +902,22 @@ function queryHistory(out: QueryOutput): void {
     const topicFilter = opts.topic && opts.topic.trim() ? opts.topic.trim() : null;
 
     const files = collectDayFiles(logRoot, { connectionId: opts.connectionId, startTime: st, endTime: et, order });
-
-    if (canUseRecentTopicFastPath(topicFilter, order, offset)) {
-        for (const fe of files) {
-            if (out.length >= limit) break;
-            const db = new Database(fe.path, { readonly: true });
-            try {
-                const indexSchemaVersion = getBestEffortIndexVersion(db);
-                if (!indexSchemaVersion) continue;
-                queryRecentTopicIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, conditions, terms, keywordLogic, limit, out);
-            } finally {
-                db.close();
-            }
-        }
-        if (out.length === 0 && (conditions.length > 0 || terms.length > 0)) {
-            const topicOnlyConditions = conditions.filter((item) => item.join !== 'and' || !topicFilter.includes(item.term));
-            queryRawRecentTopicFiles(st, et, topicFilter, topicOnlyConditions, terms, keywordLogic, limit, out);
-        }
-        return;
-    }
-
-    const skippedRef = { value: 0 };
-
-    for (const fe of files) {
+    for (const group of groupFilesByOverlappingRange(files, order)) {
         if (out.length >= limit) break;
-        const db = new Database(fe.path, { readonly: true });
-        try {
-            const indexSchemaVersion = getBestEffortIndexVersion(db);
-            if (!indexSchemaVersion) continue;
-            if (conditions.length > 0 || terms.length > 0) {
-                if (indexSchemaVersion === '6') {
-                    if (!isHistoryFtsComplete(db)) {
-                        sendDiagnostic('[history-query] compact fts fallback', {
-                            filePath: fe.path,
-                            ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
-                            reason: 'deferred-fts-incomplete'
-                        });
-                    }
-                    const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
-                    if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-                } else if (shouldPreferTimeIndexedScan(st, et) || topicFilter) {
-                    queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-                } else {
-                    if (!isHistoryFtsComplete(db)) {
-                        sendDiagnostic('[history-query] fts tail fallback', {
-                            filePath: fe.path,
-                            ftsIndexedId: Number(getIndexMeta(db, 'fts_indexed_id') || 0),
-                            reason: 'deferred-fts-incomplete'
-                        });
-                    }
-                    const usedFts = queryFtsIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, null, out);
-                    if (!usedFts) queryIndexedFile(db, indexSchemaVersion, fe, st, et, null, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-                }
-            } else {
-                queryIndexedFile(db, indexSchemaVersion, fe, st, et, topicFilter, order, conditions, terms, keywordLogic, limit, offset, skippedRef, out);
-            }
-        } finally {
-            db.close();
+        const remainingLimit = limit - out.length;
+        const candidateLimit = Math.max(1, Math.min(Number.MAX_SAFE_INTEGER, remainingOffset + remainingLimit));
+        let candidates: HistoryMessage[] = [];
+        for (const fe of group) {
+            const fileOut = new ArrayQueryOutput();
+            queryHistoryFile(fe, st, et, topicFilter, order, conditions, terms, keywordLogic, candidateLimit, fileOut);
+            const merged = mergeSortedHistoryRows(candidates, fileOut.rows, candidateLimit, order);
+            queryPeakCandidateRows = Math.max(queryPeakCandidateRows, candidates.length + fileOut.rows.length + merged.length);
+            candidates = merged;
         }
+        const start = Math.min(remainingOffset, candidates.length);
+        remainingOffset -= start;
+        for (let i = start; i < candidates.length && out.length < limit; i++) out.push(candidates[i]);
     }
-
 }
 
 try {
@@ -754,10 +926,24 @@ try {
         const streamOut = new StreamQueryOutput(requestId, Math.min(5000, Math.max(100, chunkSize ?? 1000)));
         queryHistory(streamOut);
         streamOut.flush();
+        sendDiagnostic('[history-query] completed', {
+            elapsedMs: Date.now() - queryStartedAt,
+            filesRead: queryFilesRead,
+            peakCandidateRows: queryPeakCandidateRows,
+            resultRows: streamOut.length,
+            stream: true
+        });
         parentPort?.postMessage({ type: 'done', requestId, total: streamOut.length, truncated: streamOut.length >= Math.min(500_000, Math.max(1, opts.limit ?? 500)) });
     } else {
         const arrayOut = new ArrayQueryOutput();
         queryHistory(arrayOut);
+        sendDiagnostic('[history-query] completed', {
+            elapsedMs: Date.now() - queryStartedAt,
+            filesRead: queryFilesRead,
+            peakCandidateRows: queryPeakCandidateRows,
+            resultRows: arrayOut.rows.length,
+            stream: false
+        });
         parentPort?.postMessage({ type: 'done', data: arrayOut.rows });
     }
 } catch (error) {

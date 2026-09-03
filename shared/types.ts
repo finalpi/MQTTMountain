@@ -49,6 +49,15 @@ export interface LogDirDataResult {
     targetDir?: string;
 }
 
+export interface StorageDiskPressureState {
+    level: 'normal' | 'warning' | 'critical';
+    logRoot: string;
+    totalBytes: number;
+    freeBytes: number;
+    freeRatio: number;
+    historyWritesPaused: boolean;
+}
+
 /** 批量从主进程推到渲染进程的单条消息 */
 export interface PayloadMetadata {
     payloadSize?: number;
@@ -104,6 +113,12 @@ export interface HistoryMessage extends PayloadMetadata {
     topic: string;
     payload: string;
     time: number;
+}
+
+export interface RecentHydrationSnapshot {
+    rows: HistoryMessage[];
+    /** 此时间及以前的消息由 rows 快照负责，之后的消息继续走实时 IPC。 */
+    throughTime: number;
 }
 
 export interface HistoryQueryStreamStartRequest {
@@ -227,7 +242,7 @@ export type IpcChannels = {
     'mqtt:setPriorityTopic': (p: { connectionId: string; topic: string | null }) => ApiResult;
     'mqtt:setActiveConnection': (p: { connectionId: string | null }) => ApiResult;
     'mqtt:setDisplayPaused': (p: { connectionId: string; paused: boolean }) => ApiResult;
-    'mqtt:readRecent': (p: { connectionId: string; limit?: number }) => ApiResult<HistoryMessage[]>;
+    'mqtt:readRecent': (p: { connectionId: string; limit?: number }) => ApiResult<RecentHydrationSnapshot>;
     'mqtt:clearLogs': (connectionId?: string | null) => ApiResult<{ deletedFiles: number }>;
     'history:query': (opts: HistoryQueryOptions) => ApiResult<HistoryMessage[]>;
     'history:queryStreamStart': (req: HistoryQueryStreamStartRequest) => ApiResult<{ requestId: string }>;
@@ -259,6 +274,7 @@ export type IpcEvents = {
     'mqtt:state': (p: { connectionId: string; state: 'connected' | 'reconnecting' | 'offline' | 'closed' | 'error'; message?: string }) => void;
     'app:autoDeleteDone': (files: number) => void;
     'app:startupMaintenanceDone': (p: StartupMaintenanceDone) => void;
+    'app:storageDiskPressure': (p: StorageDiskPressureState) => void;
     'window:focused': () => void;
     'history:exportProgress': (p: HistoryExportProgress) => void;
     'history:indexProgress': (p: HistoryIndexProgress) => void;

@@ -1,5 +1,5 @@
 import type { HistoryMessage } from '../../shared/types';
-import { payloadBytes } from './payload-codec';
+import { decodePayloadView, payloadBytes } from './payload-codec';
 import { deflateRawSync, inflateRawSync } from 'node:zlib';
 
 const COMPRESSED_BUCKET_MAGIC = Buffer.from('MMZ1');
@@ -35,6 +35,9 @@ export interface BucketEntry {
     payloadOffset: number;
     payloadLen: number;
     entryLen: number;
+    payloadSize: number;
+    payloadEncoding: 'utf8' | 'binary' | 'invalid-utf8';
+    payloadBase64?: string;
 }
 
 export function isCompressedBucketBlob(blob: unknown): boolean {
@@ -88,7 +91,7 @@ export function encodeBucket(items: BucketItem[], bucketSec: number): Buffer {
 
 export function validateBucketBlob(blob: unknown, expectedCount: number, expectedBytes: number): BucketValidationResult {
     if (!Buffer.isBuffer(blob)) return { valid: false, structureValid: false, count: 0, reason: 'blob is not a Buffer' };
-    if (!Number.isSafeInteger(expectedBytes) || expectedBytes !== blob.length) return { valid: false, structureValid: true, count: 0, reason: 'bucket bytes metadata mismatch' };
+    const bytesMetadataValid = Number.isSafeInteger(expectedBytes) && expectedBytes === blob.length;
     let raw: Buffer;
     try {
         raw = unpackBucketBlob(blob);
@@ -106,6 +109,7 @@ export function validateBucketBlob(blob: unknown, expectedCount: number, expecte
         p += len;
     }
     if (p !== raw.length) return { valid: false, structureValid: false, count, reason: 'trailing bytes after entries' };
+    if (!bytesMetadataValid) return { valid: false, structureValid: true, count, reason: 'bucket bytes metadata mismatch' };
     if (!Number.isSafeInteger(expectedCount) || expectedCount < 0) return { valid: false, structureValid: true, count, reason: 'invalid bucket count metadata' };
     if (count !== expectedCount) return { valid: false, structureValid: true, count, reason: 'bucket count metadata mismatch' };
     return { valid: true, structureValid: true, count };
@@ -139,15 +143,18 @@ export function iterateBucketEntries(blob: Buffer, bucketSec: number, startIndex
         if (payloadOffset + payloadLen > raw.length) break;
         p += payloadLen;
         if (i < firstIndex) continue;
-        const payload = raw.subarray(payloadOffset, payloadOffset + payloadLen).toString('utf8');
+        const payloadView = decodePayloadView(raw.subarray(payloadOffset, payloadOffset + payloadLen));
         out.push({
             msgIndex: i,
             time: base + off,
-            payload,
+            payload: payloadView.text,
             entryOffset,
             payloadOffset,
             payloadLen,
-            entryLen: p - entryOffset
+            entryLen: p - entryOffset,
+            payloadSize: payloadView.size,
+            payloadEncoding: payloadView.encoding,
+            payloadBase64: payloadView.base64
         });
     }
     return out;
@@ -171,6 +178,9 @@ export function decodeBucket(blob: Buffer, bucketSec: number, topic: string): Hi
         connectionId: '',
         topic,
         payload: entry.payload,
-        time: entry.time
+        time: entry.time,
+        payloadSize: entry.payloadSize,
+        payloadEncoding: entry.payloadEncoding,
+        payloadBase64: entry.payloadBase64
     }));
 }

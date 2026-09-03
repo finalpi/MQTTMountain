@@ -4,9 +4,12 @@ export interface PayloadView {
     text: string;
     size: number;
     encoding: PayloadEncoding;
+    base64?: string;
 }
 
-const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
+// Keep a leading UTF-8 BOM in the decoded string so valid UTF-8 payloads can be
+// reconstructed byte-for-byte without also cloning their Buffer to the worker.
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export function decodePayloadView(payload: Buffer): PayloadView {
     const size = payload.length;
@@ -20,7 +23,8 @@ export function decodePayloadView(payload: Buffer): PayloadView {
         return {
             text: payload.toString('utf8'),
             size,
-            encoding: 'invalid-utf8'
+            encoding: 'invalid-utf8',
+            base64: payload.toString('base64')
         };
     }
 }

@@ -1,52 +1,81 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { useSettingsStore } from '@/stores/settings';
 import { useMessageStore } from '@/stores/messages';
 import { useToast } from '@/composables/useToast';
 import { useUiPrefs } from '@/composables/useUiPrefs';
 import { useUpdater } from '@/composables/useUpdater';
+import { useStorageDiskPressure } from '@/composables/useStorageDiskPressure';
+import { formatBytes } from '@/utils/format';
 
 const settings = useSettingsStore();
 const msg = useMessageStore();
 const toast = useToast();
 const { prefs, toggleRight } = useUiPrefs();
 const updater = useUpdater();
+const storagePressure = useStorageDiskPressure();
 const isOpen = computed(() => prefs.activeRight === 'settings');
+const saving = ref(false);
+const displayLogDir = computed(() => settings.state.logDir || settings.defaultLogDir || settings.currentLogDir);
+const diskPressure = computed(() => storagePressure.state.current);
+const diskPressureText = computed(() => {
+    const current = diskPressure.value;
+    if (!current) return '磁盘空间状态等待检测';
+    const free = `${formatBytes(current.freeBytes)} / ${formatBytes(current.totalBytes)}（${(current.freeRatio * 100).toFixed(1)}% 可用）`;
+    if (current.level === 'critical') return `严重不足：${free}。历史写入已暂停，实时消息仍继续显示。`;
+    if (current.level === 'warning') return `空间不足：${free}。请尽快清理或更换日志目录。`;
+    return `空间正常：${free}`;
+});
 
 async function save(): Promise<void> {
-    const changeInfo = await window.api.settingsGetLogDirChangeInfo(settings.state.logDir);
-    if (!changeInfo.success) {
-        toast.error(changeInfo.message || '检查日志目录变更失败');
-        return;
-    }
+    if (saving.value) return;
+    saving.value = true;
+    let completedLogAction: 'migrate' | 'delete' | null = null;
+    try {
+        const requestedLogDir = settings.state.logDir.trim();
+        const changeInfo = await window.api.settingsGetLogDirChangeInfo(requestedLogDir);
+        if (!changeInfo.success) throw new Error(changeInfo.message || '检查日志目录变更失败');
 
-    if (changeInfo.data?.changed && changeInfo.data.sourceFiles > 0) {
-        const { sourceDir, targetDir, sourceFiles } = changeInfo.data;
-        const migrate = confirm(`原日志目录中有 ${sourceFiles} 个日志文件。\n\n是否迁移到新目录？\n\n确定：迁移\n取消：继续选择是否删除原始数据`);
-        if (migrate) {
-            const r = await window.api.settingsMigrateLogDirData({ sourceDir, targetDir });
-            if (!r.success) {
-                toast.error(r.message || '迁移原始数据失败');
-                return;
-            }
-            toast.success(`已迁移 ${r.data?.files ?? sourceFiles} 个日志文件`);
-        } else if (confirm('是否删除原始日志数据？\n\n删除后无法从历史查询找回。')) {
-            const r = await window.api.settingsDeleteLogDirData({ sourceDir });
-            if (!r.success) {
-                toast.error(r.message || '删除原始数据失败');
-                return;
-            }
-            toast.success(`已删除 ${r.data?.files ?? sourceFiles} 个日志文件`);
+        let logAction: 'migrate' | 'delete' | null = null;
+        const info = changeInfo.data;
+        if (info?.changed && info.sourceFiles > 0) {
+            const migrate = confirm(`原日志目录中有 ${info.sourceFiles} 个日志文件。\n\n是否迁移到新目录？\n\n确定：迁移\n取消：继续选择是否删除原始数据`);
+            if (migrate) logAction = 'migrate';
+            else if (confirm('是否删除原始日志数据？\n\n删除后无法从历史查询找回。')) logAction = 'delete';
         }
-    }
 
-    const r = await settings.save();
-    msg.setLimits(settings.state.maxMemoryMessages, settings.state.maxPerTopic);
-    toast.success('设置已保存');
-    if (r.needRestart) {
-        if (confirm('日志目录已变更，是否立即重启应用以生效？')) {
-            await window.api.appRelaunch();
+        if (info && logAction === 'migrate') {
+            if (!info.targetDir) throw new Error('迁移目标目录为空');
+            const moved = await window.api.settingsMigrateLogDirData({ sourceDir: info.sourceDir, targetDir: info.targetDir });
+            if (!moved.success) throw new Error(`日志迁移阶段失败，目录未切换：${moved.message || '未知错误'}`);
+            completedLogAction = 'migrate';
+            settings.currentLogDir = moved.data?.targetDir || info.targetDir;
+            settings.state.logDir = requestedLogDir ? settings.currentLogDir : '';
+            toast.success(`已迁移 ${moved.data?.files ?? info.sourceFiles} 个日志文件`);
+        } else if (info && logAction === 'delete') {
+            const deleted = await window.api.settingsDeleteLogDirData({ sourceDir: info.sourceDir });
+            if (!deleted.success) throw new Error(`原日志删除阶段失败，目录未切换：${deleted.message || '未知错误'}`);
+            completedLogAction = 'delete';
+            settings.currentLogDir = deleted.data?.targetDir || info.targetDir || settings.currentLogDir;
+            settings.state.logDir = requestedLogDir ? settings.currentLogDir : '';
+            toast.success(`已删除 ${deleted.data?.files ?? info.sourceFiles} 个日志文件`);
         }
+
+        try {
+            await settings.save();
+        } catch (settingsError) {
+            if (completedLogAction) {
+                const action = completedLogAction === 'migrate' ? '迁移' : '删除并切换';
+                throw new Error(`日志${action}已完成且当前目录已切换，但其他设置保存失败：${settingsError instanceof Error ? settingsError.message : String(settingsError)}`);
+            }
+            throw settingsError;
+        }
+        msg.setLimits(settings.state.maxMemoryMessages, settings.state.maxPerTopic);
+        toast.success('设置已保存');
+    } catch (error) {
+        toast.error('保存设置失败：' + (error instanceof Error ? error.message : String(error)));
+    } finally {
+        saving.value = false;
     }
 }
 
@@ -116,8 +145,13 @@ function setFontSize(v: number): void {
             </div>
             <div class="field">
                 <label>消息日志目录（修改后需重启）</label>
-                <input :value="settings.state.logDir || settings.currentLogDir" readonly />
+                <input :value="displayLogDir" readonly />
             </div>
+            <div
+                class="disk-pressure"
+                :class="diskPressure?.level || 'unknown'"
+                :title="diskPressure?.logRoot || displayLogDir"
+            >{{ diskPressureText }}</div>
             <div class="btn-group">
                 <button class="btn btn-mini" @click="chooseDir">浏览…</button>
                 <button class="btn btn-mini" @click="resetDir">恢复默认</button>
@@ -150,7 +184,9 @@ function setFontSize(v: number): void {
                 </div>
                 <div v-else-if="updater.state.error" class="update-tip error">{{ updater.state.error }}</div>
             </div>
-            <button class="btn btn-primary" @click="save" style="margin-top: 6px">💾 保存设置</button>
+            <button class="btn btn-primary" :disabled="saving" @click="save" style="margin-top: 6px">
+                {{ saving ? '保存中...' : '💾 保存设置' }}
+            </button>
         </div>
     </section>
 </template>
@@ -200,6 +236,29 @@ function setFontSize(v: number): void {
     gap: 8px;
     align-items: center;
     flex-wrap: wrap;
+}
+
+.disk-pressure {
+    padding: 9px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-body-bg);
+    color: var(--text-2);
+    font-size: 12px;
+    line-height: 1.5;
+
+    &.warning {
+        border-color: rgba(245, 158, 11, 0.45);
+        background: rgba(245, 158, 11, 0.1);
+        color: #fcd34d;
+    }
+
+    &.critical {
+        border-color: rgba(239, 68, 68, 0.55);
+        background: rgba(239, 68, 68, 0.12);
+        color: #fecaca;
+        font-weight: 700;
+    }
 }
 
 .version-list {

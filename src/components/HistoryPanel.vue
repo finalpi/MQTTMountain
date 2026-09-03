@@ -18,6 +18,8 @@ import { datetimeLocalToTs, formatTime, shortTime, tsToDatetimeLocal } from '@/u
 import { exportMqttxJson, exportGroupedZip } from '@/utils/exporter';
 import { parseReplayFile, replayRowsFromHistory, type ReplayMessage } from '@/utils/replay';
 import { highlight, type SearchLogic } from '@/utils/filter';
+import { recordRendererPerf } from '@/utils/rendererPerf';
+import { BoundedStringMemo } from '@/utils/boundedMemo';
 
 const formatViewer = useFormatViewer();
 const replay = useMqttReplay();
@@ -72,18 +74,21 @@ const topicVisibleCount = ref(200);
 const DETAIL_BATCH = 120;
 const TOPIC_BATCH = 200;
 const HISTORY_STREAM_CHUNK_SIZE = 1000;
+const REPLAY_PREVIEW_LIMIT = 500;
 
 let historyStreamSeq = 0;
 let activeHistoryStreamId: string | null = null;
 let pendingHistoryRows: HistoryMessage[] = [];
 let pendingHistoryFlush = 0;
+let historyRenderKeySeq = 0;
+const historyRenderKeys = new WeakMap<object, number>();
 
 const replayQos = ref<0 | 1 | 2>(0);
 const replayRetain = ref(false);
 const replaySpeed = ref<ReplaySpeed>('1x');
 const replayLoop = ref(false);
 const replayRewriteTimestamps = ref(false);
-const importedRows = ref<ReplayMessage[]>([]);
+const importedRows = shallowRef<ReplayMessage[]>([]);
 const importedName = ref('');
 const fileInput = ref<HTMLInputElement | null>(null);
 
@@ -136,17 +141,12 @@ const historyTopicCache = shallowRef<HistoryTopicCache>({
 });
 
 const canReplayToMqtt = computed(() => Boolean(conn.selectedId) && conn.selectedState === 'connected');
-const replaySourceRows = ref<HistoryMessage[]>([]);
-const importedHistoryRows = computed<HistoryMessage[]>(() => importedRows.value.map((row) => ({
-    connectionId: conn.selectedId || 'imported',
-    topic: row.topic,
-    payload: row.payload,
-    time: row.time
-})));
+const replaySourceRows = shallowRef<HistoryMessage[]>([]);
+const importedHistoryRows = shallowRef<HistoryMessage[]>([]);
 const replayPreviewRows = computed<HistoryMessage[]>(() => {
     if (!replay.state.running || replaySourceRows.value.length === 0) return [];
     const end = replay.state.currentIndex >= 0 ? Math.min(replay.state.currentIndex + 1, replaySourceRows.value.length) : 0;
-    return replaySourceRows.value.slice(0, end);
+    return replaySourceRows.value.slice(Math.max(0, end - REPLAY_PREVIEW_LIMIT), end);
 });
 const displayRows = computed<HistoryMessage[]>(() => {
     if (replay.state.running) return replayPreviewRows.value;
@@ -168,6 +168,7 @@ function sortTopicGroups(list: TopicGroup[], sort: TopicSort): TopicGroup[] {
 }
 
 function buildTopicGroups(sourceRows: HistoryMessage[]): TopicGroup[] {
+    const startedAt = performance.now();
     const m = new Map<string, TopicGroup>();
     for (const r of sourceRows) {
         let g = m.get(r.topic);
@@ -178,7 +179,9 @@ function buildTopicGroups(sourceRows: HistoryMessage[]): TopicGroup[] {
         g.items.push(r);
         if (r.time > g.lastTime) g.lastTime = r.time;
     }
-    return sortTopicGroups([...m.values()], topicSort.value);
+    const result = sortTopicGroups([...m.values()], topicSort.value);
+    recordRendererPerf('history.group-rows', performance.now() - startedAt, sourceRows.length);
+    return result;
 }
 
 function resetHistoryGroupCache(): void {
@@ -193,6 +196,7 @@ function resetHistoryGroupCache(): void {
 }
 
 function rebuildHistoryGroupCache(): void {
+    const startedAt = performance.now();
     const groups = new Map<string, TopicGroup>();
     for (const row of rows.value) {
         let group = groups.get(row.topic);
@@ -211,6 +215,7 @@ function rebuildHistoryGroupCache(): void {
         sortedVersion: -1,
         sortedKey: null
     };
+    recordRendererPerf('history.rebuild-groups', performance.now() - startedAt, rows.value.length);
 }
 
 function appendHistoryRows(newRows: HistoryMessage[]): void {
@@ -267,7 +272,7 @@ const detail = computed<HistoryMessage[]>(() => {
 });
 const visibleDetail = computed<HistoryMessage[]>(() => detail.value.slice(0, detailVisibleCount.value));
 const visibleTopics = computed<TopicGroup[]>(() => grouped.value.slice(0, topicVisibleCount.value));
-const visibleCountLabel = computed(() => displayRows.value.length);
+const visibleCountLabel = computed(() => replay.state.running ? replay.state.sent : displayRows.value.length);
 const dataSourceLabel = computed(() => {
     if (replay.state.running) return `回放预览：${replay.state.sourceName}`;
     return dataSource.value === 'imported' ? `导入数据：${importedName.value || '未命名文件'}` : '历史查询结果';
@@ -281,6 +286,22 @@ const shortKeywordRangeHint = computed(() => {
     if (windowMs <= 24 * 60 * 60 * 1000) return '';
     return '短关键词会退化为扫描，建议输入至少 3 个字符或缩小时间范围。';
 });
+const historyHighlightTerms = computed(() => keywordConditions.value.map((item) => item.term));
+const historyHighlightKey = computed(() => JSON.stringify(historyHighlightTerms.value));
+const historyHighlightMemo = new BoundedStringMemo<string>(3000);
+
+function highlightHistory(source: string): string {
+    const key = historyHighlightKey.value;
+    const cached = historyHighlightMemo.get(source, key);
+    if (cached !== undefined) return cached;
+    const startedAt = performance.now();
+    const value = highlight(source, historyHighlightTerms.value);
+    historyHighlightMemo.set(source, key, value);
+    recordRendererPerf('history.highlight-miss', performance.now() - startedAt, source.length);
+    return value;
+}
+
+watch(historyHighlightKey, () => historyHighlightMemo.clear());
 
 const indexSummary = computed(() => {
     if (indexState.value.running && indexState.value.progress) {
@@ -343,17 +364,22 @@ async function loadHistoryPage(offset: number): Promise<HistoryMessage[] | null>
 }
 
 async function query(): Promise<void> {
-    await cancelActiveHistoryStream();
-    const requestId = nextHistoryStreamId();
-    activeHistoryStreamId = requestId;
-    hasMoreHistory.value = false;
+    if (loading.value) return;
+    if (scope.value === 'current' && !conn.selectedId) {
+        toast.error('请先选择当前连接，或把连接范围改为“全部连接”');
+        return;
+    }
     loading.value = true;
-    rows.value = [];
-    resetHistoryGroupCache();
-    dataSource.value = 'history';
-    selectedTopic.value = null;
-    topicVisibleCount.value = TOPIC_BATCH;
     try {
+        await cancelActiveHistoryStream();
+        const requestId = nextHistoryStreamId();
+        activeHistoryStreamId = requestId;
+        hasMoreHistory.value = false;
+        rows.value = [];
+        resetHistoryGroupCache();
+        dataSource.value = 'history';
+        selectedTopic.value = null;
+        topicVisibleCount.value = TOPIC_BATCH;
         const r = await window.api.historyQueryStreamStart({
             requestId,
             opts: {
@@ -389,12 +415,24 @@ function removeKeywordCondition(index: number): void {
 
 let appStart = 0;
 async function refreshIndexStatus(): Promise<void> {
+    if (scope.value === 'current' && !conn.selectedId) {
+        indexState.value.status = null;
+        indexState.value.message = '请先选择当前连接';
+        return;
+    }
     const r = await window.api.historyIndexStatus({ connectionId: scope.value === 'current' ? conn.selectedId : null });
-    if (r.success && r.data) indexState.value.status = r.data;
+    if (r.success && r.data) {
+        indexState.value.status = r.data;
+        indexState.value.message = '';
+    }
 }
 
 async function buildIndex(): Promise<void> {
     if (indexState.value.running) return;
+    if (scope.value === 'current' && !conn.selectedId) {
+        toast.error('请先选择当前连接，或把连接范围改为“全部连接”');
+        return;
+    }
     indexState.value.running = true;
     indexState.value.progress = null;
     indexState.value.message = '正在启动索引任务...';
@@ -478,6 +516,7 @@ function pickQuick(q: Quick): void {
 }
 
 function buildHistoryQueryOptions(limit: number, offset = 0) {
+    if (scope.value === 'current' && !conn.selectedId) throw new Error('未选择当前连接');
     const st = datetimeLocalToTs(startTime.value);
     const et = datetimeLocalToTs(endTime.value);
     return {
@@ -492,6 +531,7 @@ function buildHistoryQueryOptions(limit: number, offset = 0) {
 }
 
 function buildExportRequest(format: 'json' | 'zip'): HistoryExportRequest {
+    if (scope.value === 'current' && !conn.selectedId) throw new Error('未选择当前连接');
     return {
         format,
         query: {
@@ -644,6 +684,16 @@ function resetDetailWindow(): void {
     });
 }
 
+function historyMessageKey(row: HistoryMessage): number {
+    const target = row as object;
+    let key = historyRenderKeys.get(target);
+    if (key == null) {
+        key = ++historyRenderKeySeq;
+        historyRenderKeys.set(target, key);
+    }
+    return key;
+}
+
 function loadMoreTopics(): void {
     if (topicVisibleCount.value >= grouped.value.length) return;
     topicVisibleCount.value = Math.min(grouped.value.length, topicVisibleCount.value + TOPIC_BATCH);
@@ -733,6 +783,12 @@ async function onImportChange(event: Event): Promise<void> {
     await cancelActiveHistoryStream();
     try {
         importedRows.value = await parseReplayFile(file);
+        importedHistoryRows.value = importedRows.value.map((row) => ({
+            connectionId: 'imported',
+            topic: row.topic,
+            payload: row.payload,
+            time: row.time
+        }));
         importedName.value = file.name;
         resetHistoryGroupCache();
         dataSource.value = 'imported';
@@ -741,6 +797,7 @@ async function onImportChange(event: Event): Promise<void> {
         toast.success(`已导入 ${importedRows.value.length} 条回放数据`);
     } catch (error) {
         importedRows.value = [];
+        importedHistoryRows.value = [];
         importedName.value = '';
         toast.error((error as Error).message || '导入失败');
     } finally {
@@ -845,6 +902,11 @@ watch(
         const sourceRows = dataSource.value === 'imported' ? importedHistoryRows.value : rows.value;
         selectedTopic.value = sourceRows[0]?.topic ?? null;
     }
+);
+
+watch(
+    () => [scope.value, conn.selectedId] as const,
+    () => { void refreshIndexStatus(); }
 );
 </script>
 
@@ -1047,7 +1109,7 @@ watch(
                                 :class="{ active: selectedTopic === g.topic }"
                                 @click="selectedTopic = g.topic"
                             >
-                                <div class="t-name" v-html="highlight(g.topic, keywordConditions.map((item) => item.term))"></div>
+                                <div class="t-name" v-html="highlightHistory(g.topic)"></div>
                                 <div class="t-meta">
                                     <span class="count">{{ g.items.length }} 条</span>
                                     <span class="ago">{{ shortTime(g.lastTime) }}</span>
@@ -1076,7 +1138,7 @@ watch(
                         <div v-else class="msg-list">
                             <div
                                 v-for="m in visibleDetail"
-                                :key="m.topic + '|' + m.time + '|' + m.payload.length"
+                                :key="historyMessageKey(m)"
                                 class="msg-card cv-auto"
                                 @contextmenu.prevent="formatViewer.open({ topic: m.topic, time: m.time, raw: m.payload })"
                             >
@@ -1084,7 +1146,7 @@ watch(
                                     <span class="time">{{ formatTime(m.time) }}</span>
                                     <span class="msg-hint">右键格式化</span>
                                 </div>
-                                <pre class="msg-body" v-html="highlight(m.payload, keywordConditions.map((item) => item.term))"></pre>
+                                <pre class="msg-body" v-html="highlightHistory(m.payload)"></pre>
                             </div>
                             <button
                                 v-if="visibleDetail.length < detail.length"

@@ -1,6 +1,10 @@
 ﻿import JSZip from 'jszip';
 import type { HistoryMessage } from '@shared/types';
 
+const MAX_REPLAY_FILE_BYTES = 128 * 1024 * 1024;
+const MAX_REPLAY_ROWS = 500_000;
+const MAX_ZIP_TEXT_BYTES = 256 * 1024 * 1024;
+
 export interface ReplayMessage {
     topic: string;
     payload: string;
@@ -127,6 +131,7 @@ export function parseReplayJsonText(text: string): ReplayMessage[] {
     if (!Array.isArray(parsed)) {
         throw new Error('JSON 文件必须是数组');
     }
+    if (parsed.length > MAX_REPLAY_ROWS) throw new Error(`回放消息不能超过 ${MAX_REPLAY_ROWS.toLocaleString()} 条`);
     const base = Date.now();
     const rows = parsed
         .map((item, index) => normalizeReplayRow((item ?? {}) as LooseRow, base + index))
@@ -140,6 +145,7 @@ export function parseReplayJsonlText(text: string, sourceName = 'JSONL'): Replay
         .split(/\r?\n/u)
         .map((line) => line.trim())
         .filter(Boolean);
+    if (lines.length > MAX_REPLAY_ROWS) throw new Error(`回放消息不能超过 ${MAX_REPLAY_ROWS.toLocaleString()} 条`);
     const base = Date.now();
     const rows: ReplayMessage[] = [];
     for (let i = 0; i < lines.length; i++) {
@@ -158,25 +164,36 @@ export function parseReplayJsonlText(text: string, sourceName = 'JSONL'): Replay
 export async function parseReplayZipFile(file: File): Promise<ReplayMessage[]> {
     const zip = await JSZip.loadAsync(await file.arrayBuffer());
     const rows: ReplayMessage[] = [];
-    const tasks: Array<Promise<void>> = [];
+    const entries: Array<{ relativePath: string; entry: JSZip.JSZipObject }> = [];
     zip.forEach((relativePath, entry) => {
         if (entry.dir) return;
         const name = relativePath.toLowerCase();
         if (!name.endsWith('.jsonl') && !name.endsWith('.json')) return;
-        tasks.push((async () => {
-            const text = await entry.async('text');
-            const parsed = name.endsWith('.jsonl')
-                ? parseReplayJsonlText(text, relativePath)
-                : parseReplayJsonText(text);
-            rows.push(...parsed);
-        })());
+        entries.push({ relativePath, entry });
     });
-    await Promise.all(tasks);
+    let totalTextBytes = 0;
+    for (const { relativePath, entry } of entries) {
+        const declaredSize = Number((entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0);
+        if (declaredSize > MAX_ZIP_TEXT_BYTES || totalTextBytes + declaredSize > MAX_ZIP_TEXT_BYTES) {
+            throw new Error('ZIP 解压后的回放数据过大');
+        }
+        const text = await entry.async('text');
+        totalTextBytes += text.length * 2;
+        if (totalTextBytes > MAX_ZIP_TEXT_BYTES) throw new Error('ZIP 解压后的回放数据过大');
+        const parsed = relativePath.toLowerCase().endsWith('.jsonl')
+            ? parseReplayJsonlText(text, relativePath)
+            : parseReplayJsonText(text);
+        if (rows.length + parsed.length > MAX_REPLAY_ROWS) {
+            throw new Error(`回放消息不能超过 ${MAX_REPLAY_ROWS.toLocaleString()} 条`);
+        }
+        rows.push(...parsed);
+    }
     if (!rows.length) throw new Error('ZIP 中没有找到可回放的 JSON/JSONL 数据');
     return sortRows(rows);
 }
 
 export async function parseReplayFile(file: File): Promise<ReplayMessage[]> {
+    if (file.size > MAX_REPLAY_FILE_BYTES) throw new Error('回放文件不能超过 128 MiB');
     const name = file.name.toLowerCase();
     if (name.endsWith('.zip')) return parseReplayZipFile(file);
     const text = await file.text();

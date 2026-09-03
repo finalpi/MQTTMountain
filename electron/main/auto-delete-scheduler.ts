@@ -1,5 +1,5 @@
 import type { BrowserWindow } from 'electron';
-import { scheduleHeavyJob } from './heavy-job-scheduler';
+import { scheduleHeavyJob, type ScheduledHeavyJob } from './heavy-job-scheduler';
 import { readSettings } from './settings';
 import { runAutoDeleteAsync } from './storage';
 
@@ -12,6 +12,7 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let startupTimer: ReturnType<typeof setTimeout> | null = null;
 let running = false;
 let windowGetter: (() => BrowserWindow | null) | null = null;
+let scheduledJob: ScheduledHeavyJob<void> | null = null;
 
 function notifyAutoDeleteDone(files: number): void {
     const win = windowGetter?.();
@@ -45,9 +46,13 @@ function runOnce(): void {
     const job = scheduleHeavyJob({ kind: 'exclusive', label: 'auto-delete', priority: -20 }, () => new Promise<void>((resolve) => {
         runAutoDeleteAsync(autoDeleteDays, notifyAutoDeleteDone, resolve);
     }));
-    void job.promise.finally(() => {
-        running = false;
-    });
+    scheduledJob = job;
+    void job.promise
+        .catch((error) => console.error('[auto-delete] scheduled cleanup failed:', error))
+        .finally(() => {
+            if (scheduledJob === job) scheduledJob = null;
+            running = false;
+        });
 }
 
 function scheduleNextDailyRun(): void {
@@ -84,5 +89,8 @@ export function rescheduleAutoDelete(immediate = false): void {
 export function stopAutoDeleteScheduler(): void {
     clearSchedule();
     clearStartupTimer();
+    scheduledJob?.cancel();
+    scheduledJob = null;
+    running = false;
     windowGetter = null;
 }

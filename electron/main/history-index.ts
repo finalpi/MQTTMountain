@@ -13,7 +13,8 @@ interface WorkerMessage {
 }
 
 function sendProgress(sender: WebContents, progress: HistoryIndexProgress): void {
-    if (!sender.isDestroyed()) sender.send('history:indexProgress', progress);
+    if (sender.isDestroyed()) return;
+    try { sender.send('history:indexProgress', progress); } catch {}
 }
 
 export function readHistoryIndexStatus(req: HistoryIndexRequest = {}) {
@@ -23,17 +24,17 @@ export function readHistoryIndexStatus(req: HistoryIndexRequest = {}) {
 export async function buildHistoryIndex(sender: WebContents, req: HistoryIndexRequest = {}): Promise<HistoryIndexResult> {
     return await scheduleHeavyJob({ kind: 'exclusive', label: 'history-index', priority: 10 }, async () => {
         pauseStorageWrites('history-index');
-        await closeAllLogDbsAsync();
-
-        const workerPath = path.join(__dirname, 'history-index-worker.js');
-        const worker = new Worker(workerPath, {
-            workerData: {
-                req,
-                logRoot: getLogRoot()
-            }
-        });
-
         try {
+            await closeAllLogDbsAsync();
+
+            const workerPath = path.join(__dirname, 'history-index-worker.js');
+            const worker = new Worker(workerPath, {
+                workerData: {
+                    req,
+                    logRoot: getLogRoot()
+                }
+            });
+
             return await new Promise<HistoryIndexResult>((resolve, reject) => {
             let settled = false;
 
@@ -70,8 +71,9 @@ export async function buildHistoryIndex(sender: WebContents, req: HistoryIndexRe
             });
 
             worker.once('exit', (code) => {
-                if (!settled && code !== 0) {
-                    reject(new Error(`索引任务异常退出（${code}）`));
+                if (!settled) {
+                    settled = true;
+                    reject(new Error(`索引任务退出但未返回结果（${code}）`));
                 }
             });
             }).finally(() => {

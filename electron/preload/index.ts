@@ -18,11 +18,13 @@ import type {
     HistoryQueryStreamCancelRequest,
     HistoryQueryStreamStartRequest,
     HistoryMessage,
+    RecentHydrationSnapshot,
     MqttMessage,
     PublishPayload,
     ApiResult,
     UpdateInfo,
-    StartupMaintenanceDone
+    StartupMaintenanceDone,
+    StorageDiskPressureState
 } from '../../shared/types';
 import type { DecodedResult, PluginRecord, PluginUpdateInfo } from '../../shared/plugin';
 
@@ -41,7 +43,7 @@ const api = {
     mqttSetActiveConnection: (p: { connectionId: string | null }) => invoke('mqtt:setActiveConnection', p),
     mqttSetDisplayPaused: (p: { connectionId: string; paused: boolean }) => invoke('mqtt:setDisplayPaused', p),
     mqttReadRecent: (p: { connectionId: string; limit?: number }) =>
-        invoke<HistoryMessage[]>('mqtt:readRecent', p),
+        invoke<RecentHydrationSnapshot>('mqtt:readRecent', p),
     mqttClearLogs: (connectionId?: string | null) =>
         invoke<{ deletedFiles: number }>('mqtt:clearLogs', connectionId),
 
@@ -121,6 +123,11 @@ const api = {
         const listener = (_e: IpcRendererEvent, p: StartupMaintenanceDone) => cb(p);
         ipcRenderer.on('app:startupMaintenanceDone', listener);
         return () => ipcRenderer.removeListener('app:startupMaintenanceDone', listener);
+    },
+    onStorageDiskPressure: (cb: (p: StorageDiskPressureState) => void) => {
+        const listener = (_e: IpcRendererEvent, p: StorageDiskPressureState) => cb(p);
+        ipcRenderer.on('app:storageDiskPressure', listener);
+        return () => ipcRenderer.removeListener('app:storageDiskPressure', listener);
     },
     onWindowFocused: (cb: () => void) => {
         const listener = () => cb();

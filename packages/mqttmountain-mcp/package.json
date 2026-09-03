@@ -1,6 +1,6 @@
 {
   "name": "mqttmountain-mcp",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "MCP server for reading MQTTMountain message logs.",
   "type": "module",
   "bin": {
@@ -13,7 +13,7 @@
   "scripts": {
     "start": "node bin/server.js",
     "check": "node bin/server.js --help",
-    "test": "node test/compressed-history.mjs"
+    "test": "node test/compressed-history.mjs && node test/query-behavior.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

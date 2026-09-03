@@ -12,11 +12,11 @@ const topicsCount = computed(() => {
     return bucket.value.topics.size;
 });
 const timelineLen = computed(() => {
-    void bucket.value.timelineVersion;
+    void bucket.value.timelineRowsVersion;
     return bucket.value.timeline.length;
 });
 const timelineCap = computed(() => {
-    void bucket.value.timelineVersion;
+    void bucket.value.timelineRowsVersion;
     return bucket.value.timeline.capacity;
 });
 </script>

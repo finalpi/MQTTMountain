@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { inflateRawSync } from 'node:zlib';
+import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -10,8 +11,6 @@ import { z } from 'zod';
 
 const DATE_KEY_FILE_RE = /^\d{4}-\d{2}-\d{2}(?:-\d{2})?\.db$/;
 const MAX_LIMIT = 5000;
-const INDEX_QUERY_CHUNK_SIZE = 1000;
-const BUCKET_QUERY_CHUNK_SIZE = 256;
 const HISTORY_INDEX_SCHEMA_VERSION = '6';
 const OFFSET_INDEX_SCHEMA_VERSIONS = new Set(['3', '4', '5', '6']);
 const LEGACY_HISTORY_INDEX_SCHEMA_VERSION = '2';
@@ -19,9 +18,14 @@ const COMPRESSED_BUCKET_MAGIC = Buffer.from('MMZ1');
 const COMPRESSED_BUCKET_HEADER_BYTES = 8;
 const DEFAULT_STATUS_MINUTES = 10;
 const DEFAULT_STATUS_TOPIC_LIMIT = 10;
+const DEFAULT_STATUS_SCAN_LIMIT = 200;
 const DEFAULT_PAYLOAD_SAMPLE_LIMIT = 5;
 const DEFAULT_PAYLOAD_PREVIEW_CHARS = 300;
-const PACKAGE_VERSION = '0.1.6';
+const DEFAULT_READ_TIMEOUT_MS = 15_000;
+const MIN_READ_TIMEOUT_MS = 100;
+const MAX_READ_TIMEOUT_MS = 120_000;
+const READ_WORKER_MARKER = 'mqttmountain-read-worker-v1';
+const PACKAGE_VERSION = '0.1.7';
 
 function printHelp() {
   process.stdout.write(`mqttmountain-mcp ${PACKAGE_VERSION}
@@ -125,13 +129,23 @@ function sanitizeConnectionId(id) {
   return safe.length > 120 ? safe.slice(0, 120) : safe || '_empty';
 }
 
-function dayStartTsFromKey(dayKey) {
-  const [year, month, day] = dayKey.split('-').map(Number);
-  return new Date(year, month - 1, day, 0, 0, 0, 0).getTime();
+function shardTimeRangeFromKey(shardKey) {
+  const parts = shardKey.split('-').map(Number);
+  const [year, month, day] = parts;
+  const hour = parts.length >= 4 ? parts[3] : null;
+  const start = hour == null
+    ? new Date(year, month - 1, day, 0, 0, 0, 0)
+    : new Date(year, month - 1, day, hour, 0, 0, 0);
+  const endExclusive = hour == null
+    ? new Date(year, month - 1, day + 1, 0, 0, 0, 0)
+    : new Date(year, month - 1, day, hour + 1, 0, 0, 0);
+  return { startTime: start.getTime(), endTime: endExclusive.getTime() - 1 };
 }
 
-function dayEndTsFromKey(dayKey) {
-  return dayStartTsFromKey(dayKey) + 86_400_000 - 1;
+function shardIntersectsRange(filePath, startTime, endTime) {
+  const shardKey = path.basename(filePath, '.db');
+  const range = shardTimeRangeFromKey(shardKey);
+  return range.endTime >= startTime && range.startTime <= endTime;
 }
 
 function isCompressedBucketBlob(blob) {
@@ -241,8 +255,12 @@ function listDayFiles(logDir, connectionId, descending = true) {
   if (!fs.existsSync(dir)) return [];
   const files = fs.readdirSync(dir)
     .filter((file) => DATE_KEY_FILE_RE.test(file))
-    .sort();
-  if (descending) files.reverse();
+    .sort((left, right) => {
+      const a = shardTimeRangeFromKey(path.basename(left, '.db')).startTime;
+      const b = shardTimeRangeFromKey(path.basename(right, '.db')).startTime;
+      const delta = a - b || left.localeCompare(right);
+      return descending ? -delta : delta;
+    });
   return files.map((file) => path.join(dir, file));
 }
 
@@ -320,29 +338,14 @@ function resolveConnectionId(userDataDir, logDir, input) {
 }
 
 function readRecentMessages(logDir, connectionId, limit, topic) {
-  const max = Math.min(MAX_LIMIT, Math.max(1, limit));
-  const topicFilter = topic && topic.trim() ? topic.trim() : null;
-  const out = [];
-  for (const filePath of listDayFiles(logDir, connectionId, true)) {
-    if (out.length >= max) break;
-    const db = new Database(filePath, { readonly: true, fileMustExist: true });
-    try {
-      const rows = topicFilter
-        ? db.prepare('SELECT bucket_ts, topic, blob FROM buckets WHERE topic = ? ORDER BY bucket_ts DESC').all(topicFilter)
-        : db.prepare('SELECT bucket_ts, topic, blob FROM buckets ORDER BY bucket_ts DESC').all();
-      for (const row of rows) {
-        const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
-        for (let i = decoded.length - 1; i >= 0; i--) {
-          out.push(decoded[i]);
-          if (out.length >= max) break;
-        }
-        if (out.length >= max) break;
-      }
-    } finally {
-      db.close();
-    }
-  }
-  return out;
+  return queryHistory(logDir, {
+    connectionId,
+    topic,
+    order: 'desc',
+    offset: 0,
+    limit: Math.min(MAX_LIMIT, Math.max(1, limit)),
+    payloadMode: 'full'
+  });
 }
 
 function normalizeKeyword(value) {
@@ -478,64 +481,139 @@ function readPayloadSamples(logDir, options) {
   const limit = Math.min(50, Math.max(1, options.limit || DEFAULT_PAYLOAD_SAMPLE_LIMIT));
   const previewChars = Math.min(2000, Math.max(0, options.payloadPreviewChars ?? DEFAULT_PAYLOAD_PREVIEW_CHARS));
   const fieldPaths = Array.isArray(options.payloadFields) ? options.payloadFields : [];
-  const topic = options.topic && options.topic.trim() ? options.topic.trim() : null;
-  const topicKeyword = normalizeKeyword(options.topicKeyword || '');
-  const keyword = normalizeKeyword(options.keyword || '');
-  const connectionIds = options.connectionId ? [options.connectionId] : listLogConnectionIds(logDir);
-  const secMin = Math.floor(Math.max(startTime, -8640000000) / 1000);
-  const secMax = Math.ceil(Math.min(endTime, 8640000000000) / 1000);
-  const samples = [];
-
-  for (const connectionId of connectionIds) {
-    const files = listDayFiles(logDir, connectionId, true)
-      .filter((filePath) => {
-        const dayKey = path.basename(filePath, '.db');
-        return dayEndTsFromKey(dayKey) >= startTime && dayStartTsFromKey(dayKey) <= endTime;
-      });
-
-    for (const filePath of files) {
-      if (samples.length >= limit) break;
-      const db = new Database(filePath, { readonly: true, fileMustExist: true });
-      try {
-        let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
-        const params = [secMin, secMax];
-        if (topic) {
-          sql += ' AND topic = ?';
-          params.push(topic);
-        }
-        sql += ' ORDER BY bucket_ts DESC';
-        const rows = db.prepare(sql).all(...params);
-        for (const row of rows) {
-          if (samples.length >= limit) break;
-          if (topicKeyword && !normalizeKeyword(row.topic).includes(topicKeyword)) continue;
-          const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
-          for (let i = decoded.length - 1; i >= 0; i--) {
-            const message = decoded[i];
-            if (message.time < startTime || message.time > endTime) continue;
-            if (keyword && !normalizeKeyword(message.topic + message.payload).includes(keyword)) continue;
-            samples.push({
-              time: message.time,
-              localTime: formatLocalTime(message.time),
-              topic: message.topic,
-              payload: summarizePayload(message.payload, previewChars, fieldPaths)
-            });
-            if (samples.length >= limit) break;
-          }
-        }
-      } finally {
-        db.close();
-      }
-    }
-  }
-
-  samples.sort((a, b) => b.time - a.time);
+  const messages = queryHistory(logDir, {
+    connectionId: options.connectionId,
+    topic: options.topic,
+    topicKeyword: options.topicKeyword,
+    keyword: options.keyword,
+    startTime,
+    endTime,
+    order: 'desc',
+    offset: 0,
+    limit,
+    payloadMode: 'full'
+  });
+  const samples = messages.map((message) => ({
+    time: message.time,
+    localTime: formatLocalTime(message.time),
+    topic: message.topic,
+    payload: summarizePayload(message.payload, previewChars, fieldPaths)
+  }));
   return {
     startTime,
     endTime,
     startLocalTime: formatLocalTime(startTime),
     endLocalTime: formatLocalTime(endTime),
-    samples: samples.slice(0, limit)
+    samples
   };
+}
+
+function mergeStatusRow(mergeStat, row) {
+  mergeStat(row.topic, Number(row.count || 0), Number(row.latest_time));
+}
+
+function readCompleteTopicStats(db, topic, topicKeyword, mergeStat) {
+  if (getIndexMeta(db, 'topic_stats_complete') !== '1' || !tableExists(db, 'history_topic_stats')) {
+    return false;
+  }
+  let sql = 'SELECT topic, count, latest_time FROM history_topic_stats WHERE 1 = 1';
+  const params = [];
+  if (topic) {
+    sql += ' AND topic = ?';
+    params.push(topic);
+  }
+  if (topicKeyword) {
+    sql += ' AND instr(lower(topic), ?) > 0';
+    params.push(topicKeyword);
+  }
+  for (const row of db.prepare(sql).iterate(...params)) mergeStatusRow(mergeStat, row);
+  return true;
+}
+
+function listIndexedTopics(db) {
+  return db.prepare(`
+    WITH RECURSIVE topics(topic) AS (
+      SELECT MIN(topic)
+      FROM history_messages INDEXED BY idx_history_messages_topic_time_msg
+      UNION ALL
+      SELECT (
+        SELECT MIN(topic)
+        FROM history_messages INDEXED BY idx_history_messages_topic_time_msg
+        WHERE topic > topics.topic
+      )
+      FROM topics
+      WHERE topic IS NOT NULL
+    )
+    SELECT topic FROM topics WHERE topic IS NOT NULL
+  `).pluck().all();
+}
+
+function readIndexedStatusRange(db, startTime, endTime, topic, topicKeyword, mergeStat) {
+  if (topic || topicKeyword) {
+    const topics = topic
+      ? [topic]
+      : listIndexedTopics(db).filter((value) => normalizeKeyword(value).includes(topicKeyword));
+    const statement = db.prepare(`
+      SELECT ? AS topic, COUNT(*) AS count, MAX(time_ms) AS latest_time
+      FROM history_messages INDEXED BY idx_history_messages_topic_time_msg
+      WHERE topic = ? AND time_ms BETWEEN ? AND ?
+    `);
+    for (const value of topics) mergeStatusRow(mergeStat, statement.get(value, value, startTime, endTime));
+    return;
+  }
+
+  const statement = db.prepare(`
+    SELECT topic, COUNT(*) AS count, MAX(time_ms) AS latest_time
+    FROM history_messages INDEXED BY idx_history_messages_time_topic_msg
+    WHERE time_ms BETWEEN ? AND ?
+    GROUP BY topic
+  `);
+  for (const row of statement.iterate(startTime, endTime)) mergeStatusRow(mergeStat, row);
+}
+
+function readBucketStatusRange(db, connectionId, startTime, endTime, topic, topicKeyword, mergeStat) {
+  const startSec = Math.floor(startTime / 1000);
+  const endSec = Math.floor(endTime / 1000);
+  const fullSecMin = Math.ceil(startTime / 1000);
+  const fullSecMax = Math.floor((endTime - 999) / 1000);
+  const partialSeconds = [...new Set([
+    startTime % 1000 === 0 ? null : startSec,
+    endTime % 1000 === 999 ? null : endSec
+  ].filter((value) => value != null && value >= startSec && value <= endSec))];
+
+  if (fullSecMin <= fullSecMax) {
+    let sql = 'SELECT topic, SUM(count) AS count, MAX(bucket_ts) * 1000 + 999 AS latest_time FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
+    const params = [fullSecMin, fullSecMax];
+    if (topic) {
+      sql += ' AND topic = ?';
+      params.push(topic);
+    }
+    if (topicKeyword) {
+      sql += ' AND instr(lower(topic), ?) > 0';
+      params.push(topicKeyword);
+    }
+    sql += ' GROUP BY topic';
+    for (const row of db.prepare(sql).iterate(...params)) mergeStatusRow(mergeStat, row);
+  }
+
+  if (!partialSeconds.length) return;
+  const placeholders = partialSeconds.map(() => '?').join(', ');
+  let sql = `SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts IN (${placeholders})`;
+  const params = [...partialSeconds];
+  if (topic) {
+    sql += ' AND topic = ?';
+    params.push(topic);
+  }
+  if (topicKeyword) {
+    sql += ' AND instr(lower(topic), ?) > 0';
+    params.push(topicKeyword);
+  }
+  for (const row of db.prepare(sql).iterate(...params)) {
+    const matches = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId)
+      .filter((message) => message.time >= startTime && message.time <= endTime);
+    if (!matches.length) continue;
+    mergeStat(row.topic, matches.length, matches[matches.length - 1].time);
+  }
 }
 
 function readMessageStatus(logDir, options) {
@@ -543,69 +621,94 @@ function readMessageStatus(logDir, options) {
   const endTime = Number.isFinite(options.endTime) ? options.endTime : now;
   const minutes = Math.min(1440, Math.max(1, options.minutes || DEFAULT_STATUS_MINUTES));
   const startTime = Number.isFinite(options.startTime) ? options.startTime : endTime - minutes * 60_000;
-  const topic = options.topic && options.topic.trim() ? options.topic.trim() : null;
-  const topicKeyword = normalizeKeyword(options.topicKeyword || '');
-  const keyword = normalizeKeyword(options.keyword || '');
   const topicLimit = Math.min(50, Math.max(1, options.topicLimit || DEFAULT_STATUS_TOPIC_LIMIT));
   const sampleLimit = Math.min(10, Math.max(0, options.sampleLimit || 0));
   const payloadPreviewChars = Math.min(500, Math.max(0, options.payloadPreviewChars || 0));
-  const connectionIds = options.connectionId ? [options.connectionId] : listLogConnectionIds(logDir);
-  const secMin = Math.floor(Math.max(startTime, -8640000000) / 1000);
-  const secMax = Math.ceil(Math.min(endTime, 8640000000000) / 1000);
+  const scanLimit = Math.min(MAX_LIMIT, Math.max(1, options.scanLimit || DEFAULT_STATUS_SCAN_LIMIT));
   const topicStats = new Map();
-  const samples = [];
+  const keyword = normalizeKeyword(options.keyword || '');
   let total = 0;
   let latestTime = null;
+  let truncated = false;
+  let countMode = 'exact';
+  let sampledMessages = [];
 
-  for (const connectionId of connectionIds) {
-    const files = listDayFiles(logDir, connectionId, true)
-      .filter((filePath) => {
-        const dayKey = path.basename(filePath, '.db');
-        return dayEndTsFromKey(dayKey) >= startTime && dayStartTsFromKey(dayKey) <= endTime;
-      });
+  const mergeStat = (topic, count, rowLatestTime) => {
+    if (!count || !Number.isFinite(rowLatestTime)) return;
+    total += count;
+    latestTime = latestTime === null ? rowLatestTime : Math.max(latestTime, rowLatestTime);
+    const stat = topicStats.get(topic) || { topic, count: 0, latestTime: rowLatestTime };
+    stat.count += count;
+    stat.latestTime = Math.max(stat.latestTime, rowLatestTime);
+    topicStats.set(topic, stat);
+  };
 
-    for (const filePath of files) {
-      const db = new Database(filePath, { readonly: true, fileMustExist: true });
-      try {
-        let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
-        const params = [secMin, secMax];
-        if (topic) {
-          sql += ' AND topic = ?';
-          params.push(topic);
-        }
-        sql += ' ORDER BY bucket_ts DESC';
-        const rows = db.prepare(sql).all(...params);
-        for (const row of rows) {
-          if (topicKeyword && !normalizeKeyword(row.topic).includes(topicKeyword)) continue;
-          const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
-          for (let i = decoded.length - 1; i >= 0; i--) {
-            const message = decoded[i];
-            if (message.time < startTime || message.time > endTime) continue;
-            if (keyword && !normalizeKeyword(message.topic + message.payload).includes(keyword)) continue;
-
-            total += 1;
-            latestTime = latestTime === null ? message.time : Math.max(latestTime, message.time);
-            const stat = topicStats.get(message.topic) || { topic: message.topic, count: 0, latestTime: message.time };
-            stat.count += 1;
-            stat.latestTime = Math.max(stat.latestTime, message.time);
-            topicStats.set(message.topic, stat);
-            if (samples.length < sampleLimit) {
-              const sample = {
-                time: message.time,
-                localTime: formatLocalTime(message.time),
-                topic: message.topic
-              };
-              const payloadPreview = previewPayload(message.payload, payloadPreviewChars);
-              if (payloadPreview) sample.payloadPreview = payloadPreview;
-              samples.push(sample);
-            }
+  if (keyword) {
+    countMode = 'bounded-payload-scan';
+    const scannedMessages = queryHistory(logDir, {
+      connectionId: options.connectionId,
+      topic: options.topic,
+      topicKeyword: options.topicKeyword,
+      keyword: options.keyword,
+      startTime,
+      endTime,
+      order: 'desc',
+      offset: 0,
+      limit: Math.min(MAX_LIMIT, scanLimit + 1),
+      payloadMode: sampleLimit > 0 && payloadPreviewChars > 0 ? 'preview' : 'none',
+      payloadPreviewChars
+    });
+    truncated = scannedMessages.length > scanLimit
+      || (scanLimit === MAX_LIMIT && scannedMessages.length === MAX_LIMIT);
+    const messages = scannedMessages.slice(0, scanLimit);
+    for (const message of messages) mergeStat(message.topic, 1, message.time);
+    sampledMessages = messages.slice(0, sampleLimit);
+  } else {
+    const topic = options.topic && options.topic.trim() ? options.topic.trim() : null;
+    const topicKeyword = normalizeKeyword(options.topicKeyword || '');
+    const connectionIds = options.connectionId ? [options.connectionId] : listLogConnectionIds(logDir);
+    for (const connectionId of connectionIds) {
+      const files = listDayFiles(logDir, connectionId, true)
+        .filter((filePath) => shardIntersectsRange(filePath, startTime, endTime));
+      for (const filePath of files) {
+        const db = new Database(filePath, { readonly: true, fileMustExist: true });
+        try {
+          const shardRange = shardTimeRangeFromKey(path.basename(filePath, '.db'));
+          const fullyCovered = startTime <= shardRange.startTime && endTime >= shardRange.endTime;
+          if (fullyCovered && readCompleteTopicStats(db, topic, topicKeyword, mergeStat)) continue;
+          if (getUsableIndexVersion(db)) {
+            readIndexedStatusRange(db, startTime, endTime, topic, topicKeyword, mergeStat);
+          } else {
+            readBucketStatusRange(db, connectionId, startTime, endTime, topic, topicKeyword, mergeStat);
           }
+        } finally {
+          db.close();
         }
-      } finally {
-        db.close();
       }
     }
+    if (sampleLimit > 0) {
+      sampledMessages = queryHistory(logDir, {
+        connectionId: options.connectionId,
+        topic: options.topic,
+        topicKeyword: options.topicKeyword,
+        startTime,
+        endTime,
+        order: 'desc',
+        offset: 0,
+        limit: sampleLimit,
+        payloadMode: payloadPreviewChars > 0 ? 'preview' : 'none',
+        payloadPreviewChars
+      });
+      if (sampledMessages[0]?.time != null) latestTime = Math.max(latestTime ?? 0, sampledMessages[0].time);
+    }
   }
+
+  const samples = sampledMessages.map((message) => ({
+    time: message.time,
+    localTime: formatLocalTime(message.time),
+    topic: message.topic,
+    ...(message.payloadPreview ? { payloadPreview: message.payloadPreview } : {})
+  }));
 
   const topics = [...topicStats.values()]
     .sort((a, b) => b.latestTime - a.latestTime || b.count - a.count)
@@ -620,6 +723,9 @@ function readMessageStatus(logDir, options) {
   return {
     hasMessages: total > 0,
     total,
+    truncated,
+    countMode,
+    scanLimit: keyword ? scanLimit : null,
     startTime,
     endTime,
     startLocalTime: formatLocalTime(startTime),
@@ -651,8 +757,13 @@ function hasOffsetIndexSchema(schemaVersion) {
   return OFFSET_INDEX_SCHEMA_VERSIONS.has(schemaVersion);
 }
 
+function hasFtsTable(db) {
+  return getIndexMeta(db, 'fts5_enabled') === '1'
+    && tableExists(db, 'history_messages_fts');
+}
+
 function hasFtsIndex(db) {
-  return getIndexMeta(db, 'fts5_enabled') === '1' && tableExists(db, 'history_messages_fts');
+  return hasFtsTable(db) && getIndexMeta(db, 'fts_index_complete') !== '0';
 }
 
 function escapeFtsPhrase(term) {
@@ -719,163 +830,160 @@ function buildQueryState(options) {
     order: options.order === 'asc' ? 'asc' : 'desc',
     keywordLogic: options.keywordLogic === 'or' ? 'or' : 'and',
     topic: options.topic && options.topic.trim() ? options.topic.trim() : null,
+    topicKeyword: normalizeKeyword(options.topicKeyword || ''),
     conditions,
     terms,
     payloadMode,
-    payloadPreviewChars: Math.min(2000, Math.max(0, Number.isFinite(options.payloadPreviewChars) ? Math.floor(options.payloadPreviewChars) : 300)),
-    skipped: 0,
-    out: []
+    payloadPreviewChars: Math.min(2000, Math.max(0, Number.isFinite(options.payloadPreviewChars) ? Math.floor(options.payloadPreviewChars) : 300))
   };
 }
 
-function acceptHistoryMessage(state, message, searchText) {
-  const hay = searchText ?? normalizeKeyword(String(message.topic || '') + String(message.payload || ''));
-  if (!matchesSearchText(hay, state.conditions, state.terms, state.keywordLogic)) return false;
-  if (state.skipped < state.offset) {
-    state.skipped += 1;
-    return false;
-  }
-  state.out.push(message);
-  return state.out.length >= state.limit;
+function createIndexedPayloadReader(filePath, connectionId, schemaVersion) {
+  let db = null;
+  let bucketStmt = null;
+  const bucketCache = new Map();
+  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+
+  const ensureOpen = () => {
+    if (db) return;
+    db = new Database(filePath, { readonly: true, fileMustExist: true });
+    bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
+  };
+
+  return {
+    read(row) {
+      ensureOpen();
+      const cacheKey = `${row.bucket_ts}|${row.topic}`;
+      let cached = bucketCache.get(cacheKey);
+      if (!cached) {
+        const bucket = bucketStmt.get(row.bucket_ts, row.topic);
+        if (!bucket) return null;
+        cached = { raw: unpackBucketBlob(bucket.blob), decoded: null };
+        bucketCache.set(cacheKey, cached);
+        if (bucketCache.size > 32) bucketCache.delete(bucketCache.keys().next().value);
+      }
+
+      const payloadLen = hasOffsets ? row.payload_len : undefined;
+      let payloadBytes = hasOffsets
+        ? readPayloadBytesSlice(cached.raw, row.payload_offset ?? -1, row.payload_len ?? -1)
+        : null;
+      let payloadText = null;
+      if (!payloadBytes) {
+        if (!cached.decoded) cached.decoded = decodeBucket(cached.raw, row.bucket_ts, row.topic, connectionId);
+        payloadText = cached.decoded[row.msg_index]?.payload ?? null;
+      }
+      if (!payloadBytes && payloadText == null) return null;
+      return { payloadBytes, payloadText, payloadSize: payloadLen };
+    },
+    close() {
+      if (db) db.close();
+      db = null;
+      bucketStmt = null;
+      bucketCache.clear();
+    }
+  };
 }
 
-function pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache, verifyPayloadMatch = false) {
+function createIndexedCandidate(connectionId, state, schemaVersion, row, payloadReader, verifyPayloadMatch) {
   const base = { connectionId, topic: row.topic, time: row.time_ms };
   const hasOffsets = hasOffsetIndexSchema(schemaVersion);
-  const payloadLen = hasOffsets ? row.payload_len : undefined;
-  if (!verifyPayloadMatch && hasOffsets && (state.payloadMode === 'none' || state.payloadMode === 'metadata')) {
-    state.out.push(formatHistoryMessage(base, state, { payloadSize: payloadLen }));
-    return state.out.length >= state.limit;
-  }
-  const bucket = bucketStmt.get(row.bucket_ts, row.topic);
-  if (!bucket) return false;
-  const cacheKey = `${row.bucket_ts}|${row.topic}`;
-  let cached = bucketCache.get(cacheKey);
-  if (!cached) {
-    cached = { raw: unpackBucketBlob(bucket.blob), decoded: null };
-    bucketCache.set(cacheKey, cached);
-  }
-  let payloadBytes = null;
-  let payload = null;
-  if (hasOffsets) {
-    payloadBytes = readPayloadBytesSlice(cached.raw, row.payload_offset ?? -1, row.payload_len ?? -1);
-    if (state.payloadMode === 'full' && payloadBytes) payload = payloadBytes.toString('utf8');
-  }
-  if (!payloadBytes && payload == null) {
-    if (!cached.decoded) cached.decoded = decodeBucket(cached.raw, row.bucket_ts, row.topic, connectionId);
-    payload = cached.decoded[row.msg_index]?.payload ?? null;
-  }
-  if (!payloadBytes && payload == null) return false;
-  const payloadText = payload ?? payloadBytes?.toString('utf8') ?? '';
+  let payloadSource = null;
   if (verifyPayloadMatch) {
-    const searchText = normalizeKeyword(String(base.topic || '') + payloadText);
-    if (!matchesSearchText(searchText, state.conditions, state.terms, state.keywordLogic)) return false;
-    if (state.skipped < state.offset) {
-      state.skipped += 1;
-      return false;
-    }
+    payloadSource = payloadReader.read(row);
+    if (!payloadSource) return null;
+    const payloadText = payloadSource.payloadText ?? payloadSource.payloadBytes?.toString('utf8') ?? '';
+    if (!matchesText(row.topic, payloadText, state.conditions, state.terms, state.keywordLogic)) return null;
   }
-  state.out.push(formatHistoryMessage(base, state, { payloadBytes, payloadText, payloadSize: payloadLen }));
-  return state.out.length >= state.limit;
-}
 
-function queryFtsIndexedFile(db, connectionId, state, schemaVersion) {
-  // v6 stores compact trigram candidates without search_text. Exact verification
-  // requires reading payload slices, so use the time/topic index path below.
-  if (schemaVersion === '6') return false;
-  const match = buildFtsMatch(state.conditions, state.terms, state.keywordLogic);
-  if (!match || !canUseFts(db, state)) return false;
-  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
-  let sql = hasOffsets
-    ? `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
-       FROM history_messages_fts
-       JOIN history_messages m
-         ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
-       WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`
-    : `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text
-       FROM history_messages_fts
-       JOIN history_messages m
-         ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
-       WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
-  const params = [match, state.startTime, state.endTime];
-  if (state.topic) {
-    sql += ' AND m.topic = ?';
-    params.push(state.topic);
-  }
-  const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
-  const bucketCache = new Map();
-  let lastTime = null;
-  let lastTopic = null;
-  let lastMsgIndex = null;
-  while (state.out.length < state.limit) {
-    const pageSql = lastTime == null
-      ? sql
-      : `${sql}${state.order === 'asc'
-          ? ' AND (m.time_ms > ? OR (m.time_ms = ? AND m.topic > ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index > ?))'
-          : ' AND (m.time_ms < ? OR (m.time_ms = ? AND m.topic < ?) OR (m.time_ms = ? AND m.topic = ? AND m.msg_index < ?))'}`;
-    const pageParams = lastTime == null
-      ? [...params]
-      : [...params, lastTime, lastTime, lastTopic, lastTime, lastTopic, lastMsgIndex];
-    const rows = db.prepare(`${pageSql}${state.order === 'asc'
-      ? ' ORDER BY m.time_ms ASC, m.topic ASC, m.msg_index ASC LIMIT ?'
-      : ' ORDER BY m.time_ms DESC, m.topic DESC, m.msg_index DESC LIMIT ?'}`).all(...pageParams, INDEX_QUERY_CHUNK_SIZE);
-    if (!rows.length) break;
-    for (const row of rows) {
-      if (!matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
-      if (state.skipped < state.offset) {
-        state.skipped += 1;
-        continue;
+  return {
+    ...base,
+    msgIndex: row.msg_index,
+    materialize() {
+      if (state.payloadMode === 'none') return formatHistoryMessage(base, state);
+      if (state.payloadMode === 'metadata' && hasOffsets) {
+        return formatHistoryMessage(base, state, { payloadSize: row.payload_len });
       }
-      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache)) return true;
+      const source = payloadSource || payloadReader.read(row);
+      return source ? formatHistoryMessage(base, state, source) : null;
     }
-    const tail = rows[rows.length - 1];
-    lastTime = tail.time_ms;
-    lastTopic = tail.topic;
-    lastMsgIndex = tail.msg_index;
-    if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;
-  }
-  return true;
+  };
 }
 
-function queryIndexedFile(db, connectionId, state, schemaVersion) {
-  const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+function *iterateIndexedHistoryFile(db, filePath, connectionId, state, schemaVersion) {
   const compact = schemaVersion === '6';
-  const verifyPayloadMatch = compact && (state.conditions.length > 0 || state.terms.length > 0);
-  let sql = compact
-    ? 'SELECT bucket_ts, time_ms, topic, msg_index, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
-    : hasOffsets
-    ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
-    : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
-  const params = [state.startTime, state.endTime];
-  const bucketStmt = db.prepare('SELECT blob FROM buckets WHERE bucket_ts = ? AND topic = ?');
-  const bucketCache = new Map();
-  if (state.topic) {
-    sql += ' AND topic = ?';
-    params.push(state.topic);
-  }
-  sql += state.order === 'asc'
-    ? ' ORDER BY time_ms ASC, topic ASC, msg_index ASC'
-    : ' ORDER BY time_ms DESC, topic DESC, msg_index DESC';
-  sql += ' LIMIT ? OFFSET ?';
-
-  let offset = 0;
-  while (state.out.length < state.limit) {
-    const rows = db.prepare(sql).all(...params, INDEX_QUERY_CHUNK_SIZE, offset);
-    if (!rows.length) break;
-    for (const row of rows) {
-      if (!compact && !matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
-      if (!verifyPayloadMatch && state.skipped < state.offset) {
-        state.skipped += 1;
-        continue;
+  const useFts = !compact && canUseFts(db, state);
+  const payloadReader = createIndexedPayloadReader(filePath, connectionId, schemaVersion);
+  try {
+    let sql;
+    const params = [];
+    if (useFts) {
+      const match = buildFtsMatch(state.conditions, state.terms, state.keywordLogic);
+      const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+      sql = hasOffsets
+        ? `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text, m.payload_offset, m.payload_len
+           FROM history_messages_fts
+           JOIN history_messages m
+             ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+           WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`
+        : `SELECT m.bucket_ts, m.time_ms, m.topic, m.msg_index, m.search_text
+           FROM history_messages_fts
+           JOIN history_messages m
+             ON m.bucket_ts = history_messages_fts.bucket_ts AND m.topic = history_messages_fts.topic AND m.msg_index = history_messages_fts.msg_index
+           WHERE history_messages_fts MATCH ? AND m.time_ms BETWEEN ? AND ?`;
+      params.push(match, state.startTime, state.endTime);
+      if (state.topic) {
+        sql += ' AND m.topic = ?';
+        params.push(state.topic);
       }
-      if (pushIndexedHistoryRow(db, connectionId, state, schemaVersion, row, bucketStmt, bucketCache, verifyPayloadMatch)) return;
+      if (state.topicKeyword) {
+        sql += ' AND instr(lower(m.topic), ?) > 0';
+        params.push(state.topicKeyword);
+      }
+      sql += state.order === 'asc'
+        ? ' ORDER BY m.time_ms ASC, m.topic ASC, m.msg_index ASC'
+        : ' ORDER BY m.time_ms DESC, m.topic DESC, m.msg_index DESC';
+    } else {
+      const hasOffsets = hasOffsetIndexSchema(schemaVersion);
+      sql = compact
+        ? 'SELECT bucket_ts, time_ms, topic, msg_index, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
+        : hasOffsets
+          ? 'SELECT bucket_ts, time_ms, topic, msg_index, search_text, payload_offset, payload_len FROM history_messages WHERE time_ms BETWEEN ? AND ?'
+          : 'SELECT bucket_ts, time_ms, topic, msg_index, search_text FROM history_messages WHERE time_ms BETWEEN ? AND ?';
+      params.push(state.startTime, state.endTime);
+      if (state.topic) {
+        sql += ' AND topic = ?';
+        params.push(state.topic);
+      }
+      if (state.topicKeyword) {
+        sql += ' AND instr(lower(topic), ?) > 0';
+        params.push(state.topicKeyword);
+      }
+      sql += state.order === 'asc'
+        ? ' ORDER BY time_ms ASC, topic ASC, msg_index ASC'
+        : ' ORDER BY time_ms DESC, topic DESC, msg_index DESC';
     }
-    offset += rows.length;
-    if (rows.length < INDEX_QUERY_CHUNK_SIZE) break;
+
+    const verifyPayloadMatch = compact && (state.conditions.length > 0 || state.terms.length > 0);
+    for (const row of db.prepare(sql).iterate(...params)) {
+      if (useFts || (!compact && (state.conditions.length > 0 || state.terms.length > 0))) {
+        if (!matchesSearchText(rowSearchText(row), state.conditions, state.terms, state.keywordLogic)) continue;
+      }
+      const candidate = createIndexedCandidate(
+        connectionId,
+        state,
+        schemaVersion,
+        row,
+        payloadReader,
+        verifyPayloadMatch
+      );
+      if (candidate) yield candidate;
+    }
+  } finally {
+    payloadReader.close();
   }
 }
 
-function queryBucketFile(db, connectionId, state) {
+function *iterateBucketHistoryFile(db, connectionId, state) {
   const secMin = Math.floor(Math.max(state.startTime, -8640000000) / 1000);
   const secMax = Math.ceil(Math.min(state.endTime, 8640000000000) / 1000);
   let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
@@ -884,72 +992,90 @@ function queryBucketFile(db, connectionId, state) {
     sql += ' AND topic = ?';
     params.push(state.topic);
   }
+  if (state.topicKeyword) {
+    sql += ' AND instr(lower(topic), ?) > 0';
+    params.push(state.topicKeyword);
+  }
   sql += state.order === 'asc'
     ? ' ORDER BY bucket_ts ASC, topic ASC'
     : ' ORDER BY bucket_ts DESC, topic DESC';
-  sql += ' LIMIT ? OFFSET ?';
 
-  let offset = 0;
-  while (state.out.length < state.limit) {
-    const rows = db.prepare(sql).all(...params, BUCKET_QUERY_CHUNK_SIZE, offset);
-    if (!rows.length) break;
-    for (const row of rows) {
-      const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
-      const start = state.order === 'asc' ? 0 : decoded.length - 1;
-      const end = state.order === 'asc' ? decoded.length : -1;
-      const step = state.order === 'asc' ? 1 : -1;
-      for (let i = start; i !== end; i += step) {
-        const message = decoded[i];
-        if (message.time < state.startTime || message.time > state.endTime) continue;
-        const done = acceptHistoryMessage(
-          state,
-          formatHistoryMessage(
-            { connectionId: message.connectionId, topic: message.topic, time: message.time },
-            state,
-            { payloadText: message.payload }
-          ),
-          normalizeKeyword(String(message.topic || '') + String(message.payload || ''))
-        );
-        if (done) return;
-      }
+  for (const row of db.prepare(sql).iterate(...params)) {
+    const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic, connectionId);
+    const start = state.order === 'asc' ? 0 : decoded.length - 1;
+    const end = state.order === 'asc' ? decoded.length : -1;
+    const step = state.order === 'asc' ? 1 : -1;
+    for (let i = start; i !== end; i += step) {
+      const message = decoded[i];
+      if (message.time < state.startTime || message.time > state.endTime) continue;
+      if (!matchesText(message.topic, message.payload, state.conditions, state.terms, state.keywordLogic)) continue;
+      const base = { connectionId, topic: message.topic, time: message.time };
+      yield {
+        ...base,
+        msgIndex: i,
+        materialize: () => formatHistoryMessage(base, state, { payloadText: message.payload })
+      };
     }
-    offset += rows.length;
-    if (rows.length < BUCKET_QUERY_CHUNK_SIZE) break;
   }
 }
 
-function queryHistory(logDir, options) {
-  const state = buildQueryState(options);
-  const connectionIds = options.connectionId
-    ? [options.connectionId]
-    : listLogConnectionIds(logDir);
-
-  for (const connectionId of connectionIds) {
-    if (state.out.length >= state.limit) break;
-    const files = listDayFiles(logDir, connectionId, state.order !== 'asc')
-      .filter((filePath) => {
-        const dayKey = path.basename(filePath, '.db');
-        return dayEndTsFromKey(dayKey) >= state.startTime && dayStartTsFromKey(dayKey) <= state.endTime;
-      });
-
-    for (const filePath of files) {
-      if (state.out.length >= state.limit) break;
-      const db = new Database(filePath, { readonly: true, fileMustExist: true });
-      try {
-        const indexSchemaVersion = getUsableIndexVersion(db);
-        if (indexSchemaVersion) {
-          const usedFts = queryFtsIndexedFile(db, connectionId, state, indexSchemaVersion);
-          if (!usedFts) queryIndexedFile(db, connectionId, state, indexSchemaVersion);
-        } else {
-          queryBucketFile(db, connectionId, state);
-        }
-      } finally {
-        db.close();
-      }
+function *iterateConnectionHistory(logDir, connectionId, options) {
+  const state = buildQueryState({ ...options, offset: 0 });
+  const files = listDayFiles(logDir, connectionId, state.order !== 'asc')
+    .filter((filePath) => shardIntersectsRange(filePath, state.startTime, state.endTime));
+  for (const filePath of files) {
+    const db = new Database(filePath, { readonly: true, fileMustExist: true });
+    try {
+      const schemaVersion = getUsableIndexVersion(db);
+      if (schemaVersion) yield *iterateIndexedHistoryFile(db, filePath, connectionId, state, schemaVersion);
+      else yield *iterateBucketHistoryFile(db, connectionId, state);
+    } finally {
+      db.close();
     }
   }
+}
 
-  return state.out;
+function compareHistoryMessages(left, right, order) {
+  const timeDelta = Number(left.time || 0) - Number(right.time || 0);
+  if (timeDelta !== 0) return order === 'asc' ? timeDelta : -timeDelta;
+  const connectionDelta = String(left.connectionId || '').localeCompare(String(right.connectionId || ''));
+  if (connectionDelta !== 0) return connectionDelta;
+  const topicDelta = String(left.topic || '').localeCompare(String(right.topic || ''));
+  return order === 'asc' ? topicDelta : -topicDelta;
+}
+
+function queryHistory(logDir, options) {
+  const request = buildQueryState(options);
+  const connectionIds = options.connectionId ? [options.connectionId] : listLogConnectionIds(logDir);
+  const sources = connectionIds.map((connectionId) => {
+    const iterator = iterateConnectionHistory(logDir, connectionId, options);
+    return { iterator, current: iterator.next() };
+  });
+
+  const out = [];
+  let skipped = 0;
+  try {
+    while (out.length < request.limit) {
+      let selected = null;
+      for (const source of sources) {
+        if (source.current.done) continue;
+        const candidate = source.current.value;
+        if (!selected || compareHistoryMessages(candidate, selected.candidate, request.order) < 0) {
+          selected = { source, candidate };
+        }
+      }
+      if (!selected) break;
+
+      const message = selected.candidate.materialize();
+      selected.source.current = selected.source.iterator.next();
+      if (!message) continue;
+      if (skipped < request.offset) skipped += 1;
+      else out.push(message);
+    }
+  } finally {
+    for (const source of sources) source.iterator.return?.();
+  }
+  return out;
 }
 
 function readHistoryIndexStatus(logDir, options) {
@@ -1014,6 +1140,122 @@ function installStdioExitHandlers(transport) {
   process.once('SIGTERM', () => void shutdown(0));
 }
 
+function normalizeReadTimeout(value) {
+  if (!Number.isFinite(value)) return DEFAULT_READ_TIMEOUT_MS;
+  return Math.min(MAX_READ_TIMEOUT_MS, Math.max(MIN_READ_TIMEOUT_MS, Math.floor(value)));
+}
+
+function readTimeoutInput(defaultValue = DEFAULT_READ_TIMEOUT_MS) {
+  return z.number().int().min(MIN_READ_TIMEOUT_MS).max(MAX_READ_TIMEOUT_MS)
+    .default(defaultValue)
+    .describe('Hard timeout for the history read in milliseconds.');
+}
+
+function executeReadWorkerTask(task, payload) {
+  if (task === 'recent') {
+    return readRecentMessages(payload.logDir, payload.connectionId, payload.limit, payload.topic);
+  }
+  if (task === 'status') return readMessageStatus(payload.logDir, payload.options);
+  if (task === 'samples') return readPayloadSamples(payload.logDir, payload.options);
+  if (task === 'index-status') return readHistoryIndexStatus(payload.logDir, payload.options);
+  if (task === 'query') return queryHistory(payload.logDir, payload.options);
+  throw new Error(`Unknown read worker task: ${task}`);
+}
+
+let reusableReadWorker = null;
+let reusableReadWorkerBusy = false;
+
+function resetReusableReadWorker(worker) {
+  if (reusableReadWorker !== worker) return;
+  reusableReadWorker = null;
+  reusableReadWorkerBusy = false;
+}
+
+function createReusableReadWorker() {
+  const worker = new Worker(new URL(import.meta.url), {
+    workerData: { marker: READ_WORKER_MARKER, persistent: true }
+  });
+  worker.unref();
+  worker.on('error', () => resetReusableReadWorker(worker));
+  worker.on('exit', () => resetReusableReadWorker(worker));
+  reusableReadWorker = worker;
+  return worker;
+}
+
+function runReadWorkerOn(worker, task, payload, options, reusable) {
+  const timeoutMs = normalizeReadTimeout(options.timeoutMs);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const signal = options.signal;
+    let timer;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      worker.removeListener('message', onMessage);
+      worker.removeListener('error', onError);
+      worker.removeListener('exit', onExit);
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (reusable && reusableReadWorker === worker) reusableReadWorkerBusy = false;
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const stopWithError = (error) => {
+      if (reusable) resetReusableReadWorker(worker);
+      void worker.terminate();
+      finish(error);
+    };
+    const onAbort = () => stopWithError(new Error(`MQTT history read cancelled (${task})`));
+    const onMessage = (message) => {
+      if (message?.ok) finish(null, message.value);
+      else finish(new Error(message?.error || `MQTT history worker failed (${task})`));
+    };
+    const onError = (error) => finish(error);
+    const onExit = (code) => {
+      if (!settled) finish(new Error(`MQTT history worker exited with code ${code} (${task})`));
+    };
+    worker.once('message', onMessage);
+    worker.once('error', onError);
+    worker.once('exit', onExit);
+    timer = setTimeout(
+      () => stopWithError(new Error(`MQTT history read timed out after ${timeoutMs}ms (${task})`)),
+      timeoutMs
+    );
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener?.('abort', onAbort, { once: true });
+    if (reusable) worker.postMessage({ task, payload });
+  });
+}
+
+function runReadWorker(task, payload, options = {}) {
+  if (!reusableReadWorkerBusy) {
+    const worker = reusableReadWorker || createReusableReadWorker();
+    reusableReadWorkerBusy = true;
+    return runReadWorkerOn(worker, task, payload, options, true);
+  }
+  const worker = new Worker(new URL(import.meta.url), {
+    workerData: { marker: READ_WORKER_MARKER, task, payload }
+  });
+  return runReadWorkerOn(worker, task, payload, options, false);
+}
+
+async function runWorkerEntry() {
+  const execute = ({ task, payload }) => {
+    try {
+      const value = executeReadWorkerTask(task, payload);
+      parentPort?.postMessage({ ok: true, value });
+    } catch (error) {
+      parentPort?.postMessage({ ok: false, error: error?.stack || error?.message || String(error) });
+    }
+  };
+  if (workerData.persistent) parentPort?.on('message', execute);
+  else execute(workerData);
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -1045,10 +1287,11 @@ async function main() {
         connectionName: z.string().optional().describe('MQTTMountain connection name, for example "深圳星扬".'),
         connectionKeyword: z.string().optional().describe('Fuzzy connection keyword, for example "深圳星扬" or "xingyang-szga".'),
         topic: z.string().optional().describe('Exact MQTT topic filter.'),
-        limit: z.number().int().min(1).max(MAX_LIMIT).default(100)
+        limit: z.number().int().min(1).max(MAX_LIMIT).default(100),
+        timeoutMs: readTimeoutInput()
       })
     },
-    async (input) => {
+    async (input, extra) => {
       const connectionId = resolveConnectionId(userDataDir, logDir, input);
       if (!connectionId) throw new Error('connectionId or connectionName is required.');
       return jsonText({
@@ -1056,7 +1299,12 @@ async function main() {
         connectionId,
         connectionName: input.connectionName,
         topic: input.topic,
-        messages: readRecentMessages(logDir, connectionId, input.limit, input.topic)
+        messages: await runReadWorker('recent', {
+          logDir,
+          connectionId,
+          limit: input.limit,
+          topic: input.topic
+        }, { timeoutMs: input.timeoutMs, signal: extra?.signal })
       });
     }
   );
@@ -1077,18 +1325,23 @@ async function main() {
         startTime: z.number().optional().describe('Start timestamp in milliseconds since Unix epoch.'),
         endTime: z.number().optional().describe('End timestamp in milliseconds since Unix epoch. Defaults to now.'),
         topicLimit: z.number().int().min(1).max(50).default(DEFAULT_STATUS_TOPIC_LIMIT),
+        scanLimit: z.number().int().min(1).max(MAX_LIMIT).default(DEFAULT_STATUS_SCAN_LIMIT).describe('Maximum newest matching messages counted for this compact status call.'),
         sampleLimit: z.number().int().min(0).max(10).default(0).describe('Number of recent sample messages to include. Defaults to 0 to save tokens.'),
-        payloadPreviewChars: z.number().int().min(0).max(500).default(0).describe('Payload preview length for samples. Defaults to 0 to save tokens.')
+        payloadPreviewChars: z.number().int().min(0).max(500).default(0).describe('Payload preview length for samples. Defaults to 0 to save tokens.'),
+        timeoutMs: readTimeoutInput(60_000)
       })
     },
-    async (input) => {
+    async (input, extra) => {
       const connectionId = resolveConnectionId(userDataDir, logDir, input);
       const query = connectionId ? { ...input, connectionId } : input;
       return jsonText({
         connectionId,
         connectionName: input.connectionName,
         connectionKeyword: input.connectionKeyword,
-        status: readMessageStatus(logDir, query)
+        status: await runReadWorker('status', { logDir, options: query }, {
+          timeoutMs: input.timeoutMs,
+          signal: extra?.signal
+        })
       });
     }
   );
@@ -1110,17 +1363,21 @@ async function main() {
         endTime: z.number().optional().describe('End timestamp in milliseconds since Unix epoch. Defaults to now.'),
         limit: z.number().int().min(1).max(50).default(DEFAULT_PAYLOAD_SAMPLE_LIMIT),
         payloadPreviewChars: z.number().int().min(0).max(2000).default(DEFAULT_PAYLOAD_PREVIEW_CHARS),
-        payloadFields: z.array(z.string()).optional().describe('Extra JSON field paths to extract, for example ["data.battery","data.mode_code"].')
+        payloadFields: z.array(z.string()).optional().describe('Extra JSON field paths to extract, for example ["data.battery","data.mode_code"].'),
+        timeoutMs: readTimeoutInput()
       })
     },
-    async (input) => {
+    async (input, extra) => {
       const connectionId = resolveConnectionId(userDataDir, logDir, input);
       const query = connectionId ? { ...input, connectionId } : input;
       return jsonText({
         connectionId,
         connectionName: input.connectionName,
         connectionKeyword: input.connectionKeyword,
-        result: readPayloadSamples(logDir, query)
+        result: await runReadWorker('samples', { logDir, options: query }, {
+          timeoutMs: input.timeoutMs,
+          signal: extra?.signal
+        })
       });
     }
   );
@@ -1133,10 +1390,11 @@ async function main() {
       inputSchema: z.object({
         connectionId: z.string().optional().describe('Optional MQTTMountain connection id. Omit to scan all log folders.'),
         connectionName: z.string().optional().describe('Optional exact MQTTMountain connection name.'),
-        connectionKeyword: z.string().optional().describe('Fuzzy connection keyword, for example "深圳星扬" or "xingyang-szga".')
+        connectionKeyword: z.string().optional().describe('Fuzzy connection keyword, for example "深圳星扬" or "xingyang-szga".'),
+        timeoutMs: readTimeoutInput()
       })
     },
-    async (input) => {
+    async (input, extra) => {
       const connectionId = resolveConnectionId(userDataDir, logDir, input);
       const query = connectionId ? { ...input, connectionId } : input;
       return jsonText({
@@ -1144,7 +1402,10 @@ async function main() {
         connectionId,
         connectionName: input.connectionName,
         connectionKeyword: input.connectionKeyword,
-        status: readHistoryIndexStatus(logDir, query)
+        status: await runReadWorker('index-status', { logDir, options: query }, {
+          timeoutMs: input.timeoutMs,
+          signal: extra?.signal
+        })
       });
     }
   );
@@ -1172,16 +1433,20 @@ async function main() {
         endTime: z.number().optional().describe('End timestamp in milliseconds since Unix epoch.'),
         payloadMode: z.enum(['full', 'preview', 'metadata', 'base64', 'none']).default('full').describe('Payload output mode. Default full preserves the legacy response shape.'),
         payloadPreviewChars: z.number().int().min(0).max(2000).default(300).describe('Preview character limit when payloadMode is preview.'),
-        limit: z.number().int().min(1).max(MAX_LIMIT).default(200)
+        limit: z.number().int().min(1).max(MAX_LIMIT).default(200),
+        timeoutMs: readTimeoutInput()
       })
     },
-    async (input) => {
+    async (input, extra) => {
       const connectionId = resolveConnectionId(userDataDir, logDir, input);
       const query = connectionId ? { ...input, connectionId } : input;
       return jsonText({
         logDir,
         query,
-        messages: queryHistory(logDir, query)
+        messages: await runReadWorker('query', { logDir, options: query }, {
+          timeoutMs: input.timeoutMs,
+          signal: extra?.signal
+        })
       });
     }
   );
@@ -1191,7 +1456,11 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((error) => {
-  process.stderr.write(`[mqttmountain-mcp] ${error?.stack || error}\n`);
-  process.exit(1);
-});
+if (!isMainThread && workerData?.marker === READ_WORKER_MARKER) {
+  void runWorkerEntry();
+} else {
+  main().catch((error) => {
+    process.stderr.write(`[mqttmountain-mcp] ${error?.stack || error}\n`);
+    process.exit(1);
+  });
+}

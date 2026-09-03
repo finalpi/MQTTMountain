@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import JSZip from 'jszip';
@@ -115,8 +116,11 @@ async function finalizeWriteStream(stream: fs.WriteStream): Promise<void> {
 }
 
 function sanitizeTopicFilename(topic: string): string {
-    const safe = topic.replace(/[\\/:*?"<>|]/g, '_').trim();
-    return safe || 'root';
+    let safe = topic.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().replace(/[. ]+$/u, '');
+    if (!safe) safe = 'root';
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(safe)) safe = `_${safe}`;
+    const hash = crypto.createHash('sha256').update(topic).digest('hex').slice(0, 24);
+    return `${Array.from(safe).slice(0, 96).join('')}-${hash}`;
 }
 
 function emitTick(stage: HistoryExportProgress['stage'], processed: number, written: number, total: number, startedAt: number, message: string): void {
@@ -172,7 +176,8 @@ async function exportJson(files: { path: string; san: string }[], total: number,
                             Topic: item.topic,
                             Payload: item.payload,
                             QoS: 0,
-                            Retain: false
+                            Retain: false,
+                            ...(item.payloadBase64 ? { PayloadBase64: item.payloadBase64, PayloadEncoding: item.payloadEncoding } : {})
                         })}`;
                         if (!stream.write(chunk, 'utf8')) await waitForDrain(stream);
                         first = false;
@@ -206,7 +211,8 @@ async function exportZip(files: { path: string; san: string }[], total: number, 
 
     const topicStreams = new Map<string, fs.WriteStream>();
     const topicFiles = new Map<string, string>();
-    const fileNameByTopic = new Map<string, string>();
+    const initializedTopics = new Set<string>();
+    const MAX_OPEN_TOPIC_STREAMS = 32;
     const st = req.query.startTime != null && req.query.startTime > 0 ? req.query.startTime : -8640000000000000;
     const et = req.query.endTime != null && req.query.endTime > 0 ? req.query.endTime : 8640000000000000;
     const secMin = Math.floor(Math.max(st, -8640000000) / 1000);
@@ -216,61 +222,78 @@ async function exportZip(files: { path: string; san: string }[], total: number, 
     let written = 0;
     let lastReport = 0;
 
-    const getTopicStream = (topic: string): fs.WriteStream => {
+    const getTopicStream = async (topic: string): Promise<fs.WriteStream> => {
         let stream = topicStreams.get(topic);
-        if (stream) return stream;
-        const safeName = sanitizeTopicFilename(topic);
-        let candidate = safeName;
-        let index = 1;
-        while (topicFiles.has(candidate)) {
-            index++;
-            candidate = `${safeName}-${index}`;
+        if (stream) {
+            topicStreams.delete(topic);
+            topicStreams.set(topic, stream);
+            return stream;
         }
+        if (topicStreams.size >= MAX_OPEN_TOPIC_STREAMS) {
+            const oldest = topicStreams.entries().next().value as [string, fs.WriteStream] | undefined;
+            if (oldest) {
+                topicStreams.delete(oldest[0]);
+                await finalizeWriteStream(oldest[1]);
+            }
+        }
+        const candidate = sanitizeTopicFilename(topic);
         const topicPath = path.join(tempDataDir, `${candidate}.jsonl`);
-        stream = fs.createWriteStream(topicPath, { encoding: 'utf8' });
+        stream = fs.createWriteStream(topicPath, {
+            encoding: 'utf8',
+            flags: initializedTopics.has(topic) ? 'a' : 'w'
+        });
+        initializedTopics.add(topic);
         topicStreams.set(topic, stream);
         topicFiles.set(candidate, topicPath);
-        fileNameByTopic.set(topic, candidate);
         return stream;
     };
 
-    for (const file of files) {
-        const db = new Database(file.path, { readonly: true });
-        try {
-            let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
-            const params: Array<number | string> = [secMin, secMax];
-            if (topicFilter) {
-                sql += ' AND topic = ?';
-                params.push(topicFilter);
-            }
-            sql += ' ORDER BY bucket_ts DESC, topic DESC';
-            const rows = db.prepare(sql).iterate(...params) as Iterable<{ bucket_ts: number; topic: string; blob: Buffer }>;
-            for (const row of rows) {
-                const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
-                for (let i = decoded.length - 1; i >= 0; i--) {
-                    const item = decoded[i];
-                    if (item.time < st || item.time > et) continue;
-                    item.connectionId = file.san;
-                    processed++;
-                    if (matchesConditions(item, req.conditions)) {
-                        const stream = getTopicStream(item.topic);
-                        const line = `${JSON.stringify({ time: item.time, topic: item.topic, payload: item.payload })}\n`;
-                        if (!stream.write(line, 'utf8')) await waitForDrain(stream);
-                        written++;
-                    }
-                    if (processed - lastReport >= 2000) {
-                        lastReport = processed;
-                        emitTick('writing', processed, written, total, startedAt, `正在写入分片：${Math.min(100, calcPercent(processed, total, 'writing'))}%`);
+    try {
+        for (const file of files) {
+            const db = new Database(file.path, { readonly: true });
+            try {
+                let sql = 'SELECT bucket_ts, topic, blob FROM buckets WHERE bucket_ts BETWEEN ? AND ?';
+                const params: Array<number | string> = [secMin, secMax];
+                if (topicFilter) {
+                    sql += ' AND topic = ?';
+                    params.push(topicFilter);
+                }
+                sql += ' ORDER BY bucket_ts DESC, topic DESC';
+                const rows = db.prepare(sql).iterate(...params) as Iterable<{ bucket_ts: number; topic: string; blob: Buffer }>;
+                for (const row of rows) {
+                    const decoded = decodeBucket(row.blob, row.bucket_ts, row.topic);
+                    for (let i = decoded.length - 1; i >= 0; i--) {
+                        const item = decoded[i];
+                        if (item.time < st || item.time > et) continue;
+                        item.connectionId = file.san;
+                        processed++;
+                        if (matchesConditions(item, req.conditions)) {
+                            const stream = await getTopicStream(item.topic);
+                            const line = `${JSON.stringify({
+                                time: item.time,
+                                topic: item.topic,
+                                payload: item.payload,
+                                ...(item.payloadBase64 ? { payloadBase64: item.payloadBase64, payloadEncoding: item.payloadEncoding } : {})
+                            })}\n`;
+                            if (!stream.write(line, 'utf8')) await waitForDrain(stream);
+                            written++;
+                        }
+                        if (processed - lastReport >= 2000) {
+                            lastReport = processed;
+                            emitTick('writing', processed, written, total, startedAt, `正在写入分片：${Math.min(100, calcPercent(processed, total, 'writing'))}%`);
+                        }
                     }
                 }
+            } finally {
+                db.close();
             }
-        } finally {
-            db.close();
         }
-    }
-
-    for (const stream of topicStreams.values()) {
-        await finalizeWriteStream(stream);
+    } finally {
+        const openStreams = [...topicStreams.values()];
+        topicStreams.clear();
+        for (const stream of openStreams) {
+            try { await finalizeWriteStream(stream); } catch { stream.destroy(); }
+        }
     }
 
     emitTick('packaging', processed, written, total, startedAt, '正在打包 ZIP...');

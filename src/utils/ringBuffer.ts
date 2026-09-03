@@ -13,8 +13,8 @@ export class RingBuffer<T> {
     public total = 0;
 
     constructor(capacity: number) {
-        this.cap = Math.max(1, capacity | 0);
-        this.buf = new Array(this.cap);
+        this.cap = Math.max(1, Math.trunc(Number.isFinite(capacity) ? capacity : 1));
+        this.buf = [];
     }
 
     get length(): number {
@@ -25,23 +25,27 @@ export class RingBuffer<T> {
     }
 
     setCapacity(capacity: number): T[] {
-        const cap = Math.max(1, capacity | 0);
+        const cap = Math.max(1, Math.trunc(Number.isFinite(capacity) ? capacity : 1));
         if (cap === this.cap) return [];
         const snap = this.snapshot();
         const removed = snap.slice(0, Math.max(0, snap.length - cap));
+        const previousTotal = this.total;
         this.cap = cap;
-        this.buf = new Array(cap);
+        this.buf = [];
         this.head = 0;
         this.size = 0;
         const start = Math.max(0, snap.length - cap);
         for (let i = start; i < snap.length; i++) this.push(snap[i]);
+        this.total = previousTotal;
         return removed;
     }
 
     push(v: T): T | undefined {
         let evicted: T | undefined;
         if (this.size < this.cap) {
-            this.buf[(this.head + this.size) % this.cap] = v;
+            const index = (this.head + this.size) % this.cap;
+            if (index === this.buf.length) this.buf.push(v);
+            else this.buf[index] = v;
             this.size++;
         } else {
             evicted = this.buf[this.head];
@@ -63,8 +67,26 @@ export class RingBuffer<T> {
         return true;
     }
 
+    /** 删除所有命中项，同时保持其余元素的原始顺序。 */
+    removeWhere(predicate: (value: T) => boolean): T[] {
+        const snapshot = this.snapshot();
+        const removed: T[] = [];
+        const kept: T[] = [];
+        for (const value of snapshot) {
+            if (predicate(value)) removed.push(value);
+            else kept.push(value);
+        }
+        if (removed.length === 0) return removed;
+
+        this.buf = kept.slice();
+        this.head = 0;
+        this.size = kept.length;
+        this.version++;
+        return removed;
+    }
+
     clear(): void {
-        this.buf = new Array(this.cap);
+        this.buf = [];
         this.head = 0;
         this.size = 0;
         this.total = 0;

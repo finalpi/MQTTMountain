@@ -7,15 +7,17 @@ import {
     purgeNonCurrentHistoryIndexDbsAsync,
     shutdownStorageAsync,
     setStorageDiagnosticListener,
+    setStorageDiskPressureListener,
     stopAcceptingStorageWrites,
     stopAutoDeleteWorkers
 } from './storage';
-import { initSettings, getCurrentLogDir, readConnections } from './settings';
+import { initSettings, getCurrentLogDir, readConnectionsStrict } from './settings';
 import { MqttService } from './mqtt-service';
 import { writeDiagnosticLog } from './diagnostics';
 import { startAutoDeleteScheduler, stopAutoDeleteScheduler } from './auto-delete-scheduler';
 import { pluginManager } from './plugin-manager';
 import './constants';
+import type { StorageDiskPressureState } from '../../shared/types';
 
 export { APP_START_TIME } from './constants';
 
@@ -73,6 +75,12 @@ let quitAfterStorageShutdown = false;
 let quitShutdownPromise: Promise<void> | null = null;
 let isQuitting = false;
 
+function notifyStorageDiskPressure(state: StorageDiskPressureState): void {
+    writeDiagnosticLog('[storage] disk pressure event', state);
+    if (!win || win.isDestroyed()) return;
+    try { win.webContents.send('app:storageDiskPressure', state); } catch {}
+}
+
 function focusExistingWindow(): void {
     if (!win || win.isDestroyed()) return;
     if (win.isMinimized()) win.restore();
@@ -108,7 +116,7 @@ async function runStartupMaintenanceBeforeConnections(): Promise<void> {
         console.error('[main] pre-window old history purge failed:', error);
     }
     try {
-        const result = await clearLogsWithoutConnectionsAsync(readConnections().connections.map((c) => c.id));
+        const result = await clearLogsWithoutConnectionsAsync(readConnectionsStrict().connections.map((c) => c.id));
         writeDiagnosticLog('[main] pre-connection stale log cleanup complete', result);
     } catch (error) {
         writeDiagnosticLog('[main] pre-connection stale log cleanup failed', error);
@@ -125,6 +133,7 @@ function shutdownForQuit(): Promise<void> {
         stopAutoDeleteScheduler();
         await stopAutoDeleteWorkers();
         mqttService?.shutdown();
+        setStorageDiskPressureListener(null);
         await withTimeout(shutdownStorageAsync(), STORAGE_SHUTDOWN_TIMEOUT_MS, 'storage shutdown').catch((error) => {
             console.warn('[main] storage shutdown did not finish cleanly:', error);
         });
@@ -181,7 +190,10 @@ async function createWindow() {
     win.webContents.on('did-finish-load', notifyFocus);
 
     win.webContents.on('console-message', (_event, _level, message) => {
-        if (message.startsWith('[renderer-diagnostics]') || message.startsWith('[plugin-bridge]')) {
+        if (message.startsWith('[renderer-diagnostics]')
+            || message.startsWith('[plugin-bridge]')
+            || message.startsWith('[shangyun-performance]')
+            || message.startsWith('[shangyun-remote]')) {
             writeDiagnosticLog('[renderer] console', message);
         }
     });
@@ -197,10 +209,6 @@ async function createWindow() {
 
     win.on('close', () => {
         writeDiagnosticLog('[window] close', { isQuitting });
-        if (isQuitting) return;
-        isQuitting = true;
-        stopAcceptingStorageWrites();
-        mqttService?.shutdown();
     });
 
     win.on('closed', () => {
@@ -231,6 +239,7 @@ app.whenReady().then(async () => {
     mqttService = new MqttService(() => win);
     initIpc(mqttService);
     await createWindow();
+    setStorageDiskPressureListener(notifyStorageDiskPressure);
     startAutoDeleteScheduler(() => win);
 }).catch((error) => {
     writeDiagnosticLog('[main] app ready failed', error);
